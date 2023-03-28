@@ -31,18 +31,15 @@ jobs:
           json -I -f package.json -e "this.version=\"${{ inputs.ver_num }}\""
         working-directory: test-tools/wamr-ide/VSCode-Extension
 
-      # [!workflow]
-      # bypass the step of publishing the extension to the Market.
-      # recover it after creating the secret in the Environment
       - name: generate wamr ide vscode extension
-        env:
+        env: 
           credentials: ${{ secrets.TOKEN }}
         run: |
           npm install -g vsce
           rm -rf node_modules
           npm install
           vsce package
-          # vsce publish -p ${{ secrets.TOKEN }}
+          vsce publish -p ${{ env.credentials }}
         working-directory: test-tools/wamr-ide/VSCode-Extension
 
       - name: compress the vscode extension
