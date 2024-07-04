@@ -35,21 +35,15 @@ typedef float64 CellType_F64;
 
 #define BR_TABLE_TMP_BUF_LEN 32
 
-#if WASM_ENABLE_THREAD_MGR != 0
+#if WASM_ENABLE_THREAD_MGR == 0
+#define get_linear_mem_size() linear_mem_size
+#else
 /**
  * Load memory data size in each time boundary check in
  * multi-threading mode since it may be changed by other
  * threads in memory.grow
  */
 #define get_linear_mem_size() GET_LINEAR_MEMORY_SIZE(memory)
-#elif WASM_ENABLE_MULTI_MEMORY != 0
-/**
- * Load memory data size in each time boundary check in
- * multi-memory mode since the memory instance(memories[i]) may be different
- */
-#define get_linear_mem_size() memory->memory_data_size
-#else
-#define get_linear_mem_size() linear_mem_size
 #endif
 
 #if WASM_ENABLE_MEMORY64 == 0
@@ -698,34 +692,35 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
 #endif
 
 #if WASM_ENABLE_MULTI_MEMORY != 0
+#define read_leb_memidx(p, p_end, res)                    \
+    do {                                                  \
+        read_leb_uint32(p, p_end, res);                   \
+        memory = wasm_get_memory_i(module, res);          \
+        linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory); \
+    } while (0)
 /* First read the alignment, then if it has flag indicating following memidx,
  * read it and set the memory instance to memories[memidx] for following memory
  * access and boundary check, if it doesn't have flag reset the memory instance
  * to the default memories[0] */
-#define read_leb_align(p, p_end, res)                   \
-    do {                                                \
-        read_leb_uint32(p, p_end, res);                 \
-        if (res & 0x40) {                               \
-            read_leb_uint32(p, p_end, memidx);          \
-            memory = wasm_get_memory_i(module, memidx); \
-        }                                               \
-        else if (memidx != 0) {                         \
-            memidx = 0;                                 \
-            memory = wasm_get_default_memory(module);   \
-        }                                               \
-    } while (0)
-#define read_leb_memidx(p, p_end, res)           \
-    do {                                         \
-        read_leb_uint32(p, p_end, res);          \
-        memory = wasm_get_memory_i(module, res); \
+#define read_leb_memarg(p, p_end, res)                        \
+    do {                                                      \
+        read_leb_uint32(p, p_end, res);                       \
+        if (res & 0x40) {                                     \
+            read_leb_memidx(p, p_end, memidx);                \
+        }                                                     \
+        else if (memidx != 0) {                               \
+            memidx = 0;                                       \
+            memory = wasm_get_default_memory(module);         \
+            linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory); \
+        }                                                     \
     } while (0)
 #else
-#define read_leb_align(p, p_end, res)   \
+#define read_leb_memidx(p, p_end, res) read_leb_memarg(p, p_end, res)
+#define read_leb_memarg(p, p_end, res)  \
     do {                                \
         read_leb_uint32(p, p_end, res); \
         (void)res;                      \
     } while (0)
-#define read_leb_memidx(p, p_end, res) read_leb_align(p, p_end, res)
 #endif
 
 #if WASM_ENABLE_LABELS_AS_VALUES == 0
@@ -4286,7 +4281,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(4);
@@ -4301,7 +4296,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(8);
@@ -4315,7 +4310,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
@@ -4329,7 +4324,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
@@ -4343,7 +4338,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
@@ -4357,7 +4352,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
@@ -4371,7 +4366,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
@@ -4385,7 +4380,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
@@ -4399,7 +4394,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
@@ -4413,7 +4408,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
@@ -4427,7 +4422,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(4);
@@ -4441,7 +4436,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 addr = POP_MEM_OFFSET();
                 CHECK_MEMORY_OVERFLOW(4);
@@ -4457,7 +4452,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 frame_sp--;
                 addr = POP_MEM_OFFSET();
@@ -4481,7 +4476,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 flags;
                 mem_offset_t offset, addr;
 
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 frame_sp -= 2;
                 addr = POP_MEM_OFFSET();
@@ -4510,7 +4505,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint32 sval;
 
                 opcode = *(frame_ip - 1);
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 sval = (uint32)POP_I32();
                 addr = POP_MEM_OFFSET();
@@ -4536,7 +4531,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint64 sval;
 
                 opcode = *(frame_ip - 1);
-                read_leb_align(frame_ip, frame_ip_end, flags);
+                read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 sval = (uint64)POP_I64();
                 addr = POP_MEM_OFFSET();
@@ -4589,8 +4584,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                        it isn't changed in wasm_enlarge_memory */
 #if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
-    || WASM_ENABLE_BULK_MEMORY != 0 || WASM_ENABLE_MULTI_MEMORY != 0
-                    linear_mem_size = get_linear_mem_size();
+    || WASM_ENABLE_BULK_MEMORY != 0
+                    linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory);
 #endif
                 }
 
@@ -5600,7 +5595,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         offset = (uint64)(uint32)POP_I32();
                         addr = (mem_offset_t)POP_MEM_OFFSET();
 
-#if WASM_ENABLE_THREAD_MGR != 0 || WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_THREAD_MGR != 0
                         linear_mem_size = get_linear_mem_size();
 #endif
 
@@ -5657,9 +5652,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         /* dst memidx */
                         read_leb_memidx(frame_ip, frame_ip_end, memidx);
 #endif
-#if WASM_ENABLE_THREAD_MGR != 0 || WASM_ENABLE_MULTI_MEMORY != 0
-                        linear_mem_size = get_linear_mem_size();
-#endif
                         /* dst boundary check */
 #ifndef OS_ENABLE_HW_BOUND_CHECK
                         CHECK_BULK_MEMORY_OVERFLOW(dst, len, mdst);
@@ -5673,9 +5665,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_MULTI_MEMORY != 0
                         /* src memidx */
                         read_leb_memidx(frame_ip, frame_ip_end, memidx);
-#endif
-#if WASM_ENABLE_THREAD_MGR != 0 || WASM_ENABLE_MULTI_MEMORY != 0
-                        linear_mem_size = get_linear_mem_size();
 #endif
                         /* src boundary check */
 #ifndef OS_ENABLE_HW_BOUND_CHECK
@@ -5706,7 +5695,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         fill_val = POP_I32();
                         dst = POP_MEM_OFFSET();
 
-#if WASM_ENABLE_THREAD_MGR != 0 || WASM_ENABLE_MULTI_MEMORY != 0
+#if WASM_ENABLE_THREAD_MGR != 0
                         linear_mem_size = get_linear_mem_size();
 #endif
 
