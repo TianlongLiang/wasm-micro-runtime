@@ -323,6 +323,11 @@ jobs:
           - make_options_run_mode: $FAST_JIT_BUILD_OPTIONS
             make_options_feature: "-DWAMR_BUILD_MEMORY64=1"
     steps:
+      - name: reset node to node16
+        run: |
+          mv /__e/node20 /__e/node20.bak
+          ln -s /__e/node16 /__e/node20
+          
       - name: checkout
         uses: actions/checkout@v3
 
@@ -346,6 +351,10 @@ jobs:
           cmake .. ${{ matrix.make_options_run_mode }} ${{ matrix.make_options_feature }} -DCMAKE_C_COMPILER=gcc-4.8 -DCMAKE_CXX_COMPILER=g++-4.8
           cmake --build . --config Release --parallel 4
         working-directory: product-mini/platforms/linux
+
+      - name: reset node back to node20
+        run: |
+          ln -s /__e/node20.bak /__e/node20
 
   build_samples_wasm_c_api:
     needs:
