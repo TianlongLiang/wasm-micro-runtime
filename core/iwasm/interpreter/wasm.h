@@ -93,6 +93,11 @@ extern "C" {
 #define MAX_PAGE_COUNT_FLAG 0x01
 #define SHARED_MEMORY_FLAG 0x02
 #define MEMORY64_FLAG 0x04
+/* limits type has same encoding for memory and table */
+#define MAX_TABLE_SIZE_FLAG MAX_PAGE_COUNT_FLAG
+/* the shared flag for table is not actual used now */
+#define SHARED_TABLE_FLAG SHARED_MEMORY_FLAG
+#define TABLE64_FLAG MEMORY64_FLAG
 
 #define DEFAULT_NUM_BYTES_PER_PAGE 65536
 #define DEFAULT_MAX_PAGES 65536
@@ -486,6 +491,7 @@ typedef struct WASMTableType {
      * 0: no max size and not shared
      * 1: has max size
      * 2: shared
+     * 4: table64
      */
     uint8 flags;
     bool possible_grow;
@@ -512,6 +518,7 @@ typedef uint64 mem_offset_t;
 typedef uint32 mem_offset_t;
 #define PR_MEM_OFFSET PRIu32
 #endif
+typedef mem_offset_t tbl_elem_idx_t;
 
 typedef struct WASMMemory {
     uint32 flags;
