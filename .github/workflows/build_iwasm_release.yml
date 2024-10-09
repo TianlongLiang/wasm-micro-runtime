@@ -82,14 +82,14 @@ jobs:
         working-directory: ${{ inputs.cwd }}
 
       - name: Compress the binary on Windows
-        if: runner.os == 'windows-latest'
+        if: inputs.runner == 'windows-latest'
         run: |
           tar -czf iwasm-${{ inputs.ver_num }}-${{ inputs.runner }}.tar.gz iwasm
           Compress-Archive -Path iwasm -DestinationPath iwasm-${{ inputs.ver_num }}-${{ inputs.runner }}.zip
         working-directory: ${{ inputs.cwd }}/build
 
       - name: compress the binary on non-Windows
-        if: runner.os != 'windows-latest'
+        if: inputs.runner != 'windows-latest'
         run: |
           tar czf iwasm-${{ inputs.ver_num }}-${{ inputs.runner }}.tar.gz iwasm
           zip iwasm-${{ inputs.ver_num }}-${{ inputs.runner }}.zip iwasm

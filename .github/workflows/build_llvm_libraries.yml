@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: install dependencies for non macos-14 and non Windows
-        if: inputs.os != 'macos-14' && runner.os != 'windows-latest'
+        if: inputs.os != 'macos-14' && input.os != 'windows-latest'
         run: /usr/bin/env python3 -m pip install -r requirements.txt
         working-directory: build-scripts
 
@@ -52,12 +52,12 @@ jobs:
         working-directory: build-scripts
 
       - name: Install dependencies (Windows)
-        if: runner.os == 'windows-latest'
+        if: input.os == 'windows-latest'
         run: python -m pip install -r requirements.txt
         working-directory: build-scripts
 
       - name: Set Python path env variable for non Windows
-        if: runner.os != 'windows-latest'
+        if: input.os != 'windows-latest'
         run: echo "PYTHON_ENV_PATH=/usr/bin/env" >> $GITHUB_ENV
 
       - name: retrieve the last commit ID
