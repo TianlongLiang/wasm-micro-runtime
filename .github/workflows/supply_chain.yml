@@ -25,7 +25,7 @@ jobs:
   analysis:
     name: Scorecard analysis
     runs-on: ubuntu-latest
-    if: github.repository == 'bytecodealliance/wasm-micro-runtime'
+    if: github.repository == 'TianlongLiang/wasm-micro-runtime'
     permissions:
       # Needed to upload the results to code-scanning dashboard.
       security-events: write
