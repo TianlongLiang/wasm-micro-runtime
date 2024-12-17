@@ -14,6 +14,7 @@ os_time_get_boot_us()
 uint64
 os_time_thread_cputime_us(void)
 {
+#ifdef CONFIG_THREAD_RUNTIME_STATS
     k_tid_t tid;
     struct k_thread_runtime_stats stats;
     uint32 clock_freq;
@@ -27,4 +28,7 @@ os_time_thread_cputime_us(void)
     }
 
     return time_in_us;
+#else
+    return os_time_get_boot_us();
+#endif
 }
