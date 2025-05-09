@@ -183,7 +183,7 @@ typedef struct {
 
 #if WASM_ENABLE_SHARED_HEAP != 0
 #define REG_SHARED_HEAP_SYM()                 \
-    REG_SYM(wasm_runtime_update_last_used_shared_heap),
+    REG_SYM(wasm_runtime_access_shared_heap),
 #else
 #define REG_SHARED_HEAP_SYM()
 #endif
