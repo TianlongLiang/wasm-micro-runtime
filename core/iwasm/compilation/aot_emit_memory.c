@@ -145,6 +145,7 @@ ffs(int n)
 static LLVMValueRef
 get_memory_curr_page_count(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx);
 
+#if WASM_ENABLE_SHARED_HEAP != 0
 uint32
 get_module_inst_extra_offset(AOTCompContext *comp_ctx);
 
@@ -216,10 +217,9 @@ aot_check_shared_heap_chain(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     GET_AOT_FUNCTION(wasm_runtime_access_shared_heap, 5);
 
-    // kind = LLVMGetEnumAttributeKindForName("cold", 5);
-    // kind = LLVMGetEnumAttributeKindForName("noinline", 7);
-    // func_attr = LLVMCreateEnumAttribute(comp_ctx->context, kind, 0);
-    // LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, func_attr);
+    // kind = LLVMGetEnumAttributeKindForName("cold", 4);
+    // coldAttr = LLVMCreateEnumAttribute(comp_ctx->context, kind, 0);
+    // LLVMAddAttributeAtIndex(func, LLVMAttributeFunctionIndex, coldAttr);
 
     /* Call function */
     param_values[0] = func_ctx->aot_inst;
@@ -383,6 +383,7 @@ aot_check_bulk_memory_shared_heap_memory_overflow(
         start_offset, max_addr, NULL, bytes, 0, is_memory64, is_target_64bit,
         true, false);
 }
+#endif
 
 LLVMValueRef
 aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
@@ -391,10 +392,10 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 {
     LLVMValueRef offset_const =
         MEMORY64_COND_VALUE(I64_CONST(offset), I32_CONST(offset));
-    LLVMValueRef addr, maddr, maddr_phi = NULL, offset1, cmp1, cmp;
+    LLVMValueRef addr, maddr, offset1, cmp1, cmp;
     LLVMValueRef mem_base_addr, mem_check_bound;
-    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
-    LLVMBasicBlockRef check_succ, block_maddr_phi = NULL;
+    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder),
+                      check_succ;
     AOTValue *aot_value_top;
     uint32 local_idx_of_aot_value = 0;
     uint64 const_value;
@@ -408,6 +409,10 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     bool is_memory64 = false;
 #else
     bool is_memory64 = IS_MEMORY64;
+#endif
+#if WASM_ENABLE_SHARED_HEAP != 0
+    LLVMValueRef maddr_phi = NULL;
+    LLVMBasicBlockRef block_maddr_phi = NULL;
 #endif
 
     is_target_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
@@ -574,6 +579,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         block_curr = check_integer_overflow_end;
     }
 
+#if WASM_ENABLE_SHARED_HEAP != 0
     if (comp_ctx->enable_shared_heap /* TODO: && mem_idx == 0 */) {
         ADD_BASIC_BLOCK(block_maddr_phi, "maddr_phi");
         SET_BUILD_POS(block_maddr_phi);
@@ -593,6 +599,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             goto fail;
         }
     }
+#endif
 
     if (comp_ctx->enable_bound_check
         && !(is_local_of_aot_value
@@ -671,6 +678,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         }
     }
 
+#if WASM_ENABLE_SHARED_HEAP != 0
     if (comp_ctx->enable_shared_heap /* TODO: && mem_idx == 0 */) {
         block_curr = LLVMGetInsertBlock(comp_ctx->builder);
         LLVMAddIncoming(maddr_phi, &maddr, &block_curr, 1);
@@ -682,6 +690,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         return maddr_phi;
     }
     else
+#endif
         return maddr;
 fail:
     return NULL;
@@ -1304,15 +1313,19 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                            LLVMValueRef offset, LLVMValueRef bytes)
 {
     LLVMValueRef maddr, max_addr, cmp, cmp1;
-    LLVMValueRef mem_base_addr, maddr_phi = NULL;
-    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
-    LLVMBasicBlockRef check_succ, block_maddr_phi = NULL;
+    LLVMValueRef mem_base_addr;
+    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder),
+                      check_succ;
     LLVMValueRef mem_size;
     bool is_target_64bit;
 #if WASM_ENABLE_MEMORY64 == 0
     bool is_memory64 = false;
 #else
     bool is_memory64 = IS_MEMORY64;
+#endif
+#if WASM_ENABLE_SHARED_HEAP != 0
+    LLVMValueRef maddr_phi = NULL;
+    LLVMBasicBlockRef block_maddr_phi = NULL;
 #endif
 
     is_target_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
@@ -1414,6 +1427,7 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         block_curr = check_integer_overflow_end;
     }
 
+#if WASM_ENABLE_SHARED_HEAP != 0
     if (comp_ctx->enable_shared_heap /* TODO: && mem_idx == 0 */) {
         ADD_BASIC_BLOCK(block_maddr_phi, "maddr_phi");
         SET_BUILD_POS(block_maddr_phi);
@@ -1431,6 +1445,7 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             goto fail;
         }
     }
+#endif
 
     /* mem_size is always 64-bit, extend max_addr on 32 bits platform */
     if (!is_target_64bit
@@ -1454,6 +1469,7 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         goto fail;
     }
 
+#if WASM_ENABLE_SHARED_HEAP != 0
     if (comp_ctx->enable_shared_heap /* TODO: && mem_idx == 0 */) {
         block_curr = LLVMGetInsertBlock(comp_ctx->builder);
         LLVMAddIncoming(maddr_phi, &maddr, &block_curr, 1);
@@ -1465,6 +1481,7 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         return maddr_phi;
     }
     else
+#endif
         return maddr;
 fail:
     return NULL;
