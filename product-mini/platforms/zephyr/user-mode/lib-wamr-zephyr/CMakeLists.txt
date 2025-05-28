@@ -39,6 +39,11 @@ endif ()
 # Limited to global heap usage in Zephyr user mode
 set (WAMR_BUILD_GLOBAL_HEAP_POOL 1)
 
+set (WAMR_BH_LOG zephyr_log)
+set (BH_DEBUG 1)
+add_definitions (-DBUILTIN_LIBC_BUFFERED_PRINTF=1)
+add_definitions (-DBUILTIN_LIBC_BUFFERED_PRINT_SIZE=256)
+
 # Override the global heap size for small devices
 if (NOT DEFINED WAMR_BUILD_GLOBAL_HEAP_SIZE)
   set (WAMR_BUILD_GLOBAL_HEAP_SIZE 40960) # 40 KB

@@ -16,6 +16,7 @@
 #include "test_wasm.h"
 #endif /* end of BUILD_TARGET_RISCV64_LP64 || BUILD_TARGET_RISCV32_ILP32 */
 
+#include <zephyr/logging/log.h>
 #if defined(BUILD_TARGET_RISCV64_LP64) || defined(BUILD_TARGET_RISCV32_ILP32)
 #define CONFIG_GLOBAL_HEAP_BUF_SIZE 5120
 #define CONFIG_APP_STACK_SIZE 512
@@ -25,6 +26,8 @@
 #define CONFIG_APP_STACK_SIZE 8192
 #define CONFIG_APP_HEAP_SIZE 8192
 #endif /* end of BUILD_TARGET_RISCV64_LP64 || BUILD_TARGET_RISCV32_ILP32 */
+
+LOG_MODULE_REGISTER(wamr_lib_log, LOG_LEVEL_DBG);
 
 static int app_argc;
 static char **app_argv;
@@ -42,6 +45,109 @@ static char **app_argv;
 bool
 wasm_application_execute_main(wasm_module_inst_t module_inst, int argc,
                               char *argv[]);
+
+// struct str_context {
+//     char *str;
+//     uint32 max;
+//     uint32 count;
+// #if BUILTIN_LIBC_BUFFERED_PRINTF != 0
+//     char print_buf[BUILTIN_LIBC_BUFFERED_PRINT_SIZE];
+//     uint32 print_buf_size;
+// #endif
+// };
+
+// typedef char *_va_list;
+
+// typedef int (*out_func_t)(int c, void *ctx);
+
+// static int
+// sprintf_out(int c, struct str_context *ctx)
+// {
+//     if (!ctx->str || ctx->count >= ctx->max) {
+//         ctx->count++;
+//         return c;
+//     }
+
+//     if (ctx->count == ctx->max - 1) {
+//         ctx->str[ctx->count++] = '\0';
+//     }
+//     else {
+//         ctx->str[ctx->count++] = (char)c;
+//     }
+
+//     return c;
+// }
+
+// static int
+// snprintf_wrapper(wasm_exec_env_t exec_env, char *str, uint32 size,
+//                  const char *format, _va_list va_args)
+// {
+//     wasm_module_inst_t module_inst = get_module_inst(exec_env);
+//     struct str_context ctx;
+
+//     /* str and format have been checked by runtime */
+//     if (!validate_native_addr(va_args, (uint64)sizeof(uint32)))
+//         return 0;
+
+//     ctx.str = str;
+//     ctx.max = size;
+//     ctx.count = 0;
+
+//     if (!_vprintf_wa((out_func_t)sprintf_out, &ctx, format, va_args,
+//                      module_inst))
+//         return 0;
+
+//     if (ctx.count < ctx.max) {
+//         str[ctx.count] = '\0';
+//     }
+
+//     return (int)ctx.count;
+// }
+
+// void
+// wasm_log_wrapper(wasm_exec_env_t exec_env, uint32 log_level, const char *fmt,
+//                  _va_list va_args)
+// {
+//         wasm_module_inst_t module_inst = get_module_inst(exec_env);
+//     struct str_context ctx = { 0 };
+
+//     memset(&ctx, 0, sizeof(ctx));
+
+// }
+
+void
+zephyr_log(uint32 log_level, const char *file, int line, const char *fmt, ...)
+{
+    /* File and line wasn't used except for LOG_FATAL and it wasn't used at all
+     */
+    (void *)file;
+    (void *)line;
+    char msg_buf[200];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
+    va_end(args);
+
+    switch (log_level) {
+        case WASM_LOG_LEVEL_ERROR:
+            LOG_ERR("%s", msg_buf);
+            break;
+        case WASM_LOG_LEVEL_WARNING:
+            LOG_WRN("%s", msg_buf);
+            break;
+        case WASM_LOG_LEVEL_DEBUG:
+            LOG_INF("%s", msg_buf);
+            break;
+        case WASM_LOG_LEVEL_VERBOSE:
+            LOG_DBG("%s", msg_buf);
+            break;
+        default:
+            // Ignore or fallback
+            break;
+    }
+
+    va_end(args);
+}
 
 static void *
 app_instance_main(wasm_module_inst_t module_inst)
@@ -106,6 +212,8 @@ iwasm_main(void *arg1, void *arg2, void *arg3)
     (void)arg1;
     (void)arg2;
     (void)arg3;
+
+    LOG_DBG("WAMR user mode library\n");
 
     os_printf("User mode thread: start\n");
 

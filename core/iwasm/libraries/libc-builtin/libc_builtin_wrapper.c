@@ -8,6 +8,12 @@
 #include "wasm_export.h"
 #include "../interpreter/wasm.h"
 
+#if KERNEL_VERSION_NUMBER > 0x030400 /* version 3.4.0 */
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(wasm_log, LOG_LEVEL_INF);
+#endif
+
 #if defined(_WIN32) || defined(_WIN32_)
 #define strncasecmp _strnicmp
 #define strcasecmp _stricmp
@@ -383,6 +389,9 @@ static int
 printf_out(int c, struct str_context *ctx)
 {
     os_printf("%c", c);
+#if KERNEL_VERSION_NUMBER > 0x030400 /* version 3.4.0 */
+    LOG_DBG("%c", c);
+#endif
     ctx->count++;
     return c;
 }
@@ -407,6 +416,9 @@ printf_wrapper(wasm_exec_env_t exec_env, const char *format, _va_list va_args)
 #if BUILTIN_LIBC_BUFFERED_PRINTF != 0
     if (ctx.print_buf_size > 0)
         os_printf("%s", ctx.print_buf);
+#if KERNEL_VERSION_NUMBER > 0x030400 /* version 3.4.0 */
+    LOG_INF("%s", ctx.print_buf);
+#endif
 #endif
 
     return (int)ctx.count;
