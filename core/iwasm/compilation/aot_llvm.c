@@ -3204,6 +3204,29 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
 
 #if WASM_ENABLE_WAMR_COMPILER != 0
     WASMModule *wasm_module = (WASMModule *)comp_data->wasm_module;
+    bool is_memory64 = false, target_support_hw_bounds_checks = false;
+
+    target_support_hw_bounds_checks =
+        strstr(comp_ctx->target_arch, "64") && !option->is_sgx_platform;
+
+    /* TODO: multi-memories for now assuming the memory idx type is
+     * consistent across multi-memories */
+    if (wasm_module->import_memory_count > 0)
+        is_memory64 = !!(wasm_module->import_memories[0].u.memory.mem_type.flags
+                         & MEMORY64_FLAG);
+    else if (wasm_module->memory_count > 0)
+        is_memory64 = !!(wasm_module->memories[0].flags & MEMORY64_FLAG);
+
+    /* For hw bounds checks, it's only avaiable on 64 bit platform and
+     * memory32. Warn the user and reset the compliation flag to enable
+     * sw bounds checks. */
+    if (!comp_ctx->enable_bound_check
+        && (!target_support_hw_bounds_checks || is_memory64)) {
+        LOG_WARNING("HW bounds checks are not available on 32-bit platforms "
+                    "and are not available for memory64; automatically enable "
+                    "SW bounds checks.");
+        comp_ctx->enable_bound_check = true;
+    }
 
     /* Return error if SIMD is disabled by command line but SIMD instructions
      * are used */

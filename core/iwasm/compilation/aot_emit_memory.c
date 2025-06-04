@@ -275,7 +275,7 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     /* offset1 = offset + addr; */
     BUILD_OP(Add, offset_const, addr, offset1, "offset1");
 
-    if (is_memory64 && comp_ctx->enable_bound_check) {
+    if (is_memory64) {
         /* Check whether integer overflow occurs in offset + addr */
         LLVMBasicBlockRef check_integer_overflow_end;
         ADD_BASIC_BLOCK(check_integer_overflow_end,
@@ -1231,7 +1231,7 @@ check_bulk_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     BUILD_OP(Add, offset, bytes, max_addr, "max_addr");
 
-    if (is_memory64 && comp_ctx->enable_bound_check) {
+    if (is_memory64) {
         /* Check whether integer overflow occurs in offset + addr */
         LLVMBasicBlockRef check_integer_overflow_end;
         ADD_BASIC_BLOCK(check_integer_overflow_end,
