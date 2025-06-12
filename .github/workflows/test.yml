@@ -1,0 +1,39 @@
+name: Cross-platform /opt Test
+
+on:
+  # allow to be triggered manually
+  workflow_dispatch:
+
+jobs:
+  test-opt-dir:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup /opt and test file (Unix shell)
+        shell: bash
+        run: |
+          set -e
+          echo "Creating /opt and a test file"
+          mkdir -p /opt
+          echo "Hello from /opt!" > /opt/hello.txt
+          echo "Contents of /opt:"
+          ls -l /opt
+          echo "Print /opt/hello.txt:"
+          cat /opt/hello.txt
+
+      - name: Run test script using /opt
+        shell: bash
+        run: |
+          echo "Running shell script that uses /opt/hello.txt"
+          if [ -f /opt/hello.txt ]; then
+            cat /opt/hello.txt
+          else
+            echo "File not found!"
+            exit 1
+          fi
