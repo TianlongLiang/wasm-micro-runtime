@@ -162,7 +162,7 @@ reschedule_timer(timer_ctx_t ctx, app_timer_t *timer)
               prev->id);
     }
     else {
-        /* insert at the begin */
+        /* insert at the beginning */
         bh_assert(ctx->app_timers == NULL);
         ctx->app_timers = timer;
         PRINT("rescheduled timer [%d] as first\n", timer->id);
