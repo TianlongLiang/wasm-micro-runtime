@@ -1230,6 +1230,16 @@ wasm_runtime_unregister_natives(const char *module_name,
                                 NativeSymbol *native_symbols);
 
 /* See wasm_export.h for description */
+WASM_RUNTIME_API_EXTERN NativeSymbolACL *
+wasm_runtime_create_native_symbol_acl(const char *module_name,
+                                      NativeSymbol *native_symbols,
+                                      uint32 n_native_symbols);
+
+/* See wasm_export.h for description */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_destroy_native_symbol_acl(NativeSymbolACL *native_acl);
+
+/* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void *
 wasm_runtime_create_context_key(void (*dtor)(WASMModuleInstanceCommon *inst,
                                              void *ctx));
@@ -1383,6 +1393,10 @@ wasm_runtime_check_and_update_last_used_shared_heap(
 #endif
 
 #if WASM_ENABLE_NATIVE_API_ACL != 0
+/*
+ * Check whether calling the specified native function is allowed by the
+ * module's NativeSymbolACL configuration.
+ */
 bool
 wasm_runtime_native_acl_check(const WASMModuleCommon *module_comm,
                               const char *module_name, const char *func_name);

@@ -360,7 +360,9 @@ typedef struct AOTModule {
     uint32 feature_flags;
 #endif
 #if WASM_ENABLE_NATIVE_API_ACL != 0
+    /* Access control list for native symbols */
     NativeSymbolACL *native_acl;
+    /* Number of ACL entries */
     uint32 native_acl_count;
 #endif
 } AOTModule;

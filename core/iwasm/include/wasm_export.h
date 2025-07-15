@@ -275,7 +275,9 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    /* List of ACLs allowed when loading the module */
     NativeSymbolACL *native_acl_list;
+    /* Number of ACL entries */
     uint32_t native_acl_count;
     /* TODO: more fields? */
 } LoadArgs;
@@ -1771,6 +1773,29 @@ wasm_runtime_register_natives_raw(const char *module_name,
 WASM_RUNTIME_API_EXTERN bool
 wasm_runtime_unregister_natives(const char *module_name,
                                 NativeSymbol *native_symbols);
+
+/**
+ * Create a NativeSymbolACL instance from a NativeSymbol list.
+ *
+ * @param module_name the module name of the native symbols
+ * @param native_symbols specifies an array of NativeSymbol structures
+ * @param n_native_symbols the number of native symbols in the array
+ *
+ * @return the NativeSymbolACL instance created, NULL if failed
+ */
+WASM_RUNTIME_API_EXTERN NativeSymbolACL *
+wasm_runtime_create_native_symbol_acl(const char *module_name,
+                                      NativeSymbol *native_symbols,
+                                      uint32_t n_native_symbols);
+
+/**
+ * Destroy the NativeSymbolACL instance created from
+ * wasm_runtime_create_native_symbol_acl()
+ *
+ * @param native_acl the NativeSymbolACL instance to destroy
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_destroy_native_symbol_acl(NativeSymbolACL *native_acl);
 
 /**
  * Get an export global instance

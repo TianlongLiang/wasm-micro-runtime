@@ -7102,6 +7102,7 @@ wasm_loader_load(uint8 *buf, uint32 size,
     module->native_acl_count = args->native_acl_count;
     if (args->native_acl_count) {
         acl_size = sizeof(NativeSymbolACL) * (uint64)args->native_acl_count;
+        /* Copy ACL data from load arguments to module */
         module->native_acl = loader_malloc(acl_size, error_buf, error_buf_size);
         if (!module->native_acl)
             goto fail;

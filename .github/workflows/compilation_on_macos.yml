@@ -414,6 +414,13 @@ jobs:
           ./run.sh test1
           ./run.sh test2
 
+      - name: Build Sample [native-acl]
+        run: |
+          cd samples/native-acl
+          ./build.sh
+          ./run.sh
+          ./run.sh --aot
+
       - name: Build Sample [shared-heap]
         run: |
           cd samples/shared-heap

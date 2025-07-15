@@ -7975,6 +7975,10 @@ wasm_runtime_check_and_update_last_used_shared_heap(
 #endif
 
 #if WASM_ENABLE_NATIVE_API_ACL != 0
+/*
+ * Verify whether a native function import is permitted according to the
+ * NativeSymbolACL configured for the module.
+ */
 bool
 wasm_runtime_native_acl_check(const WASMModuleCommon *module_comm,
                               const char *module_name, const char *func_name)
@@ -8017,5 +8021,50 @@ wasm_runtime_native_acl_check(const WASMModuleCommon *module_comm,
 
 fail:
     return false;
+}
+
+/*
+ * Helper to build a NativeSymbolACL instance from a list of NativeSymbol
+ * entries. The returned ACL should be released with
+ * wasm_runtime_destroy_native_symbol_acl().
+ */
+NativeSymbolACL *
+wasm_runtime_create_native_symbol_acl(const char *module_name,
+                                      NativeSymbol *native_symbols,
+                                      uint32 n_native_symbols)
+{
+    NativeSymbolACL *acl;
+    const char **func_list;
+    uint32 i;
+
+    if (!module_name || !native_symbols || n_native_symbols == 0)
+        return NULL;
+
+    if (!(acl = wasm_runtime_malloc(sizeof(NativeSymbolACL))))
+        return NULL;
+
+    if (!(func_list = wasm_runtime_malloc(sizeof(char *) * n_native_symbols))) {
+        wasm_runtime_free(acl);
+        return NULL;
+    }
+
+    for (i = 0; i < n_native_symbols; i++)
+        func_list[i] = native_symbols[i].symbol;
+
+    acl->module_name = module_name;
+    acl->func_list = func_list;
+    acl->func_count = n_native_symbols;
+    return acl;
+}
+
+/* Destroy the ACL instance created by wasm_runtime_create_native_symbol_acl */
+void
+wasm_runtime_destroy_native_symbol_acl(NativeSymbolACL *native_acl)
+{
+    if (!native_acl)
+        return;
+
+    wasm_runtime_free((void *)native_acl->func_list);
+    wasm_runtime_free(native_acl);
 }
 #endif /* end of WASM_ENABLE_NATIVE_API_ACL != 0 */

@@ -2,6 +2,7 @@
 #include "bh_read_file.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* Declarations from native_impl.c */
 uint32_t
@@ -13,8 +14,22 @@ int
 main(int argc, char *argv[])
 {
     const char *wasm_file = "wasm-apps/acl_app.wasm";
-    if (argc > 1)
-        wasm_file = argv[1];
+    bool aot_mode = false;
+    int arg_idx = 1;
+
+    if (argc > 1 && !strcmp(argv[1], "--aot")) {
+        aot_mode = true;
+        wasm_file = "wasm-apps/acl_app.aot";
+        arg_idx = 2;
+    }
+
+    if (argc > arg_idx)
+        wasm_file = argv[arg_idx];
+
+    if (!aot_mode)
+        printf("Run in interpreter mode\n");
+    else
+        printf("Run in AOT mode\n");
 
     static char global_heap[64 * 1024];
     RuntimeInitArgs init_args;
@@ -42,12 +57,16 @@ main(int argc, char *argv[])
 
     char error_buf[128];
 #if WASM_ENABLE_NATIVE_API_ACL != 0
-    const char *allow_list[] = { "native_add" };
-    NativeSymbolACL acl = { "env", allow_list,
-                            sizeof(allow_list) / sizeof(char *) };
+    NativeSymbolACL *acl = NULL;
+    NativeSymbol *symbols = get_symbols();
+    NativeSymbol allow_symbols[] = { symbols[0] };
+    /* Build allow list permitting only native_add */
+    acl = wasm_runtime_create_native_symbol_acl("env", allow_symbols,
+                                                sizeof(allow_symbols) /
+                                                    sizeof(NativeSymbol));
     LoadArgs load_args = { 0 };
     load_args.name = "";
-    load_args.native_acl_list = &acl;
+    load_args.native_acl_list = acl;
     load_args.native_acl_count = 1;
     wasm_module_t module = wasm_runtime_load_ex(buf, buf_size, &load_args,
                                                 error_buf, sizeof(error_buf));
@@ -102,6 +121,10 @@ fail3:
 fail2:
     wasm_runtime_unload(module);
 fail1:
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    /* Release the ACL created earlier */
+    wasm_runtime_destroy_native_symbol_acl(acl);
+#endif
     wasm_runtime_destroy();
     return 0;
 }
