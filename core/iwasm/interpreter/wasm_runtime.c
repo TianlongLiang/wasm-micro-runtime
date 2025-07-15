@@ -166,6 +166,15 @@ wasm_resolve_import_func(const WASMModule *module, WASMFunctionImport *function)
     char error_buf[128];
     WASMModule *sub_module = NULL;
 #endif
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    if (!wasm_runtime_native_acl_check((const WASMModuleCommon *)module,
+                                       function->module_name,
+                                       function->field_name)) {
+        LOG_WARNING("Import (%s, %s) is not allowed", function->module_name,
+                    function->field_name);
+        return false;
+    }
+#endif
     function->func_ptr_linked = wasm_native_resolve_symbol(
         function->module_name, function->field_name, function->func_type,
         &function->signature, &function->attachment, &function->call_conv_raw);

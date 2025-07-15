@@ -12,6 +12,9 @@
 #if WASM_ENABLE_GC != 0
 #include "gc_export.h"
 #endif
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+#include "lib_export.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -1128,6 +1131,11 @@ struct WASMModule {
     bool is_simd_used;
     bool is_ref_types_used;
     bool is_bulk_memory_used;
+#endif
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    NativeSymbolACL *native_acl;
+    uint32 native_acl_count;
 #endif
 
     /* user defined name */

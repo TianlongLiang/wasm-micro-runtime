@@ -526,6 +526,8 @@ typedef struct WASMModuleCommon *wasm_module_t;
 
 #ifndef LOAD_ARGS_OPTION_DEFINED
 #define LOAD_ARGS_OPTION_DEFINED
+typedef struct NativeSymbolACL NativeSymbolACL;
+
 typedef struct LoadArgs {
     char *name;
     /* True by default, used by wasm-c-api only.
@@ -538,6 +540,8 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    NativeSymbolACL *native_acl_list;
+    uint32 native_acl_count;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

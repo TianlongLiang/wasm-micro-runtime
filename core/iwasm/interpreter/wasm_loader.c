@@ -6647,6 +6647,10 @@ create_module(char *name, char *error_buf, uint32 error_buf_size)
 
     module->name = name;
     module->is_binary_freeable = false;
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    module->native_acl = NULL;
+    module->native_acl_count = 0;
+#endif
 
 #if WASM_ENABLE_FAST_INTERP == 0
     module->br_table_cache_list = &module->br_table_cache_list_head;
@@ -7084,10 +7088,26 @@ wasm_loader_load(uint8 *buf, uint32 size,
 #endif
                  const LoadArgs *args, char *error_buf, uint32 error_buf_size)
 {
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    uint64 acl_size;
+#endif
+
     WASMModule *module = create_module(args->name, error_buf, error_buf_size);
     if (!module) {
         return NULL;
     }
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    module->native_acl = NULL;
+    module->native_acl_count = args->native_acl_count;
+    if (args->native_acl_count) {
+        acl_size = sizeof(NativeSymbolACL) * (uint64)args->native_acl_count;
+        module->native_acl = loader_malloc(acl_size, error_buf, error_buf_size);
+        if (!module->native_acl)
+            goto fail;
+        memcpy(module->native_acl, args->native_acl_list, (uint32)acl_size);
+    }
+#endif
 
 #if WASM_ENABLE_DEBUG_INTERP != 0 || WASM_ENABLE_FAST_JIT != 0 \
     || WASM_ENABLE_DUMP_CALL_STACK != 0 || WASM_ENABLE_JIT != 0
@@ -7372,6 +7392,11 @@ wasm_loader_unload(WASMModule *module)
             wasm_runtime_free(module->stringref_rtts[i]);
     }
 #endif
+#endif
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    if (module->native_acl)
+        wasm_runtime_free(module->native_acl);
 #endif
 
     wasm_runtime_free(module);

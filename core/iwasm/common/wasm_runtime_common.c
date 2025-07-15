@@ -7973,3 +7973,49 @@ wasm_runtime_check_and_update_last_used_shared_heap(
     return false;
 }
 #endif
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+bool
+wasm_runtime_native_acl_check(const WASMModuleCommon *module_comm,
+                              const char *module_name, const char *func_name)
+{
+    if (!module_comm)
+        return false;
+
+#if WASM_ENABLE_INTERP != 0 || WASM_ENABLE_JIT != 0
+    if (module_comm->module_type == Wasm_Module_Bytecode) {
+        const WASMModule *mod = (const WASMModule *)module_comm;
+        if (!mod->native_acl_count)
+            return true;
+        NativeSymbolACL *acl = mod->native_acl;
+        if (!strcmp(module_name, acl->module_name)) {
+            for (uint32 i = 0; i < acl->func_count; i++) {
+                if (!strcmp(acl->func_list[i], func_name))
+                    return true;
+            }
+            goto fail;
+        }
+        goto fail;
+    }
+#endif
+#if WASM_ENABLE_AOT != 0
+    if (module_comm->module_type == Wasm_Module_AoT) {
+        const AOTModule *mod = (const AOTModule *)module_comm;
+        if (!mod->native_acl_count)
+            return true;
+        NativeSymbolACL *acl = mod->native_acl;
+        if (!strcmp(module_name, acl->module_name)) {
+            for (uint32 i = 0; i < acl->func_count; i++) {
+                if (!strcmp(acl->func_list[i], func_name))
+                    return true;
+            }
+            goto fail;
+        }
+        goto fail;
+    }
+#endif
+
+fail:
+    return false;
+}
+#endif /* end of WASM_ENABLE_NATIVE_API_ACL != 0 */

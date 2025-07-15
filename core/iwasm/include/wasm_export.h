@@ -275,6 +275,8 @@ typedef struct LoadArgs {
        wasm_runtime_load_ex has to be followed by a wasm_runtime_resolve_symbols
        call */
     bool no_resolve;
+    NativeSymbolACL *native_acl_list;
+    uint32_t native_acl_count;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */

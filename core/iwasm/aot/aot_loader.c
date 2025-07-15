@@ -4188,6 +4188,10 @@ create_module(char *name, char *error_buf, uint32 error_buf_size)
 
     module->name = name;
     module->is_binary_freeable = false;
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    module->native_acl = NULL;
+    module->native_acl_count = 0;
+#endif
 
 #if WASM_ENABLE_MULTI_MODULE != 0
     module->import_module_list = &module->import_module_list_head;
@@ -4490,10 +4494,28 @@ AOTModule *
 aot_load_from_aot_file(const uint8 *buf, uint32 size, const LoadArgs *args,
                        char *error_buf, uint32 error_buf_size)
 {
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    uint64 acl_size;
+#endif
+
     AOTModule *module = create_module(args->name, error_buf, error_buf_size);
 
     if (!module)
         return NULL;
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    module->native_acl = NULL;
+    module->native_acl_count = args->native_acl_count;
+    if (args->native_acl_count) {
+        acl_size = sizeof(NativeSymbolACL) * (uint64)args->native_acl_count;
+        module->native_acl = loader_malloc(acl_size, error_buf, error_buf_size);
+        if (!module->native_acl) {
+            aot_unload(module);
+            return NULL;
+        }
+        memcpy(module->native_acl, args->native_acl_list, (uint32)acl_size);
+    }
+#endif
 
     os_thread_jit_write_protect_np(false); /* Make memory writable */
     if (!load(buf, size, module, args->wasm_binary_freeable, args->no_resolve,
@@ -4705,6 +4727,11 @@ aot_unload(AOTModule *module)
         }
     }
 #endif
+#endif
+
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    if (module->native_acl)
+        wasm_runtime_free(module->native_acl);
 #endif
 
     wasm_runtime_free(module);

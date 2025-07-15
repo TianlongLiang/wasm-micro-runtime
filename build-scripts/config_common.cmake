@@ -215,6 +215,10 @@ if (NOT DEFINED WAMR_BUILD_EXTENDED_CONST_EXPR)
   set (WAMR_BUILD_EXTENDED_CONST_EXPR 0)
 endif ()
 
+if (NOT DEFINED WAMR_BUILD_NATIVE_API_ACL)
+  set (WAMR_BUILD_NATIVE_API_ACL 0)
+endif ()
+
 ########################################
 # Compilation options to marco
 ########################################
@@ -683,6 +687,13 @@ if (WAMR_BUILD_EXTENDED_CONST_EXPR EQUAL 1)
 else()
   message ("     Extended constant expression disabled")
   add_definitions(-DWASM_ENABLE_EXTENDED_CONST_EXPR=0)
+endif ()
+if (WAMR_BUILD_NATIVE_API_ACL EQUAL 1)
+  message ("     Native API access control enabled")
+  add_definitions(-DWASM_ENABLE_NATIVE_API_ACL=1)
+else()
+  message ("     Native API access control disabled")
+  add_definitions(-DWASM_ENABLE_NATIVE_API_ACL=0)
 endif ()
 ########################################
 # Show Phase4 Wasm proposals status.

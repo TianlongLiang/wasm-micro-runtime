@@ -359,6 +359,10 @@ typedef struct AOTModule {
 #if WASM_ENABLE_AOT_STACK_FRAME != 0
     uint32 feature_flags;
 #endif
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    NativeSymbolACL *native_acl;
+    uint32 native_acl_count;
+#endif
 } AOTModule;
 
 #define AOTMemoryInstance WASMMemoryInstance

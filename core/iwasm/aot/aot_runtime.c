@@ -5608,6 +5608,16 @@ aot_resolve_import_func(AOTModule *module, AOTImportFunc *import_func)
     char error_buf[128];
     AOTModule *sub_module = NULL;
 #endif
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+    if (module->native_acl_count
+        && !wasm_runtime_native_acl_check((const WASMModuleCommon *)module,
+                                          import_func->module_name,
+                                          import_func->func_name)) {
+        LOG_WARNING("Import (%s, %s) is not allowed", import_func->module_name,
+                    import_func->func_name);
+        return false;
+    }
+#endif
     import_func->func_ptr_linked = wasm_native_resolve_symbol(
         import_func->module_name, import_func->func_name,
         import_func->func_type, &import_func->signature,

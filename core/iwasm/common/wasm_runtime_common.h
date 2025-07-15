@@ -1382,6 +1382,12 @@ wasm_runtime_check_and_update_last_used_shared_heap(
     uint8 **shared_heap_base_addr_adj_p, bool is_memory64);
 #endif
 
+#if WASM_ENABLE_NATIVE_API_ACL != 0
+bool
+wasm_runtime_native_acl_check(const WASMModuleCommon *module_comm,
+                              const char *module_name, const char *func_name);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

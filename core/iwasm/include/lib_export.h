@@ -26,6 +26,12 @@ typedef struct NativeSymbol {
     void *attachment;
 } NativeSymbol;
 
+typedef struct NativeSymbolACL {
+    const char *module_name;
+    const char **func_list;
+    uint32_t func_count;
+} NativeSymbolACL;
+
 /* clang-format off */
 #define EXPORT_WASM_API(symbol) \
     { #symbol, (void *)symbol, NULL, NULL }
