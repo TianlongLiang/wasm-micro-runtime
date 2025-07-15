@@ -5,6 +5,8 @@
 #include <stdbool.h>
 
 /* Declarations from native_impl.c */
+static char global_heap[64 * 1024];
+
 uint32_t
 get_symbol_count(void);
 NativeSymbol *
@@ -15,7 +17,8 @@ main(int argc, char *argv[])
 {
     const char *wasm_file = "wasm-apps/acl_app.wasm";
     bool aot_mode = false;
-    int arg_idx = 1;
+    int arg_idx = 1, ret = 0;
+    RuntimeInitArgs init_args;
 
     if (argc > 1 && !strcmp(argv[1], "--aot")) {
         aot_mode = true;
@@ -31,10 +34,7 @@ main(int argc, char *argv[])
     else
         printf("Run in AOT mode\n");
 
-    static char global_heap[64 * 1024];
-    RuntimeInitArgs init_args;
     memset(&init_args, 0, sizeof(RuntimeInitArgs));
-
     init_args.mem_alloc_type = Alloc_With_Pool;
     init_args.mem_alloc_option.pool.heap_buf = global_heap;
     init_args.mem_alloc_option.pool.heap_size = sizeof(global_heap);
@@ -61,9 +61,8 @@ main(int argc, char *argv[])
     NativeSymbol *symbols = get_symbols();
     NativeSymbol allow_symbols[] = { symbols[0] };
     /* Build allow list permitting only native_add */
-    acl = wasm_runtime_create_native_symbol_acl("env", allow_symbols,
-                                                sizeof(allow_symbols) /
-                                                    sizeof(NativeSymbol));
+    acl = wasm_runtime_create_native_symbol_acl(
+        "env", allow_symbols, sizeof(allow_symbols) / sizeof(NativeSymbol));
     LoadArgs load_args = { 0 };
     load_args.name = "";
     load_args.native_acl_list = acl;
@@ -103,6 +102,7 @@ main(int argc, char *argv[])
     }
     else {
         printf("call_add failed: %s\n", wasm_runtime_get_exception(inst));
+        ret = -1;
     }
 
     func = wasm_runtime_lookup_function(inst, "call_sub");
@@ -110,6 +110,7 @@ main(int argc, char *argv[])
     call_args[1] = 1;
     if (func && wasm_runtime_call_wasm(env, func, 2, call_args)) {
         printf("call_sub result: %u\n", call_args[0]);
+        ret = -1;
     }
     else {
         printf("call_sub failed: %s\n", wasm_runtime_get_exception(inst));
@@ -126,5 +127,5 @@ fail1:
     wasm_runtime_destroy_native_symbol_acl(acl);
 #endif
     wasm_runtime_destroy();
-    return 0;
+    return ret;
 }
