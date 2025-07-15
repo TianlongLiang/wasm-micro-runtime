@@ -541,7 +541,7 @@ typedef struct LoadArgs {
        call */
     bool no_resolve;
     NativeSymbolACL *native_acl_list;
-    uint32 native_acl_count;
+    uint32_t native_acl_count;
     /* TODO: more fields? */
 } LoadArgs;
 #endif /* LOAD_ARGS_OPTION_DEFINED */
