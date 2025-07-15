@@ -4,9 +4,9 @@
 #include <string.h>
 #include <stdbool.h>
 
-/* Declarations from native_impl.c */
 static char global_heap[64 * 1024];
 
+/* Declarations from native_impl.c */
 uint32_t
 get_symbol_count(void);
 NativeSymbol *
