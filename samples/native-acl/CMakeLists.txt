@@ -18,3 +18,6 @@ include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 add_executable(native_acl src/main.c src/native_impl.c ${UNCOMMON_SHARED_SOURCE})
 
 target_link_libraries(native_acl vmlib -lm -ldl -lpthread)
+
+################ wasm application ###############
+add_subdirectory(wasm-app)

@@ -15,14 +15,14 @@ get_symbols(void);
 int
 main(int argc, char *argv[])
 {
-    const char *wasm_file = "wasm-apps/acl_app.wasm";
+    const char *wasm_file = "wasm-app/acl_app.wasm";
     bool aot_mode = false;
     int arg_idx = 1, ret = 0;
     RuntimeInitArgs init_args;
 
     if (argc > 1 && !strcmp(argv[1], "--aot")) {
         aot_mode = true;
-        wasm_file = "wasm-apps/acl_app.aot";
+        wasm_file = "wasm-app/acl_app.aot";
         arg_idx = 2;
     }
 
