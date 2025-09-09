@@ -163,7 +163,7 @@ endif ()
 ####################### Common sources #######################
 if (NOT MSVC)
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -ffunction-sections -fdata-sections \
-                                         -Wall -Wno-unused-parameter -Wno-pedantic")
+                                         -Wall -Wdouble-promotion -Wno-unused-parameter -Wno-pedantic")
 endif ()
 
 # include the build config template file
