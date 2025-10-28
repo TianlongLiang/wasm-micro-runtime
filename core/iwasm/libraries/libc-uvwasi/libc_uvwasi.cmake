@@ -26,7 +26,7 @@ if (LIBUV_FOUND)
 else()
     FetchContent_Declare(
         libuv
-        GIT_REPOSITORY https://github.com/libuv/libuv.git
+        GIT_REPOSITORY https://github.com/intel-innersource/thirdparty.libuv.git
         GIT_TAG ${LIBUV_VERSION}
     )
     FetchContent_MakeAvailable(libuv)
