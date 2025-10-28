@@ -286,6 +286,29 @@ main(int argc, char **argv)
         goto fail;
     }
 
+    void *native_ptr = NULL;
+    uint64_t offset = wasm_runtime_shared_heap_malloc(module_inst1, 32, &native_ptr);
+    if (!offset) {
+        printf("shared_heap_malloc failed");
+        goto fail;
+    }
+
+    uint64_t size = (uint64_t)UINT32_MAX + 0x2000;
+    bool ok = wasm_runtime_validate_app_addr(module_inst1, offset, size);
+    printf("validate result: %s\n", ok ? "true" : "false");
+
+    printf("%lx %lx\n", offset, size);
+
+    if (ok) {
+        uint8_t *ptr = wasm_runtime_addr_app_to_native(module_inst1, offset);
+        printf("memset start...\n");
+        memset(ptr, 0x41, size);
+        printf("memset done\n");
+    }
+    wasm_runtime_shared_heap_free(module_inst1, offset);
+
+    goto fail;
+
     /* wasm 1 produce shared data */
     wasm_producer(module_inst1, queue);
 
