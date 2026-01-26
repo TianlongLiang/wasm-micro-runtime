@@ -171,7 +171,7 @@ main(int argc, char *argv_main[])
     float ret_val;
     ret_val = results[0].of.f32;
     printf("Native finished calling wasm function generate_float(), returned a "
-           "float value: %ff\n",
+           "float value: %f\n",
            ret_val);
 
     // Next we will pass a buffer to the WASM function
