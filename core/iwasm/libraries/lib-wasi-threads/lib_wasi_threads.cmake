@@ -10,3 +10,4 @@ include_directories(${LIB_WASI_THREADS_DIR})
 set (LIB_WASI_THREADS_SOURCE
     ${LIB_WASI_THREADS_DIR}/lib_wasi_threads_wrapper.c
     ${LIB_WASI_THREADS_DIR}/tid_allocator.c)
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIB_WASI_THREADS_DIR}/lib_wasi_threads_wrapper.c)

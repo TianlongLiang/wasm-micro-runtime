@@ -56,3 +56,4 @@ set (UV_A_LIBS ${LIBUV_LIBRARIES} ${UVWASI_LIBRARIES})
 file (GLOB_RECURSE source_all ${LIBC_WASI_DIR}/*.c)
 
 set (LIBC_WASI_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIBC_WASI_DIR}/libc_uvwasi_wrapper.c)

@@ -14,4 +14,5 @@ include_directories(${LIB_PTHREAD_DIR})
 file (GLOB source_all ${LIB_PTHREAD_DIR}/*.c)
 
 set (LIB_PTHREAD_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIB_PTHREAD_DIR}/lib_pthread_wrapper.c)
 

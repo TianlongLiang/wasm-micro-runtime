@@ -10,4 +10,5 @@ include_directories(${LIBC_BUILTIN_DIR})
 file (GLOB source_all ${LIBC_BUILTIN_DIR}/*.c)
 
 set (LIBC_BUILTIN_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIBC_BUILTIN_DIR}/libc_builtin_wrapper.c)
 

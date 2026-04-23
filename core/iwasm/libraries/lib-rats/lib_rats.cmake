@@ -58,3 +58,4 @@ endif()
 file (GLOB source_all ${LIB_RATS_DIR}/*.c)
 
 set (LIB_RATS_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIB_RATS_DIR}/lib_rats_wrapper.c)

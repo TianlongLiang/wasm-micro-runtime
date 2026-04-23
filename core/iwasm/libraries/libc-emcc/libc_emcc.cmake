@@ -10,3 +10,4 @@ include_directories(${LIBC_EMCC_DIR})
 file (GLOB source_all ${LIBC_EMCC_DIR}/*.c)
 
 set (LIBC_EMCC_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIBC_EMCC_DIR}/libc_emcc_wrapper.c)

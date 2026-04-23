@@ -10,6 +10,7 @@ set(WASI_NN_SOURCES
   ${WASI_NN_ROOT}/src/wasi_nn.c
   ${WASI_NN_ROOT}/src/utils/wasi_nn_app_native.c
 )
+list (APPEND WAMR_NATIVE_API_SOURCES ${WASI_NN_ROOT}/src/wasi_nn.c)
 include_directories(${WASI_NN_ROOT}/include)
 add_compile_definitions(
   $<$<CONFIG:Debug>:NN_LOG_LEVEL=0>

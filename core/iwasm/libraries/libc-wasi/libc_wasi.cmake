@@ -11,3 +11,4 @@ include_directories(${LIBC_WASI_DIR}/sandboxed-system-primitives/include
 file (GLOB_RECURSE source_all ${LIBC_WASI_DIR}/*.c )
 
 set (LIBC_WASI_SOURCE ${source_all})
+list (APPEND WAMR_NATIVE_API_SOURCES ${LIBC_WASI_DIR}/libc_wasi_wrapper.c)

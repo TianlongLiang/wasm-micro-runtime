@@ -229,3 +229,36 @@ set (source_all
 )
 
 set (WAMR_RUNTIME_LIB_SOURCE ${source_all})
+
+################## Struct layout check (optional) ##################
+# When WAMR_CHECK_STRUCT_LAYOUT=ON, verify that structs passed across
+# the WASM-host boundary have identical layouts in native and wasm32.
+# Requires: Python3, pyelftools, wasi-sdk.
+option (WAMR_CHECK_STRUCT_LAYOUT
+        "Check WASM-host struct layout consistency at configure time" OFF)
+
+if (WAMR_CHECK_STRUCT_LAYOUT)
+  if (NOT DEFINED WASI_SDK_DIR)
+    foreach (_dir /opt/wasi-sdk $ENV{WASI_SDK_DIR}
+                  /opt/wasi-sdk-25.0-x86_64-linux
+                  /opt/wasi-sdk-29.0-x86_64-linux)
+      if (EXISTS "${_dir}/bin/clang")
+        set (WASI_SDK_DIR "${_dir}")
+        break ()
+      endif ()
+    endforeach ()
+  endif ()
+
+  if (WAMR_NATIVE_API_SOURCES AND WASI_SDK_DIR)
+    include (${WAMR_ROOT_DIR}/build-scripts/check_struct_layout.cmake)
+    check_wasm_struct_layout (
+      SOURCES      ${WAMR_NATIVE_API_SOURCES}
+      NATIVE_CC    ${CMAKE_C_COMPILER}
+      WASI_SDK     "${WASI_SDK_DIR}"
+    )
+  elseif (NOT WASI_SDK_DIR)
+    message (STATUS "WAMR_CHECK_STRUCT_LAYOUT: wasi-sdk not found, skipping")
+  elseif (NOT WAMR_NATIVE_API_SOURCES)
+    message (STATUS "WAMR_CHECK_STRUCT_LAYOUT: no native API sources registered")
+  endif ()
+endif ()
