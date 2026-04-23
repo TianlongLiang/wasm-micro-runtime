@@ -132,6 +132,148 @@ target_link_libraries(app PRIVATE wamr_lib)
   `add_dependencies(wamr_lib zephyr_generated_headers)` to avoid build race
   conditions with generated headers like `heap_constants.h`.
 
+### Multi-threaded user-mode demo
+
+This sample demonstrates WAMR running entirely in user mode with multi-threaded
+bh_queue communication. The architecture:
+
+```
+kernel main()                          (supervisor mode)
+  ├── set up memory domain (wamr_partition + z_libc_partition)
+  ├── os_thread_env_init_for_usermode()  grant MPU stack access
+  └── spawn wamr_main thread           (K_USER, K_FOREVER → start after setup)
+
+iwasm_main()                           (user mode, in wamr_lib.c)
+  ├── wasm_runtime_full_init()          pool allocator, heap lock via k_object_alloc
+  ├── wasm_runtime_load()               load WASM module
+  ├── bh_queue_create()                 queue lock + condvar via k_object_alloc
+  └── os_thread_create() × N workers   (K_USER | K_INHERIT_PERMS, automatic)
+        ├── wasm_runtime_instantiate()  each worker gets its own WASM instance
+        ├── wasm_application_execute_main()  run the WASM app
+        ├── bh_post_msg() × M          send messages to shared bh_queue
+        └── wasm_runtime_deinstantiate()
+
+iwasm_main() consumer loop             (user mode)
+  ├── bh_get_msg(BHT_WAIT_FOREVER)     blocks on k_condvar
+  └── os_thread_join() × N             wait for workers to finish
+```
+
+All WAMR code — runtime init, module loading, WASM execution, bh_queue
+operations, and worker thread creation — runs in user mode. The only supervisor
+code is in `main.c`: memory domain setup and one-time stack access grants.
+
+### Platform changes for user-mode thread support
+
+The following changes to `core/shared/platform/zephyr/` enable WAMR's thread
+primitives to work from user-mode threads. These are platform-wide changes, not
+sample-specific.
+
+#### Kernel object allocation (`platform_internal.h`)
+
+Under `CONFIG_USERSPACE + CONFIG_DYNAMIC_OBJECTS`, kernel objects (mutexes,
+semaphores, condvars) must be registered in the kernel object table for syscall
+validation. Statically allocated objects inside WAMR's heap are not registered
+and will fail with `-EINVAL`.
+
+**Fix:** `zmutex_t` and `zsem_t` become pointers to dynamically allocated
+objects via `k_object_alloc()`. Macros dereference transparently so no call-site
+changes are needed throughout WAMR:
+
+```c
+/* Before: zmutex_t = struct k_mutex (value type, in WAMR heap) */
+/* After:  zmutex_t = struct k_mutex * (pointer to k_object_alloc'd object) */
+#define zmutex_init(mtx) do { \
+    *(mtx) = k_object_alloc(K_OBJ_MUTEX); \
+    if (*(mtx)) k_mutex_init(*(mtx)); \
+} while (0)
+```
+
+Destruction uses `k_object_release()` (a syscall, safe from user mode) instead
+of `k_object_free()` (not a syscall, causes GPF from user mode).
+
+#### Condition variables (`zephyr_thread.c`)
+
+The original condvar implementation used a hand-rolled semaphore-based wait list.
+This doesn't work from user mode because the internal semaphore operations aren't
+registered kernel objects.
+
+**Fix:** Use Zephyr's native `k_condvar` (available since Zephyr 2.7+):
+
+- `os_cond_init`: `k_object_alloc(K_OBJ_CONDVAR)` + `k_condvar_init()`
+- `os_cond_wait`: `k_condvar_wait()` (proper syscall)
+- `os_cond_signal/broadcast`: `k_condvar_signal/broadcast()`
+- `os_cond_destroy`: `k_object_release()`
+
+#### User-mode thread creation (`zephyr_thread.c`)
+
+`os_thread_create_with_prio()` now detects user context via `k_is_user_context()`
+and adapts:
+
+| | Kernel mode (original) | User mode (new) |
+|---|---|---|
+| Thread object | `BH_MALLOC(sizeof(os_thread_obj))` | `k_object_alloc(K_OBJ_THREAD)` |
+| Thread flags | `0` | `K_USER \| K_INHERIT_PERMS` |
+| Object tracking | `os_thread_obj` list | Separate `dyn_thread_node` list |
+| Cleanup | `BH_FREE` | `k_object_release` |
+
+`K_INHERIT_PERMS` is the key: child threads automatically inherit access to all
+kernel objects the parent has — bh_queue's mutex/condvar, the WAMR heap lock, etc.
+No manual `k_object_access_grant()` calls needed for each object.
+
+#### MPU stack access grants (`zephyr_thread.c`)
+
+`os_thread_create()` uses static MPU-aligned stacks defined via
+`K_THREAD_STACK_ARRAY_DEFINE`. These are kernel objects. When a user-mode thread
+calls `k_thread_create()`, Zephyr validates that the *calling* thread has
+permission to the stack object being passed — not just the child.
+
+This is a chicken-and-egg problem: the user-mode thread needs stack access to
+create child threads, but can't grant it to itself. So `main.c` calls
+`os_thread_env_init_for_usermode(tid)` from supervisor mode before starting the
+user-mode thread.
+
+#### Thread join race fix (`zephyr_thread.c`)
+
+The original `os_thread_join()` had a race condition: if the target thread exited
+before `os_thread_join()` was called, `os_thread_cleanup()` would remove and free
+the `thread_data`, making it impossible for the joiner to find it.
+
+**Fix:** `os_thread_cleanup()` now sets a `thread_exited` flag and signals
+waiters, but does not destroy `thread_data`. `os_thread_join()` checks the flag:
+
+- Thread still running → add wait node, block on semaphore (existing path), then
+  clean up `thread_data` after waking
+- Thread already exited → clean up `thread_data` immediately, no wait needed
+
+### Linker configuration (`lib-wamr-zephyr/CMakeLists.txt`)
+
+Zephyr links libraries in two sections:
+
+```
+--whole-archive:    app, libzephyr.a, drivers, libc   (all symbols kept)
+--no-whole-archive: libkernel.a, then wamr_lib.a      (on-demand extraction)
+```
+
+`k_mutex` and `k_sem` survive because Zephyr's own `--whole-archive` code
+(picolibc `locks.c`, `mpsc_pbuf.c`) references them, so the linker extracts
+those `.o` files from `libkernel.a` during its single pass.
+
+`k_condvar` has no such reference — nothing in Zephyr's core uses it. By the
+time the linker reaches `wamr_lib.a`, the condvar `.o` has already been skipped.
+`--undefined` pre-marks these symbols as needed so the linker extracts them:
+
+```cmake
+zephyr_link_libraries(
+  -Wl,--undefined=z_impl_k_condvar_init
+  -Wl,--undefined=z_impl_k_condvar_signal
+  -Wl,--undefined=z_impl_k_condvar_wait
+  -Wl,--undefined=z_impl_k_condvar_broadcast
+)
+```
+
+This is placed in the library's CMakeLists.txt (not the app's) because the
+dependency belongs to `wamr_lib`.
+
 ### Example Targets
 
 #### qemu_x86 (Zephyr 4.x with Zephyr SDK 1.0+)
@@ -159,17 +301,34 @@ west build -t run
 Expected output:
 
 ```
-*** Booting Zephyr OS build v4.4.0-rc2 ***
-wamr_partition start addr: 1257472, size: 45056
-User mode thread: start
 Hello world!
 buf ptr: 0x1458
 buf: 1234
-User mode thread: elapsed 10
+Hello world!
+buf ptr: 0x1458
+buf: 1234
+*** Booting Zephyr OS build v4.4.0-rc2 ***
+=== WAMR User-Mode Demo ===
+bh_queue created (user mode)
+
+Starting 2 workers (WASM + bh_queue, 5 msgs each):
+  worker 0: running WASM app
+  [send] worker 0: msg 0 "w0-msg0"
+  [recv] #0 from worker 0 seq 0 "w0-msg0"
+  worker 1: running WASM app
+  [send] worker 1: msg 0 "w1-msg0"
+  [recv] #1 from worker 1 seq 0 "w1-msg0"
+  ...
+Total: sent 10, received 10
+=== Demo complete ===
 ```
 
-> Note: The boot message order may vary. `wamr_partition` size should be around
-> 45056 bytes (40 KB global heap + other library globals).
+#### qemu_arc (ARC HS)
+
+```shell
+west build -b qemu_arc/qemu_arc_hs . -p always -- -DWAMR_BUILD_TARGET=ARC
+west build -t run
+```
 
 #### qemu_x86_tiny (older Zephyr / manual QEMU)
 

@@ -116,34 +116,84 @@
 #define STDERR_FILENO 2
 #endif
 
-/* Synchronization primitives for usermode.
+/* Synchronization primitives.
  * The macros are prefixed with 'z' because when building
  * with WAMR_BUILD_LIBC_WASI the same functions are defined,
  * and used in the sandboxed-system-primitives (see locking.h)
+ *
+ * Note: sys_mutex/sys_sem (the userspace-safe wrappers) require their
+ * addresses to be registered in the kernel object table via static
+ * definitions (SYS_MUTEX_DEFINE/SYS_SEM_DEFINE). WAMR dynamically
+ * allocates these structs inside its heap pool, so they are never
+ * registered and k_object_find() returns NULL, causing sys_mutex_lock
+ * and sys_sem_take to fail with -EINVAL. Use k_mutex/k_sem directly
+ * instead — kernel threads bypass permission checks, and user-mode
+ * threads can be granted access via k_thread_access_grant().
  */
-#ifdef CONFIG_USERSPACE
-#define zmutex_t struct sys_mutex
-#define zmutex_init(mtx) sys_mutex_init(mtx)
-#define zmutex_lock(mtx, timeout) sys_mutex_lock(mtx, timeout)
-#define zmutex_unlock(mtx) sys_mutex_unlock(mtx)
 
-#define zsem_t struct sys_sem
-#define zsem_init(sem, init_count, limit) sys_sem_init(sem, init_count, limit)
-#define zsem_give(sem) sys_sem_give(sem)
-#define zsem_take(sem, timeout) sys_sem_take(sem, timeout)
-#define zsem_count_get(sem) sys_sem_count_get(sem)
-#else /* else of CONFIG_USERSPACE */
+#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+/*
+ * Under CONFIG_USERSPACE, kernel objects must be registered in the kernel
+ * object table for syscall validation. Use k_object_alloc to dynamically
+ * allocate and register them. Types become pointers; macros dereference
+ * transparently so no call-site changes are needed.
+ *
+ * Example expansion:
+ *   zmutex_lock(&some_lock, K_FOREVER)
+ *   → k_mutex_lock(*(&some_lock), K_FOREVER)
+ *   → k_mutex_lock(some_lock, K_FOREVER)    // some_lock is struct k_mutex *
+ */
+#define zmutex_t struct k_mutex *
+#define zmutex_init(mtx)                      \
+    do {                                      \
+        *(mtx) = k_object_alloc(K_OBJ_MUTEX); \
+        if (*(mtx))                           \
+            k_mutex_init(*(mtx));             \
+    } while (0)
+#define zmutex_lock(mtx, timeout) k_mutex_lock(*(mtx), timeout)
+#define zmutex_unlock(mtx) k_mutex_unlock(*(mtx))
+#define zmutex_destroy(mtx)           \
+    do {                              \
+        if (*(mtx)) {                 \
+            k_object_release(*(mtx)); \
+            *(mtx) = NULL;            \
+        }                             \
+    } while (0)
+
+#define zsem_t struct k_sem *
+#define zsem_init(sem, init_count, limit)          \
+    do {                                           \
+        *(sem) = k_object_alloc(K_OBJ_SEM);        \
+        if (*(sem))                                \
+            k_sem_init(*(sem), init_count, limit); \
+    } while (0)
+#define zsem_give(sem) k_sem_give(*(sem))
+#define zsem_take(sem, timeout) k_sem_take(*(sem), timeout)
+#define zsem_count_get(sem) k_sem_count_get(*(sem))
+#define zsem_destroy(sem)             \
+    do {                              \
+        if (*(sem)) {                 \
+            k_object_release(*(sem)); \
+            *(sem) = NULL;            \
+        }                             \
+    } while (0)
+
+#else /* !CONFIG_USERSPACE || !CONFIG_DYNAMIC_OBJECTS */
+
 #define zmutex_t struct k_mutex
 #define zmutex_init(mtx) k_mutex_init(mtx)
 #define zmutex_lock(mtx, timeout) k_mutex_lock(mtx, timeout)
 #define zmutex_unlock(mtx) k_mutex_unlock(mtx)
+#define zmutex_destroy(mtx) ((void)0)
 
 #define zsem_t struct k_sem
 #define zsem_init(sem, init_count, limit) k_sem_init(sem, init_count, limit)
 #define zsem_give(sem) k_sem_give(sem)
 #define zsem_take(sem, timeout) k_sem_take(sem, timeout)
 #define zsem_count_get(sem) k_sem_count_get(sem)
-#endif /* end of CONFIG_USERSPACE */
+#define zsem_destroy(sem) ((void)0)
+
+#endif /* CONFIG_USERSPACE && CONFIG_DYNAMIC_OBJECTS */
 
 #define BH_APPLET_PRESERVED_STACK_SIZE (2 * BH_KB)
 
@@ -159,10 +209,17 @@ typedef unsigned int korp_sem;
    we just define the type to make the compiler happy */
 struct os_thread_wait_node;
 typedef struct os_thread_wait_node *os_thread_wait_list;
+
+#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+typedef struct korp_cond {
+    struct k_condvar *condvar;
+} korp_cond;
+#else
 typedef struct korp_cond {
     zmutex_t wait_list_lock;
     os_thread_wait_list thread_wait_list;
 } korp_cond;
+#endif
 
 typedef struct {
     struct k_mutex mtx; // Mutex for exclusive access

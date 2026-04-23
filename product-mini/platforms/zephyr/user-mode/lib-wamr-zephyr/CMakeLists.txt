@@ -41,7 +41,12 @@ set (WAMR_BUILD_GLOBAL_HEAP_POOL 1)
 
 # Override the global heap size for small devices
 if (NOT DEFINED WAMR_BUILD_GLOBAL_HEAP_SIZE)
-  set (WAMR_BUILD_GLOBAL_HEAP_SIZE 40960) # 40 KB
+  set (WAMR_BUILD_GLOBAL_HEAP_SIZE 65536) # 64 KB
+endif ()
+
+# Enable thread management for wasm_runtime_spawn_exec_env
+if (NOT DEFINED WAMR_BUILD_THREAD_MGR)
+  set (WAMR_BUILD_THREAD_MGR 1)
 endif ()
 
 set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
@@ -77,4 +82,28 @@ endif()
 # registration via set_property() instead, demonstrating the pre-built library approach.
 if (NOT WAMR_USE_PREBUILT_LIB)
   zephyr_library_app_memory (wamr_partition)
+endif ()
+
+# Under CONFIG_USERSPACE + CONFIG_DYNAMIC_OBJECTS, WAMR uses k_condvar
+# (via k_object_alloc + k_condvar_init/signal/wait/broadcast).
+#
+# Zephyr links libraries in two sections:
+#   --whole-archive   : app, libzephyr.a, drivers, libc  (all symbols kept)
+#   --no-whole-archive: libkernel.a, then wamr_lib.a     (on-demand extraction)
+#
+# k_mutex and k_sem survive because Zephyr's own --whole-archive code
+# (picolibc locks.c, mpsc_pbuf.c) already references them, so the linker
+# extracts those .o files from libkernel.a during its single pass.
+#
+# k_condvar has no such reference — nothing in Zephyr's core uses it.
+# By the time the linker reaches wamr_lib.a, the condvar .o in libkernel.a
+# has already been skipped. --undefined pre-marks these symbols as needed
+# so the linker extracts them when it scans libkernel.a.
+if (CONFIG_USERSPACE AND CONFIG_DYNAMIC_OBJECTS)
+  zephyr_link_libraries(
+    -Wl,--undefined=z_impl_k_condvar_init
+    -Wl,--undefined=z_impl_k_condvar_signal
+    -Wl,--undefined=z_impl_k_condvar_wait
+    -Wl,--undefined=z_impl_k_condvar_broadcast
+  )
 endif ()

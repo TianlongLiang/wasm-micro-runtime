@@ -5,168 +5,216 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <zephyr/kernel.h>
 #include "bh_platform.h"
-#include "bh_assert.h"
-#include "bh_log.h"
 #include "bh_queue.h"
 #include "wasm_export.h"
+
 #if defined(BUILD_TARGET_RISCV64_LP64) || defined(BUILD_TARGET_RISCV32_ILP32)
 #include "test_wasm_riscv64.h"
 #else
 #include "test_wasm.h"
-#endif /* end of BUILD_TARGET_RISCV64_LP64 || BUILD_TARGET_RISCV32_ILP32 */
+#endif
 
-#if defined(BUILD_TARGET_RISCV64_LP64) || defined(BUILD_TARGET_RISCV32_ILP32)
-#define CONFIG_GLOBAL_HEAP_BUF_SIZE 5120
-#define CONFIG_APP_STACK_SIZE 512
-#define CONFIG_APP_HEAP_SIZE 512
-#else /* else of BUILD_TARGET_RISCV64_LP64 || BUILD_TARGET_RISCV32_ILP32 */
 #define CONFIG_GLOBAL_HEAP_BUF_SIZE WASM_GLOBAL_HEAP_SIZE
-#define CONFIG_APP_STACK_SIZE 8192
-#define CONFIG_APP_HEAP_SIZE 8192
-#endif /* end of BUILD_TARGET_RISCV64_LP64 || BUILD_TARGET_RISCV32_ILP32 */
+#define APP_STACK_SIZE 8192
+#define APP_HEAP_SIZE 8192
+#define WORKER_STACK_SIZE 4096
+#define MSGS_PER_WORKER 5
 
-static int app_argc;
-static char **app_argv;
+static char global_heap_buf[CONFIG_GLOBAL_HEAP_BUF_SIZE] = { 0 };
 
-/**
- * Find the unique main function from a WASM module instance
- * and execute that function.
+struct test_msg {
+    int worker_id;
+    int seq;
+    char payload[32];
+};
+
+struct worker_ctx {
+    int id;
+    bh_queue *queue;
+    wasm_module_t module;
+};
+
+/*
+ * Worker thread: each worker instantiates the WASM module, runs its main
+ * function, then sends messages to the shared bh_queue.
  *
- * @param module_inst the WASM module instance
- * @param argc the number of arguments
- * @param argv the arguments array
- *
- * @return true if the main function is called, false otherwise.
+ * Created via os_thread_create — under CONFIG_USERSPACE, this sets
+ * K_USER | K_INHERIT_PERMS so the worker inherits access to bh_queue's
+ * internal mutex/condvar and the WAMR heap lock.
  */
-bool
-wasm_application_execute_main(wasm_module_inst_t module_inst, int argc,
-                              char *argv[]);
-
 static void *
-app_instance_main(wasm_module_inst_t module_inst)
+worker_entry(void *arg)
 {
-    const char *exception;
-    wasm_function_inst_t func;
-    wasm_exec_env_t exec_env;
-    unsigned argv[2] = { 0 };
+    struct worker_ctx *ctx = (struct worker_ctx *)arg;
+    wasm_module_inst_t inst;
+    char error_buf[128];
+    int i;
 
-    if (wasm_runtime_lookup_function(module_inst, "main")
-        || wasm_runtime_lookup_function(module_inst, "__main_argc_argv")) {
-        LOG_VERBOSE("Calling main function\n");
-        wasm_application_execute_main(module_inst, app_argc, app_argv);
-    }
-    else if ((func = wasm_runtime_lookup_function(module_inst, "app_main"))) {
-        exec_env =
-            wasm_runtime_create_exec_env(module_inst, CONFIG_APP_HEAP_SIZE);
-        if (!exec_env) {
-            os_printf("Create exec env failed\n");
-            return NULL;
-        }
-
-        LOG_VERBOSE("Calling app_main function\n");
-        wasm_runtime_call_wasm(exec_env, func, 0, argv);
-
-        if (!wasm_runtime_get_exception(module_inst)) {
-            os_printf("result: 0x%x\n", argv[0]);
-        }
-
-        wasm_runtime_destroy_exec_env(exec_env);
-    }
-    else {
-        os_printf("Failed to lookup function main or app_main to call\n");
+    /* Each worker gets its own WASM instance — thread-safe, no shared state */
+    inst = wasm_runtime_instantiate(ctx->module, APP_STACK_SIZE, APP_HEAP_SIZE,
+                                    error_buf, sizeof(error_buf));
+    if (!inst) {
+        printk("  worker %d: instantiate failed: %s\n", ctx->id, error_buf);
         return NULL;
     }
 
-    if ((exception = wasm_runtime_get_exception(module_inst)))
-        os_printf("%s\n", exception);
+    printk("  worker %d: running WASM app\n", ctx->id);
+    wasm_application_execute_main(inst, 0, NULL);
+    {
+        const char *exc = wasm_runtime_get_exception(inst);
+        if (exc)
+            printk("  worker %d: WASM exception: %s\n", ctx->id, exc);
+    }
 
+    /* Now use bh_queue to send messages back to the main thread */
+    for (i = 0; i < MSGS_PER_WORKER; i++) {
+        struct test_msg *msg = wasm_runtime_malloc(sizeof(struct test_msg));
+        if (!msg) {
+            printk("  [send] worker %d: malloc failed for msg %d\n",
+                   ctx->id, i);
+            break;
+        }
+        msg->worker_id = ctx->id;
+        msg->seq = i;
+        snprintf(msg->payload, sizeof(msg->payload), "w%d-msg%d",
+                 ctx->id, i);
+
+        printk("  [send] worker %d: msg %d \"%s\"\n", ctx->id, i,
+               msg->payload);
+
+        if (!bh_post_msg(ctx->queue, 0, msg, sizeof(struct test_msg))) {
+            printk("  [send] worker %d: post failed for msg %d\n",
+                   ctx->id, i);
+            wasm_runtime_free(msg);
+            break;
+        }
+    }
+
+    wasm_runtime_deinstantiate(inst);
     return NULL;
 }
 
-#if WASM_ENABLE_GLOBAL_HEAP_POOL != 0
-static char global_heap_buf[CONFIG_GLOBAL_HEAP_BUF_SIZE] = { 0 };
-#endif
-
+/*
+ * WAMR main entry point — runs in user mode.
+ * arg1 = number of worker threads (cast from intptr_t).
+ *
+ * Initializes WAMR runtime, loads the WASM module, spawns worker threads
+ * that each run the WASM app then send messages via bh_queue, and
+ * dequeues messages using blocking condvar wait.
+ */
 void
 iwasm_main(void *arg1, void *arg2, void *arg3)
 {
-    int start, end;
-    start = k_uptime_get_32();
-    uint8 *wasm_file_buf = NULL;
-    uint32 wasm_file_size;
-    wasm_module_t wasm_module = NULL;
-    wasm_module_inst_t wasm_module_inst = NULL;
+    int num_workers = (int)(intptr_t)arg1;
     RuntimeInitArgs init_args;
+    wasm_module_t module = NULL;
+    bh_queue *queue = NULL;
+    korp_tid *worker_tids = NULL;
+    struct worker_ctx *worker_ctxs = NULL;
     char error_buf[128];
-#if WASM_ENABLE_LOG != 0
-    int log_verbose_level = 2;
-#endif
+    int i, total_dequeued = 0;
+    int expected;
 
-    (void)arg1;
     (void)arg2;
     (void)arg3;
 
-    os_printf("User mode thread: start\n");
+    if (num_workers <= 0)
+        num_workers = 2;
+    expected = num_workers * MSGS_PER_WORKER;
 
+    printk("=== WAMR User-Mode Demo ===\n");
+
+    /* Initialize WAMR runtime */
     memset(&init_args, 0, sizeof(RuntimeInitArgs));
-
-#if WASM_ENABLE_GLOBAL_HEAP_POOL != 0
     init_args.mem_alloc_type = Alloc_With_Pool;
     init_args.mem_alloc_option.pool.heap_buf = global_heap_buf;
     init_args.mem_alloc_option.pool.heap_size = sizeof(global_heap_buf);
-#elif (defined(CONFIG_COMMON_LIBC_MALLOC)            \
-       && CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE != 0) \
-    || defined(CONFIG_NEWLIB_LIBC)
-    init_args.mem_alloc_type = Alloc_With_System_Allocator;
-#else
-#error "memory allocation scheme is not defined."
-#endif
 
-    /* initialize runtime environment */
     if (!wasm_runtime_full_init(&init_args)) {
-        printf("Init runtime environment failed.\n");
+        printk("WAMR init failed\n");
         return;
     }
 
-#if WASM_ENABLE_LOG != 0
-    bh_log_set_verbose_level(log_verbose_level);
-#endif
-
-    /* load WASM byte buffer from byte buffer of include file */
-    wasm_file_buf = (uint8 *)wasm_test_file;
-    wasm_file_size = sizeof(wasm_test_file);
-
-    /* load WASM module */
-    if (!(wasm_module = wasm_runtime_load(wasm_file_buf, wasm_file_size,
-                                          error_buf, sizeof(error_buf)))) {
-        printf("%s\n", error_buf);
-        goto fail1;
+    /* Load the WASM module */
+    module = wasm_runtime_load((uint8_t *)wasm_test_file,
+                               sizeof(wasm_test_file), error_buf,
+                               sizeof(error_buf));
+    if (!module) {
+        printk("Load WASM module failed: %s\n", error_buf);
+        goto cleanup;
     }
 
-    /* instantiate the module */
-    if (!(wasm_module_inst = wasm_runtime_instantiate(
-              wasm_module, CONFIG_APP_STACK_SIZE, CONFIG_APP_HEAP_SIZE,
-              error_buf, sizeof(error_buf)))) {
-        printf("%s\n", error_buf);
-        goto fail2;
+    /* Create bh_queue — lock and condvar are allocated via k_object_alloc */
+    queue = bh_queue_create();
+    if (!queue) {
+        printk("bh_queue_create failed\n");
+        goto cleanup;
+    }
+    printk("bh_queue created (user mode)\n");
+
+    /* Allocate worker tracking arrays from WAMR heap */
+    worker_tids = wasm_runtime_malloc(num_workers * sizeof(korp_tid));
+    worker_ctxs = wasm_runtime_malloc(num_workers * sizeof(struct worker_ctx));
+    if (!worker_tids || !worker_ctxs) {
+        printk("Failed to allocate worker arrays\n");
+        goto cleanup;
+    }
+    memset(worker_tids, 0, num_workers * sizeof(korp_tid));
+
+    /* Spawn worker threads via os_thread_create.
+     * Under CONFIG_USERSPACE, os_thread_create detects user context and
+     * sets K_USER | K_INHERIT_PERMS, so workers inherit access to all
+     * kernel objects (bh_queue lock, condvar, WAMR heap lock, etc.). */
+    printk("\nStarting %d workers (WASM + bh_queue, %d msgs each):\n",
+           num_workers, MSGS_PER_WORKER);
+    for (i = 0; i < num_workers; i++) {
+        worker_ctxs[i].id = i;
+        worker_ctxs[i].queue = queue;
+        worker_ctxs[i].module = module;
+        if (os_thread_create(&worker_tids[i], worker_entry,
+                             &worker_ctxs[i], APP_STACK_SIZE) != BHT_OK) {
+            printk("Failed to create worker %d\n", i);
+            num_workers = i;
+            expected = num_workers * MSGS_PER_WORKER;
+            break;
+        }
     }
 
-    /* invoke the main function */
-    app_instance_main(wasm_module_inst);
+    /* Consume messages concurrently — blocks on condvar until a producer
+     * signals via bh_post_msg. */
+    while (total_dequeued < expected) {
+        bh_message_t bmsg = bh_get_msg(queue, BHT_WAIT_FOREVER);
+        if (!bmsg)
+            continue;
 
-    /* destroy the module instance */
-    wasm_runtime_deinstantiate(wasm_module_inst);
+        struct test_msg *msg = (struct test_msg *)bh_message_payload(bmsg);
+        if (msg) {
+            printk("  [recv] #%d from worker %d seq %d \"%s\"\n",
+                   total_dequeued, msg->worker_id, msg->seq, msg->payload);
+        }
+        bh_free_msg(bmsg);
+        total_dequeued++;
+    }
 
-fail2:
-    /* unload the module */
-    wasm_runtime_unload(wasm_module);
+    /* Join worker threads */
+    for (i = 0; i < num_workers; i++) {
+        if (worker_tids[i])
+            os_thread_join(worker_tids[i], NULL);
+    }
 
-fail1:
-    /* destroy runtime environment */
+    printk("\nTotal: sent %d, received %d\n", expected, total_dequeued);
+
+cleanup:
+    if (worker_ctxs)
+        wasm_runtime_free(worker_ctxs);
+    if (worker_tids)
+        wasm_runtime_free(worker_tids);
+    if (queue)
+        bh_queue_destroy(queue);
+    if (module)
+        wasm_runtime_unload(module);
     wasm_runtime_destroy();
-
-    end = k_uptime_get_32();
-
-    os_printf("User mode thread: elapsed %d\n", (end - start));
+    printk("=== Demo complete ===\n");
 }
