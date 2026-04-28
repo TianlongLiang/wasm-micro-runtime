@@ -4,12 +4,21 @@
  */
 
 /*
- * Inconsistent nested struct — layout differs between wasm32 and native.
+ * Inconsistent struct — layout differs between wasm32 and native.
  *
- * The inner struct has uint64_t which aligns to 8 bytes on wasm32-clang
- * but only 4 bytes on x86-32 gcc, making the inner struct itself different
- * in size. This cascades: the outer struct's fields after the inner member
- * shift to different offsets.
+ * Two sources of mismatch demonstrated:
+ *
+ *   1. uint64_t alignment (x86-32 only): 8 bytes on wasm32-clang,
+ *      4 bytes on x86-32 gcc. Inner struct size differs, cascading
+ *      to all fields after it.
+ *
+ *   2. -fshort-enums (x86-64 and x86-32): native gcc with -fshort-enums
+ *      packs enums to the smallest type (1 byte here), while wasm32-clang
+ *      always uses 4-byte enums.
+ *
+ * Note: __attribute__((packed)) is honored by both native gcc and
+ * wasm32-clang, so packed structs are actually consistent across
+ * both targets — no mismatch there.
  */
 
 #ifndef STRUCT_INCONSISTENT_H
@@ -23,6 +32,13 @@ typedef unsigned long long uint64_t;
 #include <stdint.h>
 #endif
 
+enum device_status {
+    DEV_STATUS_OFF = 0,
+    DEV_STATUS_ON = 1,
+    DEV_STATUS_STANDBY = 2,
+    DEV_STATUS_ERROR = 3,
+};
+
 struct device_info {
     uint8_t type;
     uint64_t serial;
@@ -34,7 +50,7 @@ struct device_report {
     float voltage;
     uint8_t channel;
     double calibration;
-    uint8_t mode;
+    enum device_status status;
 };
 
 #endif /* STRUCT_INCONSISTENT_H */

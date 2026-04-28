@@ -648,11 +648,33 @@ jobs:
           ./build.sh --aot
           ./run.sh --aot
 
-      - name: Build Sample [wasm-host-struct-consistent]
+      - name: Build Sample [wasm-host-struct-consistent] x86_64
         run: |
           pip install pyelftools
           cd samples/wasm-host-struct-consistent
-          ./build.sh
+          ./build.sh --target X86_64
+
+      - name: Run Sample [wasm-host-struct-consistent] x86_64
+        run: |
+          cd samples/wasm-host-struct-consistent
+          ./run.sh
+
+      - name: install x32 support libraries for struct-consistent sample
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y g++-multilib
+
+      - name: Build Sample [wasm-host-struct-consistent] x86_32
+        run: |
+          cd samples/wasm-host-struct-consistent
+          rm -rf cmake_build
+          ./build.sh --target X86_32
+
+      - name: Run Sample [wasm-host-struct-consistent] x86_32
+        run: |
+          cd samples/wasm-host-struct-consistent
+          ./run.sh
 
   test:
     needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]

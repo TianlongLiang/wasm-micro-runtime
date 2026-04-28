@@ -250,11 +250,21 @@ if (WAMR_CHECK_STRUCT_LAYOUT)
   endif ()
 
   if (WAMR_NATIVE_API_SOURCES AND WASI_SDK_DIR)
+    # On x86-64 host building for X86_32, pass -m32 so the checker
+    # compares the correct native layout against wasm32.
+    if (WAMR_BUILD_TARGET STREQUAL "X86_32" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+      set (_struct_check_native_flags "-m32")
+    else ()
+      set (_struct_check_native_flags "")
+    endif ()
+
     include (${WAMR_ROOT_DIR}/build-scripts/check_struct_layout.cmake)
     check_wasm_struct_layout (
       SOURCES      ${WAMR_NATIVE_API_SOURCES}
       NATIVE_CC    ${CMAKE_C_COMPILER}
+      NATIVE_FLAGS "${_struct_check_native_flags}"
       WASI_SDK     "${WASI_SDK_DIR}"
+      FATAL_ON_MISMATCH
     )
   elseif (NOT WASI_SDK_DIR)
     message (STATUS "WAMR_CHECK_STRUCT_LAYOUT: wasi-sdk not found, skipping")

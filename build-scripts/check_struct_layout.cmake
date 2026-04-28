@@ -9,9 +9,10 @@
 #     WASI_SDK     /opt/wasi-sdk         # wasi-sdk path (required)
 #     INCLUDE_DIRS shared/               # extra include dirs (optional, auto-discovered)
 #     VERBOSE                            # show full field-by-field table (optional)
+#     FATAL_ON_MISMATCH                   # treat mismatch as FATAL_ERROR (optional)
 #   )
 #
-# On mismatch: emits CMake WARNING with per-field fix suggestions.
+# On mismatch: emits CMake WARNING (or FATAL_ERROR if FATAL_ON_MISMATCH).
 # On success or missing tools: STATUS message only, build continues.
 
 function(check_wasm_struct_layout)
@@ -20,7 +21,7 @@ function(check_wasm_struct_layout)
   #   Line 2: single-value args  — each takes exactly one value
   #   Line 3: multi-value args   — each takes a list of values
   cmake_parse_arguments(CHK
-    "VERBOSE"                                       # boolean flags
+    "VERBOSE;FATAL_ON_MISMATCH"                     # boolean flags
     "SOURCE;NATIVE_CC;NATIVE_FLAGS;WASI_SDK"        # single-value args
     "INCLUDE_DIRS;SOURCES"                          # multi-value args
     ${ARGN}
@@ -118,12 +119,21 @@ function(check_wasm_struct_layout)
       endif()
     endif()
 
-    message(WARNING
-      "WASM-host struct layout MISMATCH detected!\n"
-      "\n"
-      "Suggested fixes:\n"
-      "${fixes}"
-    )
+    if(CHK_FATAL_ON_MISMATCH)
+      message(FATAL_ERROR
+        "WASM-host struct layout MISMATCH detected!\n"
+        "\n"
+        "Suggested fixes:\n"
+        "${fixes}"
+      )
+    else()
+      message(WARNING
+        "WASM-host struct layout MISMATCH detected!\n"
+        "\n"
+        "Suggested fixes:\n"
+        "${fixes}"
+      )
+    endif()
 
   else()
     message(STATUS "Struct layout check: tool error (exit ${rc})")

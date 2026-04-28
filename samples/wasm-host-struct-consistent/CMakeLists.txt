@@ -74,6 +74,12 @@ else()
   set(STRUCT_CHECK_NATIVE_FLAGS "")
 endif()
 
+# Add -fshort-enums to demonstrate enum size mismatch:
+# native gcc -fshort-enums packs enums to the smallest type (1 byte here),
+# while wasm32-clang always uses 4-byte enums — triggers mismatch on x86-64.
+set(STRUCT_CHECK_NATIVE_FLAGS "${STRUCT_CHECK_NATIVE_FLAGS} -fshort-enums")
+add_compile_options(-fshort-enums)
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_struct_layout.cmake)
 check_wasm_struct_layout(
   VERBOSE      TRUE

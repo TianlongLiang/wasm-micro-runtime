@@ -195,8 +195,8 @@ configure_device_native(wasm_exec_env_t exec_env,
     print_double("calibration", 1.23456789, rpt->calibration);
     errors += check_double(1.23456789, rpt->calibration);
 
-    print_hex8("mode", 0xAB, rpt->mode);
-    errors += check_u8(0xAB, rpt->mode);
+    print_u32("status", DEV_STATUS_ERROR, (uint32_t)rpt->status);
+    errors += check_u32(DEV_STATUS_ERROR, (uint32_t)rpt->status);
 
     printf("\n  Result: %d errors (%s)\n", errors,
            errors == 0 ? "PASS" : "FAIL — layout mismatch causes wrong values");

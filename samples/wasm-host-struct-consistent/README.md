@@ -8,8 +8,7 @@ When a WASM app passes a struct pointer to a native host API, the host reads
 fields at offsets determined by the native compiler. If the native compiler
 lays out the struct differently from wasm32-clang, the host reads garbage.
 
-This is a real problem on 32-bit platforms. wasm32-clang and native gcc
-disagree on:
+wasm32-clang and native gcc disagree on:
 
 | Type | wasm32-clang | x86-32 / ARC gcc | Impact |
 |---|---|---|---|
@@ -29,6 +28,30 @@ struct device_info {
 
 The native host reads `serial` at offset 4, but the WASM app wrote it at
 offset 8. The host sees garbage.
+
+### What about `__attribute__((packed))`?
+
+`__attribute__((packed))` is honored by **both** native gcc and wasm32-clang,
+so packed structs are actually consistent across both targets. No mismatch
+occurs with packed structs.
+
+### What about `-fshort-enums`?
+
+When the native compiler uses `-fshort-enums`, enum types are packed to the
+smallest integer type that fits all values (often 1 byte). wasm32-clang
+always uses 4-byte enums. This creates a size mismatch even on x86-64:
+
+```c
+enum device_status { DEV_STATUS_OFF=0, DEV_STATUS_ON=1, ... };
+
+struct device_report {
+    ...
+    enum device_status status;  // 1 byte native (-fshort-enums) vs 4 bytes wasm32
+};
+```
+
+This sample compiles the native side with `-fshort-enums` to demonstrate
+this mismatch.
 
 ## The Solution
 
@@ -194,7 +217,7 @@ include(cmake/check_struct_layout.cmake)
 check_wasm_struct_layout(
   SOURCE       ${CMAKE_CURRENT_SOURCE_DIR}/src/native_impl.c
   NATIVE_CC    ${CMAKE_C_COMPILER}
-  NATIVE_FLAGS "-m32"
+  NATIVE_FLAGS "-m32 -fshort-enums"
   WASI_SDK     /opt/wasi-sdk
 )
 ```
@@ -210,11 +233,13 @@ cmake .. -DWAMR_CHECK_STRUCT_LAYOUT=ON
 
 This scans all enabled WAMR native libraries at configure time. Each native
 library's cmake file self-registers its NativeSymbol source via
-`list(APPEND WAMR_NATIVE_API_SOURCES ...)`.
+`list(APPEND WAMR_NATIVE_API_SOURCES ...)`. When enabled through this option,
+`FATAL_ON_MISMATCH` is set — any mismatch will fail the build.
 
 ## This Sample
 
-The sample demonstrates both the problem and the solution with two nested structs:
+The sample demonstrates both the problem and the solution with two struct
+families and three mismatch sources:
 
 **Consistent** (`shared/struct_consistent.h`):
 ```c
@@ -230,20 +255,31 @@ struct sensor_report {
 
 **Inconsistent** (`shared/struct_inconsistent.h`):
 ```c
+enum device_status { DEV_STATUS_OFF=0, ..., DEV_STATUS_ERROR=3 };
 struct device_info { uint8_t type; uint64_t serial; };  // no alignment attr
 struct device_report {
     uint8_t id;
     struct device_info info;                             // inner struct misaligned
     float voltage;
     double calibration;                                  // no alignment attr
-    uint8_t mode;
+    enum device_status status;                           // enum size mismatch
 };
 ```
+
+Mismatch sources:
+1. **uint64_t alignment** (x86-32): `device_info.serial` is at offset 4
+   natively vs 8 in wasm32
+2. **-fshort-enums** (x86-64 and x86-32): `device_report.status` is 1 byte
+   natively vs 4 bytes in wasm32
+3. **Nested struct cascade** (x86-32): `device_info` size difference shifts
+   all subsequent `device_report` fields
 
 The WASM app fills both structs and passes them to native APIs. The native
 host prints Expected vs Host-read values for every field, showing:
 - Consistent struct: all fields match
-- Inconsistent struct: fields after `device_info` read garbage
+- Inconsistent struct (x86-32): fields after `device_info` read garbage
+- Inconsistent struct (x86-64): runtime passes (padding absorbs the enum
+  size difference), but the cmake-time checker still flags the mismatch
 
 A `void*` native function (`process_raw`) is included to demonstrate the
 unchecked pointer warning.
@@ -253,35 +289,25 @@ unchecked pointer warning.
 - Native C compiler (gcc or clang)
 - [wasi-sdk](https://github.com/WebAssembly/wasi-sdk)
 - Python 3.6+ with `pyelftools` (for the layout checker)
+- For x86-32 testing: `gcc-multilib` / `g++-multilib`
 
 ## Build and Run
 
 ```bash
-# Build host app
-mkdir cmake_build && cd cmake_build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-cd ..
-
-# Build WASM app
-mkdir -p out/wasm-app
-/opt/wasi-sdk/bin/clang --target=wasm32 -O2 -Ishared \
-    -z stack-size=4096 -Wl,--initial-memory=65536 \
-    -Wl,--export=run -Wl,--export=__heap_base,--export=__data_end \
-    -Wl,--no-entry -Wl,--allow-undefined -nostdlib \
-    -o out/wasm-app/main.wasm wasm-app/main.c
-
-# Run
-./cmake_build/struct_check -f out/wasm-app/main.wasm
-```
-
-Or use the build script:
-
-```bash
+# Build for the default target (auto-detected)
 ./build.sh
+./run.sh
+
+# Build for a specific target
+./build.sh --target X86_64
+./run.sh
+
+# Build for x86-32 (requires gcc-multilib)
+./build.sh --target X86_32
+./run.sh
 ```
 
-### Expected output
+### Expected output (x86-32)
 
 ```
 === process_report (consistent nested struct) ===
@@ -310,7 +336,7 @@ Or use the build script:
   voltage               3.29                0xCAFEBABE          WRONG
   channel               0x05                0xEF                WRONG
   calibration           1.234567            0x0000000540533333  WRONG
-  mode                  0xAB                0x1B                WRONG
+  status                3                   27                  WRONG
 
   Result: 7 errors (FAIL — layout mismatch causes wrong values)
 ```
@@ -323,7 +349,7 @@ pip install pyelftools
 python3 check_struct_layout.py \
     --source src/native_impl.c \
     --native-cc gcc \
-    --native-flags="-m32" \
+    --native-flags="-m32 -fshort-enums" \
     --wasi-sdk /opt/wasi-sdk \
     --verbose
 ```

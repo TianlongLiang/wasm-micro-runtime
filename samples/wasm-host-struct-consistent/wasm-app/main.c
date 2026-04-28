@@ -41,7 +41,7 @@ run(void)
     dev.voltage = 3.3f;
     dev.channel = 0x05;
     dev.calibration = 1.23456789;
-    dev.mode = 0xAB;
+    dev.status = DEV_STATUS_ERROR;
 
     result += configure_device(&dev, sizeof(dev));
     print_int(result);
