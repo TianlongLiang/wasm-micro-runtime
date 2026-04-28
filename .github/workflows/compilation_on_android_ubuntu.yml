@@ -291,11 +291,21 @@ jobs:
         if: endsWith(matrix.make_options_run_mode, '_JIT_BUILD_OPTIONS') && (steps.retrieve_llvm_libs.outputs.cache-hit != 'true')
         run: echo "::error::can not get prebuilt llvm libraries" && exit 1
 
+      - name: install wasi-sdk and pyelftools for struct layout check
+        if: matrix.platform == 'linux'
+        uses: ./.github/actions/install-wasi-sdk-wabt
+        with:
+          os: ${{ matrix.os }}
+
+      - name: install pyelftools
+        if: matrix.platform == 'linux'
+        run: pip install pyelftools
+
       - name: Build iwasm for linux
         if: matrix.platform == 'linux'
         run: |
           mkdir build && cd build
-          cmake .. -DCMAKE_C_FLAGS="-Werror" ${{ matrix.make_options_run_mode }} ${{ matrix.make_options_feature }} ${{ matrix.extra_options}}
+          cmake .. -DCMAKE_C_FLAGS="-Werror" -DWAMR_CHECK_STRUCT_LAYOUT=ON ${{ matrix.make_options_run_mode }} ${{ matrix.make_options_feature }} ${{ matrix.extra_options}}
           cmake --build . --config Release --parallel 4
         working-directory: product-mini/platforms/${{ matrix.platform }}
 
@@ -637,6 +647,12 @@ jobs:
           ./run.sh
           ./build.sh --aot
           ./run.sh --aot
+
+      - name: Build Sample [wasm-host-struct-consistent]
+        run: |
+          pip install pyelftools
+          cd samples/wasm-host-struct-consistent
+          ./build.sh
 
   test:
     needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]
