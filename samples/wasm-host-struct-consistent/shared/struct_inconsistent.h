@@ -48,9 +48,9 @@ struct device_report {
     uint8_t id;
     struct device_info info;
     float voltage;
+    enum device_status status;
     uint8_t channel;
     double calibration;
-    enum device_status status;
 };
 
 #endif /* STRUCT_INCONSISTENT_H */

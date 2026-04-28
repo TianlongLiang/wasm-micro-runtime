@@ -39,14 +39,19 @@ occurs with packed structs.
 
 When the native compiler uses `-fshort-enums`, enum types are packed to the
 smallest integer type that fits all values (often 1 byte). wasm32-clang
-always uses 4-byte enums. This creates a size mismatch even on x86-64:
+always uses 4-byte enums. This creates a size mismatch even on x86-64.
+
+When the enum field is followed by other fields, the size difference shifts
+subsequent field offsets — causing visible data corruption at runtime:
 
 ```c
 enum device_status { DEV_STATUS_OFF=0, DEV_STATUS_ON=1, ... };
 
 struct device_report {
     ...
-    enum device_status status;  // 1 byte native (-fshort-enums) vs 4 bytes wasm32
+    enum device_status status;  // 1 byte native vs 4 bytes wasm32
+    uint8_t channel;            // offset shifts due to status size difference
+    double calibration;         // reads garbage on both x86-64 and x86-32
 };
 ```
 
@@ -261,28 +266,82 @@ struct device_report {
     uint8_t id;
     struct device_info info;                             // inner struct misaligned
     float voltage;
-    double calibration;                                  // no alignment attr
-    enum device_status status;                           // enum size mismatch
+    enum device_status status;                           // enum before other fields
+    uint8_t channel;
+    double calibration;
 };
 ```
 
 Mismatch sources:
 1. **uint64_t alignment** (x86-32): `device_info.serial` is at offset 4
-   natively vs 8 in wasm32
-2. **-fshort-enums** (x86-64 and x86-32): `device_report.status` is 1 byte
-   natively vs 4 bytes in wasm32
-3. **Nested struct cascade** (x86-32): `device_info` size difference shifts
-   all subsequent `device_report` fields
+   natively vs 8 in wasm32 — cascades to all outer fields
+2. **-fshort-enums** (x86-64 and x86-32): `enum device_status` is 1 byte
+   natively vs 4 bytes in wasm32 — shifts `channel` and `calibration`
+3. **Nested struct cascade** (x86-32): `device_info` size difference (12 vs
+   16 bytes) shifts all subsequent `device_report` fields
 
-The WASM app fills both structs and passes them to native APIs. The native
-host prints Expected vs Host-read values for every field, showing:
-- Consistent struct: all fields match
-- Inconsistent struct (x86-32): fields after `device_info` read garbage
-- Inconsistent struct (x86-64): runtime passes (padding absorbs the enum
-  size difference), but the cmake-time checker still flags the mismatch
+### Runtime output
+
+The WASM module fills both structs and passes them to native APIs. The native
+side prints Expected vs Host-read values for every field, making mismatches
+immediately visible.
+
+**x86-64** (3 errors — enum size mismatch shifts `channel` and `calibration`):
+```
+=== configure_device (inconsistent nested struct) ===
+  sizeof: WASM=48  native=40  MISMATCH!
+
+  Field                 Expected            Host read           Match
+  ────────────────────  ─────────────────────────────────────────────
+  id                    0x07                0x07                OK
+  info.type             0x03                0x03                OK
+  info.serial           0xDEADBEEFCAFEBABE  0xDEADBEEFCAFEBABE  OK
+  voltage               3.29                3.29                OK
+  status                3                   3                   OK
+  channel               0x05                0x00                WRONG
+  calibration           1.234567            0x0000000000000005  WRONG
+
+  Result: 3 errors (FAIL — layout mismatch causes wrong values)
+```
+
+**x86-32** (7 errors — uint64_t alignment + enum + cascade):
+```
+=== configure_device (inconsistent nested struct) ===
+  sizeof: WASM=48  native=32  MISMATCH!
+
+  Field                 Expected            Host read           Match
+  ────────────────────  ─────────────────────────────────────────────
+  id                    0x07                0x07                OK
+  info.type             0x03                0x00                WRONG
+  info.serial           0xDEADBEEFCAFEBABE  0x0000000000000003  WRONG
+  voltage               3.29                0xCAFEBABE          WRONG
+  status                3                   239                 WRONG
+  channel               0x05                0xBE                WRONG
+  calibration           1.234567            0x0000000340533333  WRONG
+
+  Result: 7 errors (FAIL — layout mismatch causes wrong values)
+```
 
 A `void*` native function (`process_raw`) is included to demonstrate the
-unchecked pointer warning.
+unchecked pointer warning from the build-time checker.
+
+### Regression testing
+
+The `run.sh` script accepts `--expect-mismatch` to assert that the
+inconsistent struct causes runtime errors (non-zero return from the WASM
+module). In CI, both x86-64 and x86-32 builds use this flag:
+
+```bash
+./build.sh --target X86_64
+./run.sh --expect-mismatch   # asserts non-zero return
+
+./build.sh --target X86_32
+./run.sh --expect-mismatch   # asserts non-zero return
+```
+
+If a compiler change or struct modification accidentally makes the layouts
+match (eliminating the expected mismatch), CI will fail — catching the
+regression.
 
 ## Requirements
 
@@ -294,51 +353,17 @@ unchecked pointer warning.
 ## Build and Run
 
 ```bash
-# Build for the default target (auto-detected)
+# Build and run for the default target (auto-detected)
 ./build.sh
 ./run.sh
 
-# Build for a specific target
+# Build and run for a specific target
 ./build.sh --target X86_64
-./run.sh
+./run.sh --expect-mismatch
 
-# Build for x86-32 (requires gcc-multilib)
+# Build and run for x86-32 (requires gcc-multilib)
 ./build.sh --target X86_32
-./run.sh
-```
-
-### Expected output (x86-32)
-
-```
-=== process_report (consistent nested struct) ===
-  sizeof: WASM=48  native=48
-
-  Field                 Expected            Host read           Match
-  ────────────────────  ─────────────────────────────────────────────
-  sensor_id             0x42                0x42                OK
-  reading.raw_value     1024                1024                OK
-  reading.calibrated    23.50               23.50               OK
-  timestamp             0x1234567890ABCDEF  0x1234567890ABCDEF  OK
-  flags                 255                 255                 OK
-  precision             0.001000            0.001000            OK
-  status                0x01                0x01                OK
-
-  Result: 0 errors (PASS)
-
-=== configure_device (inconsistent nested struct) ===
-  sizeof: WASM=48  native=36  MISMATCH!
-
-  Field                 Expected            Host read           Match
-  ────────────────────  ─────────────────────────────────────────────
-  id                    0x07                0x07                OK
-  info.type             0x03                0x00                WRONG
-  info.serial           0xDEADBEEFCAFEBABE  0x0000000000000003  WRONG
-  voltage               3.29                0xCAFEBABE          WRONG
-  channel               0x05                0xEF                WRONG
-  calibration           1.234567            0x0000000540533333  WRONG
-  status                3                   27                  WRONG
-
-  Result: 7 errors (FAIL — layout mismatch causes wrong values)
+./run.sh --expect-mismatch
 ```
 
 ### Run the checker standalone

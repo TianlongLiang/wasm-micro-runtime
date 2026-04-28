@@ -657,7 +657,7 @@ jobs:
       - name: Run Sample [wasm-host-struct-consistent] x86_64
         run: |
           cd samples/wasm-host-struct-consistent
-          ./run.sh
+          ./run.sh --expect-mismatch
 
       - name: install x32 support libraries for struct-consistent sample
         run: |
@@ -674,7 +674,7 @@ jobs:
       - name: Run Sample [wasm-host-struct-consistent] x86_32
         run: |
           cd samples/wasm-host-struct-consistent
-          ./run.sh
+          ./run.sh --expect-mismatch
 
   test:
     needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]

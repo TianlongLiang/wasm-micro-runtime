@@ -39,9 +39,9 @@ run(void)
     dev.info.type = 0x03;
     dev.info.serial = 0xDEADBEEFCAFEBABEULL;
     dev.voltage = 3.3f;
+    dev.status = DEV_STATUS_ERROR;
     dev.channel = 0x05;
     dev.calibration = 1.23456789;
-    dev.status = DEV_STATUS_ERROR;
 
     result += configure_device(&dev, sizeof(dev));
     print_int(result);
