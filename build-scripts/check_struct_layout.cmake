@@ -49,7 +49,19 @@ function(check_wasm_struct_layout)
     return()
   endif()
 
-  set(CHECKER "${CMAKE_CURRENT_LIST_DIR}/check_struct_layout.py")
+  # Find the Python script relative to this cmake module's location, not the caller's.
+  # CMAKE_CURRENT_FUNCTION_LIST_DIR is the directory of this function definition.
+  # For CMake < 3.17, we rely on this file being in build-scripts/ and the script
+  # being in the same directory.
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.17")
+    set(CHECKER "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/check_struct_layout.py")
+  else()
+    # Fallback: assume this cmake file is in ${WAMR_ROOT_DIR}/build-scripts/
+    # and the Python script is there too
+    get_filename_component(_this_dir "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
+    set(CHECKER "${_this_dir}/check_struct_layout.py")
+  endif()
+
   if(NOT EXISTS "${CHECKER}")
     message(WARNING "check_wasm_struct_layout: ${CHECKER} not found")
     return()
@@ -62,7 +74,8 @@ function(check_wasm_struct_layout)
     set(CHK_NATIVE_CC "${CMAKE_C_COMPILER}")
   endif()
 
-  set(CMD ${Python3_EXECUTABLE} "${CHECKER}" "--source")
+  # New main.py uses subcommands: source <args> or binary <args>
+  set(CMD ${Python3_EXECUTABLE} "${CHECKER}" "source" "--source")
   foreach(src IN LISTS _sources)
     list(APPEND CMD "${src}")
   endforeach()
