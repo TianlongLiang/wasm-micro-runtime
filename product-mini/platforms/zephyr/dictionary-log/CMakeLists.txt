@@ -126,13 +126,51 @@ if(WASI_SDK_DIR)
   # --- Size comparison ---
   add_custom_command(TARGET wasm_dict POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "===== WASM Size Comparison ====="
+    COMMAND ${CMAKE_COMMAND} -E echo "--- Sensor App ---"
     COMMAND ls -la ${WASM_BASELINE_OUT}
     COMMAND ls -la ${WASM_DICT_OUT}
+    COMMAND ${CMAKE_COMMAND} -E echo "--- Network App ---"
+    COMMAND ls -la ${WASM_NET_BASELINE_OUT}
+    COMMAND ls -la ${WASM_NET_DICT_OUT}
     COMMAND ${CMAKE_COMMAND} -E echo "================================"
   )
 
-  # --- Network app: dictionary mode build ---
+  # --- Network app: baseline + dictionary builds ---
   set(WASM_NET_SRC ${WASM_APPS_DIR}/log_app_network.c)
+  set(WASM_NET_BASELINE_OUT ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_baseline.wasm)
+  set(WASM_NET_BASELINE_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/lib-wamr-zephyr/test_wasm_network_baseline.h)
+
+  # Network baseline (with format strings)
+  add_custom_command(
+    OUTPUT ${WASM_NET_BASELINE_OUT}
+    COMMAND ${WASI_CLANG}
+      --target=wasm32 -O2
+      -DCUR_LOG_LEVEL=4
+      -I ${WASM_APPS_DIR}
+      -z stack-size=8192
+      -Wl,--initial-memory=131072
+      -Wl,--export=main
+      -Wl,--export=__heap_base,--export=__data_end
+      -Wl,--no-entry
+      -Wl,--allow-undefined
+      -nostdlib
+      -o ${WASM_NET_BASELINE_OUT} ${WASM_NET_SRC}
+    DEPENDS ${WASM_NET_SRC} ${WASM_APPS_DIR}/wasm_log.h
+    COMMENT "Compiling network baseline: log_app_network.c -> log_app_network_baseline.wasm"
+  )
+
+  add_custom_command(
+    OUTPUT ${WASM_NET_BASELINE_HEADER}
+    COMMAND ${CMAKE_COMMAND}
+      -DWASM_IN=${WASM_NET_BASELINE_OUT}
+      -DHEADER_OUT=${WASM_NET_BASELINE_HEADER}
+      -DARRAY_NAME=wasm_test_file_network_baseline
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/wasm_to_header.cmake
+    DEPENDS ${WASM_NET_BASELINE_OUT}
+    COMMENT "Generating header: log_app_network_baseline.wasm -> test_wasm_network_baseline.h"
+  )
+
+  add_custom_target(wasm_network_baseline DEPENDS ${WASM_NET_BASELINE_HEADER})
   set(WASM_NET_DICT_SRC ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_dict.c)
   set(WASM_NET_DICT_JSON ${CMAKE_CURRENT_BINARY_DIR}/wasm_log_dict_network.json)
   set(WASM_NET_DICT_OUT ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_dict.wasm)
@@ -184,9 +222,10 @@ if(WASI_SDK_DIR)
   add_custom_target(wasm_network DEPENDS ${WASM_NET_DICT_HEADER} ${WASM_NET_DICT_JSON})
 
 else()
-  message(STATUS "WASI SDK not found - using pre-built test_wasm_baseline.h")
+  message(STATUS "WASI SDK not found - using pre-built headers")
   add_custom_target(wasm_baseline)
   add_custom_target(wasm_dict)
+  add_custom_target(wasm_network_baseline)
   add_custom_target(wasm_network)
 endif()
 
@@ -194,7 +233,7 @@ endif()
 add_subdirectory(lib-wamr-zephyr)
 
 # Ensure the WASM header is generated before compiling the WAMR library
-add_dependencies(wamr_lib wasm_baseline wasm_dict wasm_network)
+add_dependencies(wamr_lib wasm_baseline wasm_dict wasm_network_baseline wasm_network)
 
 set(WAMR_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
 

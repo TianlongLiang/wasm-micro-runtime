@@ -88,11 +88,12 @@ west build -t run 2>&1 | tee /tmp/serial.log
 # Press Ctrl+A then X to exit QEMU
 ```
 
-The host app runs four groups of log messages:
+The host app runs five groups of log messages:
 1. **Native Zephyr logs** (`dict_log_demo` module) — binary hex (dict ON) or readable text (dict OFF)
-2. **Baseline WASM app** (sensor) — format strings in WASM data segment, formatted at runtime
-3. **Dictionary WASM sensor app** (app_id=0) — binary packets, always requires decode
-4. **Dictionary WASM network app** (app_id=1) — second app demonstrating multi-app support
+2. **Baseline sensor app** — format strings in WASM data segment, formatted at runtime
+3. **Dictionary sensor app** (app_id=0) — binary packets, decoded offline
+4. **Baseline network app** — format strings in WASM data segment, formatted at runtime
+5. **Dictionary network app** (app_id=1) — binary packets, decoded offline
 
 ## Decode
 
@@ -199,14 +200,18 @@ both the quality improvement and multi-app capability.
 The build prints sizes of all WASM variants:
 
 ```
-Sensor baseline:     13,288 bytes  (135 log calls, format strings in binary)
-Sensor dictionary:    5,721 bytes  (135 log calls, string IDs only) — 57% smaller
-Network dictionary:   1,525 bytes  ( 28 log calls, string IDs only)
+--- Sensor App ---
+Baseline:     13,288 bytes  (135 log calls, format strings in binary)
+Dictionary:    5,721 bytes  (135 log calls, string IDs only) — 57% smaller
+
+--- Network App ---
+Baseline:      3,119 bytes  ( 28 log calls, format strings in binary)
+Dictionary:    1,525 bytes  ( 28 log calls, string IDs only) — 51% smaller
 ```
 
 The savings come from eliminating format string literals from the WASM data
-segment. The sensor app eliminates ~7KB of strings. The network app is tiny
-because 28 short-ID log calls compile to very little code.
+segment. Both apps show 50%+ reduction. The sensor app eliminates ~7KB of
+strings; the network app eliminates ~1.5KB.
 
 ## Key Advantage
 

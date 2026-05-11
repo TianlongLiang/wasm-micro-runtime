@@ -13,6 +13,7 @@
 
 #include "test_wasm_baseline.h"
 #include "test_wasm_dict.h"
+#include "test_wasm_network_baseline.h"
 #include "test_wasm_network.h"
 
 #define CONFIG_GLOBAL_HEAP_BUF_SIZE WASM_GLOBAL_HEAP_SIZE
@@ -177,6 +178,10 @@ iwasm_main(void *arg1, void *arg2, void *arg3)
     /* Run the dictionary WASM app (app_id=0, sensor app) */
     run_wasm_app("DICT_SENSOR", 0, (uint8 *)wasm_test_file_dict,
                  sizeof(wasm_test_file_dict));
+
+    /* Run the network baseline WASM app (app_id=1, with format strings) */
+    run_wasm_app("BASELINE_NETWORK", 1, (uint8 *)wasm_test_file_network_baseline,
+                 sizeof(wasm_test_file_network_baseline));
 
     /* Run the network dictionary WASM app (app_id=1) */
     run_wasm_app("DICT_NETWORK", 1, (uint8 *)wasm_test_file_network,
