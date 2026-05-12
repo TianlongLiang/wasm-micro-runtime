@@ -258,6 +258,46 @@ The per-app approach is correct: each app gets its own dictionary, can be
 updated independently, and the WASM binary size (the thing that matters on
 the embedded device) is unaffected by dictionary organization.
 
+## Limitations
+
+### PRI Format Macros Not Supported
+
+The string extraction tool works on **raw source** (not preprocessed). C format
+macros like `PRIu32`, `PRId64`, `PRIx32` from `<inttypes.h>` are not string
+literals — they expand during preprocessing. The tool cannot resolve them.
+
+```c
+/* NOT supported — will be skipped with a warning: */
+LOG_INF("value: %" PRIu32, val);
+
+/* Use direct format specifiers instead: */
+LOG_INF("value: %u", val);      /* uint32_t on wasm32 is always %u */
+LOG_INF("big: %llu", val64);    /* uint64_t on wasm32 is always %llu */
+```
+
+This is acceptable for WASM because types are fixed on the `wasm32` target:
+`uint32_t` = `%u`, `int32_t` = `%d`, `uint64_t` = `%llu`, `int64_t` = `%lld`.
+There's no portability ambiguity that PRI macros are meant to solve.
+
+Unsupported LOG calls are flagged at build time with a clear warning and
+replaced with a comment in the transformed source. The build continues with
+the remaining valid calls.
+
+### Max 8 Arguments Per Log Call
+
+The type descriptor is a uint32 with 4 bits per argument, limiting each log
+call to 8 typed arguments maximum. Calls exceeding this are skipped with a
+warning at build time.
+
+### String Argument Length Limit
+
+String arguments (`%s`) are packed into the binary packet as length-prefixed
+data: `[type=0x04][len:2B LE][string bytes]`. The total packet size is capped
+at 256 bytes (`WASM_LOG_DICT_MAX_PACKET`). After the 14-byte header and other
+args, this leaves roughly 200 bytes for string content. Strings exceeding the
+remaining space are truncated at runtime (no build-time warning — the string
+value isn't known until runtime).
+
 ## Binary Packet Format (msg_type=0x80)
 
 ```
@@ -272,3 +312,35 @@ Offset  Size   Field
 ```
 
 Arg types: 0x01=int32(4B), 0x02=int64(8B), 0x03=float64(8B), 0x04=string(2B len + data)
+
+## Security Analysis
+
+The dictionary logging transformation does NOT weaken the WASM sandbox.
+A malicious WASM app controls `log_level`, `string_id`, `arg_type_descriptor`,
+and `va_args` — but none of these provide an escape vector:
+
+| Attack Vector | Why It Fails |
+|---------------|-------------|
+| Read host memory via string offset | `validate_app_str_addr()` bounds-checks within WASM linear memory |
+| Read past va_args bounds | `wasm_runtime_get_native_addr_range()` enforces limits |
+| Buffer overflow in packet | Every arg write checked against `WASM_LOG_DICT_MAX_PACKET` (256B) |
+| Forge app_id | Host-assigned via exec_env user_data — WASM has no API to modify it |
+| Malicious string_id/type_desc | Only affects offline decoder (Python on host), not runtime memory |
+
+The worst case: a malicious WASM app emits garbage packets that decode to
+nonsense — a denial-of-observability, not a sandbox escape. This is equivalent
+to the baseline `wasm_log()` path where a malicious app could print misleading
+text.
+
+## Tests
+
+Unit tests for the string extraction script:
+
+```bash
+cd product-mini/platforms/zephyr/dictionary-log
+python3 -m pytest tests/ -v
+```
+
+Tests use C fixture files in `tests/` covering valid patterns (basic, multi-line,
+all types) and invalid patterns (PRI macros, non-literal format strings, empty
+calls, too many args). 47 tests total.

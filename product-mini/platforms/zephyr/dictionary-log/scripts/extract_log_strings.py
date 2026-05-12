@@ -212,20 +212,12 @@ def extract_log_calls(source):
     """
     Extract all LOG_* macro calls from the source.
 
-    Returns a list of dicts:
-      {
-        'level': 'ERR'|'WRN'|'INF'|'DBG'|'VERBOSE',
-        'fmt': format string (without quotes),
-        'args_text': raw text of the remaining arguments,
-        'arg_types': list of type codes,
-        'arg_type_names': list of type names for JSON,
-        'type_descriptor': uint32 packed descriptor,
-        'source_line': 1-based line number,
-        'start_pos': position in source of LOG_ start,
-        'end_pos': position in source after closing );
-      }
+    Returns (results, skipped) where:
+    - results is a list of valid extracted call dicts
+    - skipped is a list of (start_pos, end_pos, reason) for invalid calls
     """
     results = []
+    skipped = []
 
     for match in LOG_PATTERN.finditer(source):
         level = match.group(1)
@@ -246,6 +238,41 @@ def extract_log_calls(source):
         # Extract format string and remaining args
         fmt, args_text = extract_format_string(inner)
 
+        # Validate: format string must be non-empty (a pure string literal)
+        if not fmt and inner.strip():
+            # The first argument wasn't a string literal — likely a macro
+            # (e.g., PRIu32) or variable. Skip with warning.
+            reason = "first arg not a string literal"
+            print(f"Warning: LOG_{level} at line {source_line}: "
+                  f"{reason}. Content: {inner.strip()[:80]!r}",
+                  file=sys.stderr)
+            skipped.append((match.start(), close_paren + 1, reason))
+            continue
+
+        # Validate: detect PRI macro patterns in the raw inner text
+        # These appear as string concatenation with non-literal identifiers:
+        # e.g., "value: %" PRIu32  or  "x=%" PRId64 " y=%" PRIu32
+        pri_pattern = re.compile(r'"\s*PRI[a-zA-Z0-9]+')
+        if pri_pattern.search(inner):
+            reason = "contains PRI format macro"
+            print(f"Warning: LOG_{level} at line {source_line}: "
+                  f"{reason} (PRIu32, PRId64, etc.) which "
+                  f"cannot be resolved at extraction time. Use %d/%u/%ld/%llu "
+                  f"directly for WASM (types are fixed on wasm32). Skipping.",
+                  file=sys.stderr)
+            skipped.append((match.start(), close_paren + 1, reason))
+            continue
+
+        # Validate: check for non-string-literal first arg patterns
+        # If fmt is empty but inner was non-empty, something went wrong
+        if not fmt:
+            reason = "could not extract format string"
+            print(f"Warning: LOG_{level} at line {source_line}: "
+                  f"{reason}. Content: {inner.strip()[:80]!r}",
+                  file=sys.stderr)
+            skipped.append((match.start(), close_paren + 1, reason))
+            continue
+
         # Parse format specifiers
         specifiers = FORMAT_SPEC_PATTERN.findall(fmt)
         type_codes = []
@@ -253,6 +280,15 @@ def extract_log_calls(source):
             tc = classify_specifier(spec)
             if tc is not None:
                 type_codes.append(tc)
+
+        # Validate: more than 8 args not supported in type descriptor
+        if len(type_codes) > 8:
+            reason = f"too many args ({len(type_codes)}, max 8)"
+            print(f"Warning: LOG_{level} at line {source_line}: "
+                  f"{reason}. Skipping.",
+                  file=sys.stderr)
+            skipped.append((match.start(), close_paren + 1, reason))
+            continue
 
         type_names = [type_code_to_name(tc) for tc in type_codes]
         descriptor = build_type_descriptor(type_codes)
@@ -272,7 +308,7 @@ def extract_log_calls(source):
             'end_pos': end_pos,
         })
 
-    return results
+    return results, skipped
 
 
 def generate_replacement(call, string_id):
@@ -291,9 +327,10 @@ def generate_replacement(call, string_id):
                 f"/*types=*/0x{descriptor:x})")
 
 
-def transform_source(source, calls):
+def transform_source(source, calls, skipped_positions):
     """
     Replace LOG_* calls with wasm_log_dict() calls in the source.
+    Skipped calls (unsupported patterns) are replaced with a comment.
     Adds #define WASM_LOG_DICT 1 at the very top.
     Returns the transformed source string.
     """
@@ -303,9 +340,17 @@ def transform_source(source, calls):
         replacement = generate_replacement(call, i)
         replacements.append((call['start_pos'], call['end_pos'], replacement))
 
+    # Also replace skipped calls with comments
+    for start, end, reason in skipped_positions:
+        comment = f"/* WASM_LOG_DICT: skipped ({reason}) */"
+        replacements.append((start, end, comment))
+
+    # Sort all replacements by position (descending) for reverse application
+    replacements.sort(key=lambda x: x[0], reverse=True)
+
     # Apply in reverse order
     result = list(source)
-    for start, end, repl in reversed(replacements):
+    for start, end, repl in replacements:
         result[start:end] = list(repl)
 
     transformed = ''.join(result)
@@ -347,14 +392,17 @@ def main():
         source = f.read()
 
     # Extract log calls
-    calls = extract_log_calls(source)
+    calls, skipped = extract_log_calls(source)
 
     if not calls:
-        print("No LOG_* calls found in input.", file=sys.stderr)
+        print("No valid LOG_* calls found in input.", file=sys.stderr)
+        if skipped:
+            print(f"  ({len(skipped)} calls were skipped due to errors)",
+                  file=sys.stderr)
         sys.exit(1)
 
     # Generate transformed source
-    transformed = transform_source(source, calls)
+    transformed = transform_source(source, calls, skipped)
 
     # Write transformed source
     with open(args.output, 'w') as f:
@@ -371,6 +419,8 @@ def main():
 
     # Print summary
     print(f"Extracted {len(calls)} log strings")
+    if skipped:
+        print(f"  Skipped: {len(skipped)} (unsupported patterns, see warnings above)")
     print(f"  Source: {args.output}")
     print(f"  Dictionary: {args.json}")
     print(f"  Total format string bytes eliminated: {total_bytes}")
