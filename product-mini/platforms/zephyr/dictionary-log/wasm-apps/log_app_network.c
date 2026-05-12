@@ -1,5 +1,4 @@
 /* product-mini/platforms/zephyr/dictionary-log/wasm-apps/log_app_network.c */
-#include <inttypes.h>
 #include "wasm_log.h"
 
 static void net_init(void)
@@ -50,27 +49,10 @@ static void net_errors(void)
     LOG_ERR("Stack overflow detected: task %d, usage=%u of %u bytes", 1, 3800, 4096);
 }
 
-/*
- * Test cases for extract_log_strings.py error handling.
- * These LOG calls use unsupported patterns and should be warned/skipped.
- */
-static void test_unsupported_patterns(void)
-{
-    /* PRI macro usage — cannot be resolved at extraction time */
-    uint32_t val32 = 42;
-    uint64_t val64 = 123456789ULL;
-    LOG_INF("PRI test: value=%" PRIu32, val32);
-    LOG_DBG("PRI test: big=%" PRId64 " small=%" PRIu32, val64, val32);
-
-    /* These are fine and should NOT be skipped */
-    LOG_INF("Normal after PRI tests: %d %u", 1, 2);
-}
-
 int main(void)
 {
     net_init();
     net_traffic();
     net_errors();
-    test_unsupported_patterns();
     return 0;
 }

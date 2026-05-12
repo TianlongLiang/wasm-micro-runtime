@@ -30,7 +30,9 @@ endif()
 
 # --- Baseline WASM build ---
 set(WASM_APPS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps)
-set(WASM_BASELINE_SRC ${WASM_APPS_DIR}/log_heavy_app.c)
+set(WASM_BASELINE_SRCS
+    ${WASM_APPS_DIR}/log_heavy_app.c
+    ${WASM_APPS_DIR}/log_heavy_app_errors.c)
 set(WASM_BASELINE_OUT ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_baseline.wasm)
 set(WASM_BASELINE_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/lib-wamr-zephyr/test_wasm_baseline.h)
 
@@ -51,9 +53,10 @@ if(WASI_SDK_DIR)
       -Wl,--no-entry
       -Wl,--allow-undefined
       -nostdlib
-      -o ${WASM_BASELINE_OUT} ${WASM_BASELINE_SRC}
-    DEPENDS ${WASM_BASELINE_SRC} ${WASM_APPS_DIR}/wasm_log.h
-    COMMENT "Compiling WASM baseline: log_heavy_app.c -> log_heavy_app_baseline.wasm"
+      -o ${WASM_BASELINE_OUT} ${WASM_BASELINE_SRCS}
+    DEPENDS ${WASM_BASELINE_SRCS} ${WASM_APPS_DIR}/wasm_log.h
+              ${WASM_APPS_DIR}/sensor_app.h
+    COMMENT "Compiling WASM baseline: log_heavy_app.c + log_heavy_app_errors.c -> log_heavy_app_baseline.wasm"
   )
 
   add_custom_command(
@@ -69,34 +72,41 @@ if(WASI_SDK_DIR)
 
   add_custom_target(wasm_baseline DEPENDS ${WASM_BASELINE_HEADER})
 
-  # --- Dictionary mode: two-pass build ---
+  # --- Dictionary mode: preprocessor-based extraction ---
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   set(EXTRACT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/extract_log_strings.py)
-  set(WASM_DICT_SRC ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_dict.c)
+  set(WASM_DICT_SRCS
+      ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_dict.i
+      ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_errors_dict.i)
   set(WASM_DICT_JSON ${CMAKE_CURRENT_BINARY_DIR}/wasm_log_dict.json)
   set(WASM_DICT_OUT ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_dict.wasm)
   set(WASM_DICT_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/lib-wamr-zephyr/test_wasm_dict.h)
 
-  # Pass 1: extract strings and generate transformed source
+  # Extract log strings via preprocessor and generate transformed .i source
   add_custom_command(
-    OUTPUT ${WASM_DICT_SRC} ${WASM_DICT_JSON}
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_dict.i
+           ${CMAKE_CURRENT_BINARY_DIR}/log_heavy_app_errors_dict.i
+           ${WASM_DICT_JSON}
     COMMAND ${Python3_EXECUTABLE} ${EXTRACT_SCRIPT}
-      ${WASM_BASELINE_SRC}
-      -o ${WASM_DICT_SRC}
+      --clang ${WASI_CLANG}
+      --target wasm32
+      -I ${WASM_APPS_DIR}
+      -D CUR_LOG_LEVEL=4
+      -o-dir ${CMAKE_CURRENT_BINARY_DIR}
       -j ${WASM_DICT_JSON}
-    DEPENDS ${WASM_BASELINE_SRC} ${EXTRACT_SCRIPT}
-    COMMENT "Pass 1: Extracting log strings from log_heavy_app.c"
+      ${WASM_BASELINE_SRCS}
+    DEPENDS ${WASM_BASELINE_SRCS} ${WASM_APPS_DIR}/wasm_log.h
+            ${WASM_APPS_DIR}/sensor_app.h ${EXTRACT_SCRIPT}
+    COMMENT "Extracting log strings (preprocess) for sensor app"
   )
 
-  # Pass 2: compile dictionary WASM (no format strings)
+  # Compile dictionary WASM from preprocessed .i files
   add_custom_command(
     OUTPUT ${WASM_DICT_OUT}
     COMMAND ${WASI_CLANG}
       --target=wasm32 -O2
       -DWASM_LOG_DICT
-      -DCUR_LOG_LEVEL=4
-      -I ${WASM_APPS_DIR}
       -z stack-size=8192
       -Wl,--initial-memory=131072
       -Wl,--export=main
@@ -104,9 +114,9 @@ if(WASI_SDK_DIR)
       -Wl,--no-entry
       -Wl,--allow-undefined
       -nostdlib
-      -o ${WASM_DICT_OUT} ${WASM_DICT_SRC}
-    DEPENDS ${WASM_DICT_SRC}
-    COMMENT "Pass 2: Compiling dict WASM: log_heavy_app_dict.c -> log_heavy_app_dict.wasm"
+      -o ${WASM_DICT_OUT} ${WASM_DICT_SRCS}
+    DEPENDS ${WASM_DICT_SRCS}
+    COMMENT "Compiling sensor dict WASM from preprocessed .i files"
   )
 
   # Convert to C header
@@ -171,30 +181,32 @@ if(WASI_SDK_DIR)
   )
 
   add_custom_target(wasm_network_baseline DEPENDS ${WASM_NET_BASELINE_HEADER})
-  set(WASM_NET_DICT_SRC ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_dict.c)
+  set(WASM_NET_DICT_SRC ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_dict.i)
   set(WASM_NET_DICT_JSON ${CMAKE_CURRENT_BINARY_DIR}/wasm_log_dict_network.json)
   set(WASM_NET_DICT_OUT ${CMAKE_CURRENT_BINARY_DIR}/log_app_network_dict.wasm)
   set(WASM_NET_DICT_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/lib-wamr-zephyr/test_wasm_network.h)
 
-  # Pass 1: extract strings and generate transformed source
+  # Extract log strings via preprocessor and generate transformed .i source
   add_custom_command(
     OUTPUT ${WASM_NET_DICT_SRC} ${WASM_NET_DICT_JSON}
     COMMAND ${Python3_EXECUTABLE} ${EXTRACT_SCRIPT}
-      ${WASM_NET_SRC}
-      -o ${WASM_NET_DICT_SRC}
+      --clang ${WASI_CLANG}
+      --target wasm32
+      -I ${WASM_APPS_DIR}
+      -D CUR_LOG_LEVEL=4
+      -o-dir ${CMAKE_CURRENT_BINARY_DIR}
       -j ${WASM_NET_DICT_JSON}
-    DEPENDS ${WASM_NET_SRC} ${EXTRACT_SCRIPT}
-    COMMENT "Pass 1: Extracting log strings from log_app_network.c"
+      ${WASM_NET_SRC}
+    DEPENDS ${WASM_NET_SRC} ${WASM_APPS_DIR}/wasm_log.h ${EXTRACT_SCRIPT}
+    COMMENT "Extracting log strings (preprocess) for network app"
   )
 
-  # Pass 2: compile dictionary WASM (no format strings)
+  # Compile dictionary WASM from preprocessed .i file
   add_custom_command(
     OUTPUT ${WASM_NET_DICT_OUT}
     COMMAND ${WASI_CLANG}
       --target=wasm32 -O2
       -DWASM_LOG_DICT
-      -DCUR_LOG_LEVEL=4
-      -I ${WASM_APPS_DIR}
       -z stack-size=8192
       -Wl,--initial-memory=131072
       -Wl,--export=main
@@ -204,7 +216,7 @@ if(WASI_SDK_DIR)
       -nostdlib
       -o ${WASM_NET_DICT_OUT} ${WASM_NET_DICT_SRC}
     DEPENDS ${WASM_NET_DICT_SRC}
-    COMMENT "Pass 2: Compiling dict WASM: log_app_network_dict.c -> log_app_network_dict.wasm"
+    COMMENT "Compiling network dict WASM from preprocessed .i"
   )
 
   # Convert to C header

@@ -5,10 +5,12 @@ eliminate format strings from the WASM data segment, reducing binary size.
 
 ## How It Works
 
-1. **Build time:** `extract_log_strings.py` scans the WASM app source, extracts
-   all `LOG_*` format strings, assigns integer IDs, and generates a transformed
-   source where log calls use `wasm_log_dict(level, string_id, type_desc, args)`
-   instead of embedding the format string.
+1. **Build time:** `extract_log_strings.py` preprocesses WASM app C sources
+   (`clang -E`), then scans the preprocessed output for `wasm_log()` calls
+   (all macros, PRI format specifiers, and header includes already resolved).
+   It assigns integer IDs, computes type descriptors, and generates transformed
+   `.i` files where log calls use `wasm_log_dict(level, string_id, type_desc, args)`.
+   Supports multi-file WASM apps (multiple `.c` files compiled and linked together).
 
 2. **Runtime:** The native `wasm_log_dict()` wrapper packs a compact binary
    packet (msg_type=0x80) with the string ID, timestamp, and typed argument
@@ -42,10 +44,13 @@ west build -b qemu_x86 . -- -DWAMR_ZEPHYR_DICT_LOG=OFF
 ```
 
 Both modes:
-- Extract log strings from the WASM app source
+- Preprocess C sources (`clang -E`) to resolve all macros and includes
+- Extract log strings from preprocessed output, assign IDs, transform
 - Compile both baseline (with format strings) and dictionary (without) WASM variants
 - Embed both in the Zephyr ELF with the WAMR runtime
 - Print size comparison
+
+The sensor app demonstrates multi-file compilation (2 `.c` files + 1 `.h` header).
 
 ## Configuration
 
@@ -200,18 +205,19 @@ both the quality improvement and multi-app capability.
 The build prints sizes of all WASM variants:
 
 ```
---- Sensor App ---
-Baseline:     13,288 bytes  (135 log calls, format strings in binary)
-Dictionary:    5,721 bytes  (135 log calls, string IDs only) — 57% smaller
+--- Sensor App (2 .c files + 1 .h, multi-file) ---
+Baseline:     13,260 bytes  (135 log calls, format strings in binary)
+Dictionary:    5,869 bytes  (135 log calls, string IDs only) — 56% smaller
 
---- Network App ---
-Baseline:      3,119 bytes  ( 28 log calls, format strings in binary)
+--- Network App (single .c file) ---
+Baseline:      3,091 bytes  ( 28 log calls, format strings in binary)
 Dictionary:    1,525 bytes  ( 28 log calls, string IDs only) — 51% smaller
 ```
 
 The savings come from eliminating format string literals from the WASM data
-segment. Both apps show 50%+ reduction. The sensor app eliminates ~7KB of
-strings; the network app eliminates ~1.5KB.
+segment. Both apps show 50%+ reduction. The sensor app (multi-file) demonstrates
+that the preprocessor-based extraction handles multiple source files with shared
+headers seamlessly.
 
 ## Key Advantage
 
@@ -260,29 +266,6 @@ the embedded device) is unaffected by dictionary organization.
 
 ## Limitations
 
-### PRI Format Macros Not Supported
-
-The string extraction tool works on **raw source** (not preprocessed). C format
-macros like `PRIu32`, `PRId64`, `PRIx32` from `<inttypes.h>` are not string
-literals — they expand during preprocessing. The tool cannot resolve them.
-
-```c
-/* NOT supported — will be skipped with a warning: */
-LOG_INF("value: %" PRIu32, val);
-
-/* Use direct format specifiers instead: */
-LOG_INF("value: %u", val);      /* uint32_t on wasm32 is always %u */
-LOG_INF("big: %llu", val64);    /* uint64_t on wasm32 is always %llu */
-```
-
-This is acceptable for WASM because types are fixed on the `wasm32` target:
-`uint32_t` = `%u`, `int32_t` = `%d`, `uint64_t` = `%llu`, `int64_t` = `%lld`.
-There's no portability ambiguity that PRI macros are meant to solve.
-
-Unsupported LOG calls are flagged at build time with a clear warning and
-replaced with a comment in the transformed source. The build continues with
-the remaining valid calls.
-
 ### Max 8 Arguments Per Log Call
 
 The type descriptor is a uint32 with 4 bits per argument, limiting each log
@@ -297,6 +280,16 @@ at 256 bytes (`WASM_LOG_DICT_MAX_PACKET`). After the 14-byte header and other
 args, this leaves roughly 200 bytes for string content. Strings exceeding the
 remaining space are truncated at runtime (no build-time warning — the string
 value isn't known until runtime).
+
+### What IS Supported (Not Limitations)
+
+The following are fully handled by the preprocessor-based extraction:
+
+- **PRI format macros** (`PRIu32`, `PRId64`, etc.) — resolved by `clang -E`
+- **LOG calls in header files** (inline functions, shared helpers) — inlined by preprocessor
+- **Multi-file WASM apps** (multiple `.c` files linked together) — flat ID space across all files
+- **String concatenation** (`"part1" "part2"`) — merged by preprocessor
+- **Macro-wrapped LOG calls** — expanded before extraction
 
 ## Binary Packet Format (msg_type=0x80)
 
@@ -334,13 +327,41 @@ text.
 
 ## Tests
 
-Unit tests for the string extraction script:
-
 ```bash
 cd product-mini/platforms/zephyr/dictionary-log
 python3 -m pytest tests/ -v
 ```
 
-Tests use C fixture files in `tests/` covering valid patterns (basic, multi-line,
-all types) and invalid patterns (PRI macros, non-literal format strings, empty
-calls, too many args). 47 tests total.
+Two test suites (65 tests total):
+
+- **`test_multifile_extraction.py`** (44 tests) — invokes the extraction script
+  as a subprocess on C fixture files:
+  - **Multi-file** (3 `.c` + 2 `.h`): flat ID space, header inline LOG extracted,
+    PRI macros resolved, shared headers get separate IDs per call site,
+    duplicate strings across files get different IDs, file order affects IDs
+  - **Format type classification** (`types_test.c`): `%d`/`%i`/`%u`/`%x`/`%X`/`%o`
+    → int32, `%c`/`%p` → int32, `%ld`/`%llu`/`%llx` → int64,
+    `%f`/`%e`/`%g`/`%F`/`%E`/`%G` → float64, `%s` → string,
+    `%%` not counted, width/precision modifiers, PRI macros, mixed types,
+    zero args, max 8 args, escaped quotes, backslash sequences, long strings,
+    adjacent calls on same line
+  - **Edge cases** (`edge_cases.c`): `#if 0` block excluded, variable format
+    string skipped, valid call after skip, comments before LOG, empty functions
+  - **Error handling**: syntax errors caught, missing includes caught,
+    empty files, no-log-call files
+  - **Single file**: basic sanity, output file naming
+
+- **`test_decode_truncation.py`** (21 tests) — tests the offline decoder:
+  - Valid packet decoding (all arg types: int32, int64, float64, string)
+  - Truncated packets at every level (header, int32, int64, float64, string
+    length, string data)
+  - Unknown string_id, unknown app_id, unknown arg_type
+  - Offset handling and sequential packet decoding
+
+Test fixtures:
+```
+tests/
+├── multifile/       3 .c + 2 .h (multi-file compilation scenarios)
+├── singlefile/      types_test.c + edge_cases.c (single-file type/edge tests)
+└── error_cases/     syntax_error.c, missing_include.c, no_log_calls.c, empty_file.c
+```

@@ -3,29 +3,24 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 """
-extract_log_strings.py - Build-time string extraction for dictionary logging.
+extract_log_strings.py - Preprocessor-based multi-file extraction for
+dictionary logging.
 
-Scans WASM app C source code for LOG_* macro invocations, extracts format
-strings, assigns integer IDs, infers argument types from format specifiers,
-and generates:
-  1. A transformed C source where LOG_* calls are replaced with wasm_log_dict()
-  2. A JSON dictionary mapping string_id -> {fmt, arg_types, source_line}
+Workflow:
+  1. Dry-run compile (clang -fsyntax-only) to verify sources are valid.
+  2. Preprocess each source file (clang -E) to expand all macros.
+  3. Scan preprocessed output for wasm_log(level, "fmt", args) calls.
+  4. Assign sequential IDs, compute type descriptors, transform calls.
+  5. Output one <name>_dict.i per input file + one merged JSON dictionary.
 """
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 
-
-# Log level mapping: macro suffix -> C constant name
-LEVEL_MAP = {
-    "ERR": "WASM_LOG_LEVEL_ERR",
-    "WRN": "WASM_LOG_LEVEL_WRN",
-    "INF": "WASM_LOG_LEVEL_INF",
-    "DBG": "WASM_LOG_LEVEL_DBG",
-    "VERBOSE": "WASM_LOG_LEVEL_VERBOSE",
-}
 
 # Type codes for arg_type_descriptor nibbles
 TYPE_INT32 = 0x01
@@ -33,12 +28,10 @@ TYPE_INT64 = 0x02
 TYPE_FLOAT64 = 0x03
 TYPE_STRING = 0x04
 
-# Regex to match the start of a LOG_* call
-LOG_PATTERN = re.compile(r'\bLOG_(ERR|WRN|INF|DBG|VERBOSE)\s*\(')
+# Regex to match the start of a wasm_log call (after preprocessing)
+WASM_LOG_PATTERN = re.compile(r'\bwasm_log\s*\(')
 
-# Regex for format specifiers (handles %%, %d, %ld, %lld, %u, %lu, %llu,
-# %x, %X, %lx, %llx, %o, %lo, %llo, %f, %e, %g, %F, %E, %G, %s, %c, %p,
-# %i, %li, %lli, and width/precision modifiers)
+# Regex for format specifiers
 FORMAT_SPEC_PATTERN = re.compile(
     r'%'
     r'(?:%'                          # %% literal percent
@@ -49,6 +42,10 @@ FORMAT_SPEC_PATTERN = re.compile(
     r'[diouxXeEfFgGaAcspn])'       # conversion
 )
 
+# Regex to parse #line directives from preprocessor output
+# Matches: # <line_number> "<filename>"
+LINE_DIRECTIVE_PATTERN = re.compile(r'^#\s+(\d+)\s+"([^"]*)"', re.MULTILINE)
+
 
 def classify_specifier(spec):
     """
@@ -58,22 +55,15 @@ def classify_specifier(spec):
     if spec == '%%':
         return None
 
-    # Check for length modifiers and conversion character
-    # Strip flags, width, precision to get to length+conversion
-    # We need to parse from the end
     conv = spec[-1]
 
-    # Check if it's a string
     if conv == 's':
         return TYPE_STRING
 
-    # Check if it's a float type
     if conv in ('f', 'e', 'g', 'F', 'E', 'G', 'a', 'A'):
         return TYPE_FLOAT64
 
-    # For integer types, check length modifier
     if conv in ('d', 'i', 'u', 'x', 'X', 'o', 'c', 'p', 'n'):
-        # Check for 'll' or 'l' before conversion
         remainder = spec[1:-1]  # strip % and conversion
         if 'll' in remainder:
             return TYPE_INT64
@@ -123,7 +113,7 @@ def find_matching_paren(source, start_pos):
 
         if in_string:
             if c == '\\':
-                i += 2  # skip escaped char
+                i += 2
                 continue
             if c == '"':
                 in_string = False
@@ -152,278 +142,430 @@ def find_matching_paren(source, start_pos):
 
         i += 1
 
-    return -1  # no matching paren found
+    return -1
 
 
-def extract_format_string(args_text):
+def resolve_source_location(source, pos):
     """
-    Extract the format string from the arguments of a LOG_* call.
-    The format string is the first argument -- a C string literal,
-    possibly composed of multiple concatenated string literals.
-
-    Returns (format_string, rest_of_args) where rest_of_args is the
-    text after the format string (starting with ',' if there are more args,
-    or empty string if no more args).
+    Given a position in the preprocessed source, find the original source file
+    and line number by searching backwards for the nearest # line directive.
+    Returns (filename, line_number).
     """
-    text = args_text.strip()
-    fmt_parts = []
+    # Find all line directives before this position
+    text_before = source[:pos]
+    last_directive = None
+    for m in LINE_DIRECTIVE_PATTERN.finditer(text_before):
+        last_directive = m
+
+    if last_directive is None:
+        # Fallback: count lines from the start
+        line_in_pp = text_before.count('\n') + 1
+        return ("<unknown>", line_in_pp)
+
+    directive_line_num = int(last_directive.group(1))
+    directive_file = last_directive.group(2)
+
+    # Count newlines between the directive and our position
+    text_after_directive = source[last_directive.end():pos]
+    lines_after = text_after_directive.count('\n')
+
+    return (directive_file, directive_line_num + lines_after)
+
+
+def parse_inner_content(inner):
+    """
+    Parse the inner content of a wasm_log(...) call.
+    Expected form: <level_expr>, "<format_string>", <args...>
+
+    Returns (level_text, format_string, args_text) or None if not parseable.
+    The level_text may contain parentheses from macro expansion.
+    """
+    # Find the first comma at depth 0 (separating level from format string)
+    depth = 0
+    in_string = False
+    in_char = False
+    first_comma = -1
     i = 0
 
-    while i < len(text):
-        # Skip whitespace
-        while i < len(text) and text[i] in ' \t\n\r':
+    while i < len(inner):
+        c = inner[i]
+
+        if in_string:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if in_char:
+            if c == '\\':
+                i += 2
+                continue
+            if c == "'":
+                in_char = False
+            i += 1
+            continue
+
+        if c == '"':
+            in_string = True
+        elif c == "'":
+            in_char = True
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            first_comma = i
+            break
+
+        i += 1
+
+    if first_comma < 0:
+        return None
+
+    level_text = inner[:first_comma].strip()
+    rest = inner[first_comma + 1:].strip()
+
+    # The format string should be the next thing - a C string literal
+    if not rest or rest[0] != '"':
+        return None  # second arg is not a string literal
+
+    # Parse the string literal (handle escape sequences)
+    i = 1  # skip opening quote
+    fmt_chars = []
+    while i < len(rest) and rest[i] != '"':
+        if rest[i] == '\\':
+            fmt_chars.append(rest[i])
+            i += 1
+            if i < len(rest):
+                fmt_chars.append(rest[i])
+                i += 1
+        else:
+            fmt_chars.append(rest[i])
             i += 1
 
-        if i >= len(text):
-            break
+    if i >= len(rest):
+        return None  # unterminated string
 
-        if text[i] == '"':
-            # Parse a string literal
-            i += 1  # skip opening quote
-            literal = []
-            while i < len(text) and text[i] != '"':
-                if text[i] == '\\':
-                    literal.append(text[i])
+    format_string = ''.join(fmt_chars)
+    i += 1  # skip closing quote
+
+    # Check for string concatenation (adjacent string literals)
+    # After preprocessing, strings should be fully resolved, but handle it anyway
+    while i < len(rest):
+        while i < len(rest) and rest[i] in ' \t\n\r':
+            i += 1
+        if i < len(rest) and rest[i] == '"':
+            # Another string literal - concatenate
+            i += 1
+            while i < len(rest) and rest[i] != '"':
+                if rest[i] == '\\':
+                    fmt_chars.append(rest[i])
                     i += 1
-                    if i < len(text):
-                        literal.append(text[i])
+                    if i < len(rest):
+                        fmt_chars.append(rest[i])
                         i += 1
                 else:
-                    literal.append(text[i])
+                    fmt_chars.append(rest[i])
                     i += 1
-            if i < len(text):
-                i += 1  # skip closing quote
-            fmt_parts.append(''.join(literal))
+            if i < len(rest):
+                i += 1
+            format_string = ''.join(fmt_chars)
         else:
-            # Not a string literal -- we've reached args or end
             break
 
-    format_string = ''.join(fmt_parts)
-    rest = text[i:].strip()
-    if rest.startswith(','):
-        rest = rest[1:].strip()
+    # Remaining text after format string
+    after_fmt = rest[i:].strip()
+    if after_fmt.startswith(','):
+        args_text = after_fmt[1:].strip()
     else:
-        rest = ''
+        args_text = ''
 
-    return format_string, rest
+    return (level_text, format_string, args_text)
 
 
-def extract_log_calls(source):
+def extract_wasm_log_calls(source):
     """
-    Extract all LOG_* macro calls from the source.
-
-    Returns (results, skipped) where:
-    - results is a list of valid extracted call dicts
-    - skipped is a list of (start_pos, end_pos, reason) for invalid calls
+    Extract all wasm_log() calls from preprocessed source.
+    Returns a list of dicts with call info.
     """
     results = []
-    skipped = []
 
-    for match in LOG_PATTERN.finditer(source):
-        level = match.group(1)
+    for match in WASM_LOG_PATTERN.finditer(source):
         paren_pos = match.end() - 1  # position of '('
         close_paren = find_matching_paren(source, paren_pos)
         if close_paren < 0:
-            print(f"Warning: unmatched paren for LOG_{level} at offset "
+            print(f"Warning: unmatched paren for wasm_log at offset "
                   f"{match.start()}", file=sys.stderr)
             continue
 
-        # The full call spans from match.start() to close_paren + 1
-        # But we also need to capture the trailing semicolon (if any)
         inner = source[paren_pos + 1:close_paren]
 
-        # Calculate source line number (1-based)
-        source_line = source[:match.start()].count('\n') + 1
-
-        # Extract format string and remaining args
-        fmt, args_text = extract_format_string(inner)
-
-        # Validate: format string must be non-empty (a pure string literal)
-        if not fmt and inner.strip():
-            # The first argument wasn't a string literal — likely a macro
-            # (e.g., PRIu32) or variable. Skip with warning.
-            reason = "first arg not a string literal"
-            print(f"Warning: LOG_{level} at line {source_line}: "
-                  f"{reason}. Content: {inner.strip()[:80]!r}",
-                  file=sys.stderr)
-            skipped.append((match.start(), close_paren + 1, reason))
+        # Parse the call content
+        parsed = parse_inner_content(inner)
+        if parsed is None:
+            # Second arg is not a string literal - skip silently
             continue
 
-        # Validate: detect PRI macro patterns in the raw inner text
-        # These appear as string concatenation with non-literal identifiers:
-        # e.g., "value: %" PRIu32  or  "x=%" PRId64 " y=%" PRIu32
-        pri_pattern = re.compile(r'"\s*PRI[a-zA-Z0-9]+')
-        if pri_pattern.search(inner):
-            reason = "contains PRI format macro"
-            print(f"Warning: LOG_{level} at line {source_line}: "
-                  f"{reason} (PRIu32, PRId64, etc.) which "
-                  f"cannot be resolved at extraction time. Use %d/%u/%ld/%llu "
-                  f"directly for WASM (types are fixed on wasm32). Skipping.",
-                  file=sys.stderr)
-            skipped.append((match.start(), close_paren + 1, reason))
-            continue
+        level_text, format_string, args_text = parsed
 
-        # Validate: check for non-string-literal first arg patterns
-        # If fmt is empty but inner was non-empty, something went wrong
-        if not fmt:
-            reason = "could not extract format string"
-            print(f"Warning: LOG_{level} at line {source_line}: "
-                  f"{reason}. Content: {inner.strip()[:80]!r}",
-                  file=sys.stderr)
-            skipped.append((match.start(), close_paren + 1, reason))
-            continue
+        # Resolve source location from # line directives
+        src_file, src_line = resolve_source_location(source, match.start())
 
         # Parse format specifiers
-        specifiers = FORMAT_SPEC_PATTERN.findall(fmt)
+        specifiers = FORMAT_SPEC_PATTERN.findall(format_string)
         type_codes = []
         for spec in specifiers:
             tc = classify_specifier(spec)
             if tc is not None:
                 type_codes.append(tc)
 
-        # Validate: more than 8 args not supported in type descriptor
+        # Skip if more than 8 args
         if len(type_codes) > 8:
-            reason = f"too many args ({len(type_codes)}, max 8)"
-            print(f"Warning: LOG_{level} at line {source_line}: "
-                  f"{reason}. Skipping.",
+            print(f"Warning: wasm_log at {src_file}:{src_line} has "
+                  f"{len(type_codes)} format args (max 8). Skipping.",
                   file=sys.stderr)
-            skipped.append((match.start(), close_paren + 1, reason))
             continue
 
         type_names = [type_code_to_name(tc) for tc in type_codes]
         descriptor = build_type_descriptor(type_codes)
 
-        # Find the end position: include closing paren and optional semicolon
-        end_pos = close_paren + 1
-
         results.append({
-            'level': level,
-            'fmt': fmt,
+            'level_text': level_text,
+            'fmt': format_string,
             'args_text': args_text,
             'arg_types': type_codes,
             'arg_type_names': type_names,
             'type_descriptor': descriptor,
-            'source_line': source_line,
+            'source_file': src_file,
+            'source_line': src_line,
             'start_pos': match.start(),
-            'end_pos': end_pos,
+            'end_pos': close_paren + 1,
         })
 
-    return results, skipped
+    return results
 
 
 def generate_replacement(call, string_id):
     """
-    Generate the wasm_log_dict() replacement call for a LOG_* call.
+    Generate the wasm_log_dict() replacement call.
     """
-    level_const = LEVEL_MAP[call['level']]
+    level_text = call['level_text']
     descriptor = call['type_descriptor']
     args_text = call['args_text'].strip()
 
     if args_text:
-        return (f"wasm_log_dict({level_const}, /*id=*/{string_id}, "
+        return (f"wasm_log_dict({level_text}, /*id=*/{string_id}, "
                 f"/*types=*/0x{descriptor:x}, {args_text})")
     else:
-        return (f"wasm_log_dict({level_const}, /*id=*/{string_id}, "
+        return (f"wasm_log_dict({level_text}, /*id=*/{string_id}, "
                 f"/*types=*/0x{descriptor:x})")
 
 
-def transform_source(source, calls, skipped_positions):
+def transform_source(source, calls, id_offset):
     """
-    Replace LOG_* calls with wasm_log_dict() calls in the source.
-    Skipped calls (unsupported patterns) are replaced with a comment.
-    Adds #define WASM_LOG_DICT 1 at the very top.
+    Replace wasm_log() calls with wasm_log_dict() calls in preprocessed source.
+    Also replaces the wasm_log declaration with wasm_log_dict declaration.
     Returns the transformed source string.
     """
     # Build replacements in reverse order so positions remain valid
     replacements = []
     for i, call in enumerate(calls):
-        replacement = generate_replacement(call, i)
+        string_id = id_offset + i
+        replacement = generate_replacement(call, string_id)
         replacements.append((call['start_pos'], call['end_pos'], replacement))
 
-    # Also replace skipped calls with comments
-    for start, end, reason in skipped_positions:
-        comment = f"/* WASM_LOG_DICT: skipped ({reason}) */"
-        replacements.append((start, end, comment))
+    # Also replace the wasm_log function declaration with wasm_log_dict
+    # The declaration in preprocessed output looks like:
+    #   __attribute__((__import_module__("env")))
+    #   __attribute__((__import_name__("wasm_log")))
+    #   int32_t wasm_log(uint32_t log_level, const char *format, ...);
+    # Replace entire block with wasm_log_dict declaration
+    decl_pattern = re.compile(
+        r'(__attribute__\(\(__import_module__\("env"\)\)\)\s*'
+        r'__attribute__\(\(__import_name__\("wasm_log"\)\)\)\s*'
+        r'int32_t\s+wasm_log\s*\([^)]*\)\s*;)',
+        re.DOTALL
+    )
+    decl_match = decl_pattern.search(source)
+    if decl_match:
+        new_decl = (
+            '__attribute__((__import_module__("env")))\n'
+            '__attribute__((__import_name__("wasm_log_dict")))\n'
+            'int32_t wasm_log_dict(unsigned int log_level, '
+            'unsigned int string_id, unsigned int arg_type_descriptor, ...);'
+        )
+        replacements.append((decl_match.start(), decl_match.end(), new_decl))
 
-    # Sort all replacements by position (descending) for reverse application
+    # Sort by position descending for reverse application
     replacements.sort(key=lambda x: x[0], reverse=True)
 
-    # Apply in reverse order
     result = list(source)
     for start, end, repl in replacements:
         result[start:end] = list(repl)
 
     transformed = ''.join(result)
 
-    # Add #define WASM_LOG_DICT 1 at the very top
+    # Add WASM_LOG_DICT define at the top
     transformed = "#define WASM_LOG_DICT 1\n" + transformed
 
     return transformed
 
 
-def build_dictionary(calls):
-    """
-    Build the JSON dictionary mapping string_id -> {fmt, arg_types, source_line}.
-    """
-    dictionary = {}
-    for i, call in enumerate(calls):
-        dictionary[str(i)] = {
-            "fmt": call['fmt'],
-            "arg_types": call['arg_type_names'],
-            "source_line": call['source_line'],
-        }
-    return dictionary
+def run_clang_command(clang, args, description):
+    """Run a clang command and return (returncode, stdout, stderr)."""
+    cmd = [clang] + args
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.returncode, result.stdout, result.stderr
+    except FileNotFoundError:
+        print(f"Error: clang not found at '{clang}'", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error running {description}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract LOG_* strings from WASM app C source and generate "
-                    "dictionary-based logging output."
+        description="Preprocessor-based multi-file log string extraction "
+                    "for dictionary logging."
     )
-    parser.add_argument("input", help="Input C source file")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Output transformed C source file")
+    parser.add_argument("sources", nargs='+', metavar="FILE",
+                        help="Input C source file(s)")
+    parser.add_argument("--clang", default="clang",
+                        help="Path to clang (default: clang)")
+    parser.add_argument("--target", default=None,
+                        help="Target triple (e.g. wasm32)")
+    parser.add_argument("-I", dest="includes", action="append", default=[],
+                        metavar="DIR", help="Include directory (repeatable)")
+    parser.add_argument("-D", dest="defines", action="append", default=[],
+                        metavar="MACRO", help="Preprocessor define (repeatable)")
+    parser.add_argument("-o-dir", dest="output_dir", required=True,
+                        help="Output directory for transformed .i files")
     parser.add_argument("-j", "--json", required=True,
                         help="Output JSON dictionary file")
     args = parser.parse_args()
 
-    # Read input
-    with open(args.input, 'r') as f:
-        source = f.read()
+    # Build common clang flags
+    common_flags = []
+    if args.target:
+        common_flags += ["--target=" + args.target]
+    for inc in args.includes:
+        common_flags += ["-I", inc]
+    for define in args.defines:
+        common_flags += ["-D", define]
 
-    # Extract log calls
-    calls, skipped = extract_log_calls(source)
+    # Ensure output directory exists
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    if not calls:
-        print("No valid LOG_* calls found in input.", file=sys.stderr)
-        if skipped:
-            print(f"  ({len(skipped)} calls were skipped due to errors)",
+    # Step 1: Dry-run compile (syntax check all sources at once)
+    print("Step 1: Syntax check...", file=sys.stderr)
+    syntax_args = common_flags + ["-fsyntax-only"] + args.sources
+    rc, stdout, stderr = run_clang_command(args.clang, syntax_args,
+                                           "syntax check")
+    if rc != 0:
+        print("Compilation failed:", file=sys.stderr)
+        if stdout:
+            sys.stdout.write(stdout)
+        if stderr:
+            sys.stderr.write(stderr)
+        sys.exit(rc)
+
+    # Step 2: Preprocess each source file
+    print("Step 2: Preprocessing...", file=sys.stderr)
+    preprocessed_files = {}
+    for src in args.sources:
+        basename = os.path.splitext(os.path.basename(src))[0]
+        pp_path = os.path.join(args.output_dir, basename + ".i")
+
+        preprocess_args = common_flags + ["-E", src, "-o", pp_path]
+        rc, stdout, stderr = run_clang_command(args.clang, preprocess_args,
+                                               f"preprocessing {src}")
+        if rc != 0:
+            print(f"Preprocessing failed for {src}:", file=sys.stderr)
+            if stdout:
+                sys.stdout.write(stdout)
+            if stderr:
+                sys.stderr.write(stderr)
+            sys.exit(rc)
+
+        preprocessed_files[src] = pp_path
+
+    # Step 3: Scan and transform
+    print("Step 3: Extracting log strings...", file=sys.stderr)
+    all_calls = []  # (source_file, call_dict) tuples
+    file_calls = {}  # src -> list of calls
+    global_id = 0
+
+    for src in args.sources:
+        pp_path = preprocessed_files[src]
+        with open(pp_path, 'r') as f:
+            pp_source = f.read()
+
+        calls = extract_wasm_log_calls(pp_source)
+
+        if not calls:
+            print(f"Warning: no wasm_log() calls found in {src}",
                   file=sys.stderr)
+
+        file_calls[src] = (pp_path, pp_source, calls)
+        for call in calls:
+            all_calls.append((src, call))
+
+    if not all_calls:
+        print("Error: no wasm_log() calls found in any input file.",
+              file=sys.stderr)
         sys.exit(1)
 
-    # Generate transformed source
-    transformed = transform_source(source, calls, skipped)
+    # Step 4: Assign IDs and transform
+    print("Step 4: Transforming...", file=sys.stderr)
+    dictionary = {}
+    id_offset = 0
 
-    # Write transformed source
-    with open(args.output, 'w') as f:
-        f.write(transformed)
+    for src in args.sources:
+        pp_path, pp_source, calls = file_calls[src]
+        basename = os.path.splitext(os.path.basename(src))[0]
+        out_path = os.path.join(args.output_dir, basename + "_dict.i")
 
-    # Build and write JSON dictionary
-    dictionary = build_dictionary(calls)
+        # Transform source
+        transformed = transform_source(pp_source, calls, id_offset)
+
+        # Write transformed file
+        with open(out_path, 'w') as f:
+            f.write(transformed)
+
+        # Add entries to dictionary
+        for i, call in enumerate(calls):
+            string_id = id_offset + i
+            dictionary[str(string_id)] = {
+                "fmt": call['fmt'],
+                "arg_types": call['arg_type_names'],
+                "type_descriptor": f"0x{call['type_descriptor']:08x}",
+                "source_file": call['source_file'],
+                "source_line": call['source_line'],
+            }
+
+        id_offset += len(calls)
+
+    # Step 5: Write JSON dictionary
     with open(args.json, 'w') as f:
         json.dump(dictionary, f, indent=2)
         f.write('\n')
 
-    # Calculate total format string bytes eliminated
-    total_bytes = sum(len(call['fmt']) for call in calls)
-
-    # Print summary
-    print(f"Extracted {len(calls)} log strings")
-    if skipped:
-        print(f"  Skipped: {len(skipped)} (unsupported patterns, see warnings above)")
-    print(f"  Source: {args.output}")
-    print(f"  Dictionary: {args.json}")
-    print(f"  Total format string bytes eliminated: {total_bytes}")
+    # Summary
+    total_bytes = sum(len(call['fmt']) for _, call in all_calls)
+    print(f"\nExtracted {len(all_calls)} log strings", file=sys.stderr)
+    for src in args.sources:
+        _, _, calls = file_calls[src]
+        basename = os.path.splitext(os.path.basename(src))[0]
+        print(f"  {src}: {len(calls)} calls -> "
+              f"{basename}_dict.i", file=sys.stderr)
+    print(f"  Dictionary: {args.json}", file=sys.stderr)
+    print(f"  Total format string bytes eliminated: {total_bytes}",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":
