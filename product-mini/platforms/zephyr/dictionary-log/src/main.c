@@ -28,6 +28,8 @@ struct k_mem_domain wamr_domain;
 extern void
 iwasm_main(void *arg1, void *arg2, void *arg3);
 
+/* Set up a Zephyr userspace thread with memory domain for WAMR.
+ * Grants UART device access so wasm_log_dict can emit binary packets. */
 static bool
 iwasm_user_mode(void)
 {

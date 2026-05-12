@@ -560,11 +560,35 @@ class TestEdgeCases:
         """Comments before LOG calls don't interfere."""
         assert any('after comment' in fmt for fmt in self.fmts)
 
+    def test_wasm_log_text_in_format_string(self):
+        """'wasm_log(' text inside a format string doesn't confuse extraction."""
+        # This call has "wasm_log(%d)" literally inside the format string
+        matching = [v for v in self.d.values()
+                    if 'calling wasm_log' in v['fmt']]
+        assert len(matching) == 1
+        entry = matching[0]
+        assert entry['arg_types'] == ['int32', 'int32']
+
+    def test_wasm_log_description_in_string(self):
+        """A format string describing the wasm_log API doesn't cause issues."""
+        matching = [v for v in self.d.values()
+                    if 'wasm_log(level, fmt, ...)' in v['fmt']]
+        assert len(matching) == 1
+        assert matching[0]['arg_types'] == []
+
+    def test_valid_after_wasm_log_in_string(self):
+        """Valid call following a tricky format string is still extracted."""
+        matching = [v for v in self.d.values()
+                    if 'valid after wasm_log-in-string' in v['fmt']]
+        assert len(matching) == 1
+        assert matching[0]['arg_types'] == ['int32']
+
     def test_total_valid_calls(self):
         """Only the valid LOG calls are extracted, not dead code or variable fmt."""
         # edge_cases.c has: 1 in #if 0 (excluded), 1 variable (skipped),
-        # 1 "valid after variable fmt", 1 "after comment" = 2 valid
-        assert len(self.d) == 2
+        # 1 "valid after variable fmt", 1 "after comment",
+        # 3 wasm_log-in-string tests = 5 valid
+        assert len(self.d) == 5
 
 
 class TestEmptyAndMinimal:

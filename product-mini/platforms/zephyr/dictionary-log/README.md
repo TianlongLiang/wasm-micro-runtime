@@ -290,6 +290,49 @@ The following are fully handled by the preprocessor-based extraction:
 - **Multi-file WASM apps** (multiple `.c` files linked together) — flat ID space across all files
 - **String concatenation** (`"part1" "part2"`) — merged by preprocessor
 - **Macro-wrapped LOG calls** — expanded before extraction
+- **`wasm_log` text inside format strings** — e.g., `LOG_ERR("calling wasm_log(%d) failed", err)`
+  is handled correctly (the paren matcher tracks string literal boundaries)
+
+## Design: Why Regex on Preprocessed Output (Not AST)
+
+The extraction tool uses regex pattern matching on `clang -E` preprocessed output
+rather than C AST parsing (e.g., libclang). This is a deliberate choice:
+
+**Why regex works perfectly here:**
+
+After `clang -E`, the preprocessor has already:
+- Resolved all macros (PRI, LOG_AT, etc.)
+- Expanded all includes (headers inlined)
+- Merged string concatenation
+- Stripped comments
+
+The resulting `.i` file contains `wasm_log(level, "literal_string", args)` — a
+simple, unambiguous pattern. The format string is guaranteed to be a literal
+(the preprocessor ensures this). Our paren-matching parser correctly handles
+`wasm_log` text appearing inside format strings by tracking `in_string` state.
+
+**Why AST adds no benefit:**
+
+| Concern | Regex on `.i` | AST (libclang) |
+|---------|---------------|----------------|
+| Correctness | Preprocessor resolves ambiguity | Same (also needs preprocessing first) |
+| False positives | None after `clang -E` strips comments | None |
+| Security | clang validates before AND after | Same |
+| Type inference | From `%d`/`%s`/`%f` specifiers | Same (format string is runtime, not typed in AST) |
+| Dependencies | Python stdlib only | Requires `libclang` or JSON AST parsing |
+| Speed | Fast text scan | Slower (full parse tree) |
+| Maintenance | Simple, version-independent | AST format is clang-version-dependent |
+
+**The trust model makes AST unnecessary:**
+
+```
+Source → [clang -fsyntax-only] → [clang -E] → [our regex] → [clang compile] → [WASM sandbox]
+          validates input          resolves       transforms    validates output   validates runtime
+```
+
+Our regex is sandwiched between two clang validation passes. It cannot produce
+dangerous output — only wrong output (which clang's second pass rejects). AST
+would add complexity without improving correctness or security.
 
 ## Binary Packet Format (msg_type=0x80)
 

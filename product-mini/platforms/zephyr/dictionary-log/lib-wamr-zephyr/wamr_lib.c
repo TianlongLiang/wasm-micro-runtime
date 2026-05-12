@@ -35,6 +35,7 @@ bool
 wasm_application_execute_main(wasm_module_inst_t module_inst, int argc,
                               char *argv[]);
 
+/* Find and execute the WASM module's entry point (main or app_main). */
 static void *
 app_instance_main(wasm_module_inst_t module_inst)
 {
@@ -80,6 +81,9 @@ app_instance_main(wasm_module_inst_t module_inst)
 static char global_heap_buf[CONFIG_GLOBAL_HEAP_BUF_SIZE] = { 0 };
 #endif
 
+/* Load, instantiate, and run a WASM app. Sets app_id on the singleton exec_env
+ * so the native wasm_log_dict wrapper can embed it in packets (host-controlled,
+ * WASM app has no visibility). */
 static void
 run_wasm_app(const char *label, uint8 app_id, uint8 *wasm_buf, uint32 wasm_size)
 {
@@ -123,6 +127,9 @@ fail_unload:
     wasm_runtime_unload(wasm_module);
 }
 
+/* Entry point for the WAMR userspace thread. Initializes the runtime,
+ * registers native log APIs, then runs all WASM apps sequentially
+ * (baseline + dictionary variants for each). */
 void
 iwasm_main(void *arg1, void *arg2, void *arg3)
 {

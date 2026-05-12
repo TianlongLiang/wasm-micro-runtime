@@ -92,6 +92,7 @@ typedef char *_va_list;
         }                                     \
     } while (0)
 
+/* Emit "ERR" as error indicator when format parsing fails */
 static void
 print_err(out_func_t out, void *ctx)
 {
@@ -100,6 +101,9 @@ print_err(out_func_t out, void *ctx)
     out('R', ctx);
 }
 
+/* Printf implementation for WASM: parse format string char-by-char,
+ * pull typed args from WASM linear memory via _va_list, format via snprintf.
+ * Used by the baseline wasm_log() path (runtime string formatting). */
 static bool
 _vprintf_wa(out_func_t out, void *ctx, const char *fmt, _va_list ap,
             wasm_module_inst_t module_inst)
@@ -345,6 +349,8 @@ fail:
         }                                             \
     } while (0)
 
+/* Output callback for _vprintf_wa: buffers chars until newline or buffer full,
+ * then flushes via Zephyr LOG_* macros at the appropriate level. */
 static int
 printf_out(int c, struct str_context *ctx)
 {
@@ -367,6 +373,8 @@ printf_out(int c, struct str_context *ctx)
     return c;
 }
 
+/* Baseline native API: wasm_log(level, "fmt", args...).
+ * Formats the message at runtime using _vprintf_wa and emits via Zephyr LOG_*. */
 static int
 wasm_log_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
                  const char *format, _va_list va_args)
@@ -413,6 +421,9 @@ _Static_assert(MSG_WASM_LOG >= 0x80,
 
 #define WASM_LOG_DICT_MAX_PACKET 256
 
+/* Emit a binary packet as hex characters directly to UART.
+ * Bypasses Zephyr's log backend — the packet appears in the raw UART stream
+ * before the ##ZLOGV1## separator. */
 static void
 emit_dict_packet(const uint8 *data, uint32 len)
 {
@@ -433,6 +444,10 @@ emit_dict_packet(const uint8 *data, uint32 len)
     }
 }
 
+/* Dictionary native API: wasm_log_dict(level, string_id, type_desc, args...).
+ * Packs a 14-byte header + typed args into a binary packet (msg_type=0x80)
+ * and emits it as hex via UART. No format string processing at runtime.
+ * app_id is retrieved from exec_env user_data (host-assigned, not from WASM). */
 static int
 wasm_log_dict_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
                       uint32 string_id, uint32 arg_type_desc,
@@ -554,6 +569,8 @@ static NativeSymbol native_symbols_lib_wasm_log[] = {
     REG_NATIVE_FUNC(wasm_log_dict, "(iii*)i"),
 };
 
+/* Return the native symbol table for WAMR to register both wasm_log (baseline)
+ * and wasm_log_dict (dictionary) imports available to WASM modules. */
 uint32
 get_lib_wasm_log_export_apis(NativeSymbol **p_native_symbols)
 {
