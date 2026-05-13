@@ -27,7 +27,10 @@ import sys
 try:
     import colorama
     from colorama import Fore, Style
-    colorama.init()
+    # Don't let colorama strip ANSI when piped — we handle color decisions
+    # ourselves based on whether native logs have colors. If native logs
+    # have ANSI codes, we add them too; if not, we don't.
+    colorama.init(strip=False)
     HAS_COLOR = True
 except ImportError:
     HAS_COLOR = False
@@ -45,14 +48,16 @@ MSG_TYPE_DROPPED = 0x01
 # WASM dictionary packet type (from lib_wasm_dict_log.c)
 MSG_WASM_LOG = 0x80
 
-# WASM log levels (from wasm_log.h) — colors match Zephyr's log_parser.py
+# WASM log levels — colors match Zephyr's TEXT mode backend:
+#   ERR = bright red, WRN = bright yellow, INF/DBG = default (no color)
+# This matches what native Zephyr logs look like in text mode output.
 if HAS_COLOR:
     WASM_LOG_LEVELS = {
-        1: ("err", Fore.RED),
-        2: ("wrn", Fore.YELLOW),
-        3: ("inf", Fore.GREEN),
-        4: ("dbg", Fore.BLUE),
-        5: ("verbose", Fore.BLUE),
+        1: ("err", "\x1b[1;31m"),       # bright red (matches Zephyr ERR)
+        2: ("wrn", "\x1b[1;33m"),       # bright yellow (matches Zephyr WRN)
+        3: ("inf", ""),                  # no color (matches Zephyr INF)
+        4: ("dbg", ""),                  # no color (matches Zephyr DBG)
+        5: ("verbose", ""),              # no color
     }
 else:
     WASM_LOG_LEVELS = {
@@ -104,13 +109,191 @@ def calc_zephyr_native_packet_size(data, offset):
 # ---------------------------------------------------------------------------
 
 
-def decode_wasm_packet(data, offset, wasm_dbs):
+# ---------------------------------------------------------------------------
+# Timestamp format detection and formatting
+# ---------------------------------------------------------------------------
+
+# Patterns for auto-detecting timestamp format from native log lines
+TS_FORMAT_UPTIME = "uptime"       # [HH:MM:SS.mmm,uuu]
+TS_FORMAT_RTC = "rtc"             # [YYYY-MM-DD HH:MM:SS.mmm]
+TS_FORMAT_RAW = "raw"             # [     12345] (raw integer)
+
+TS_PATTERN_UPTIME = re.compile(r'\[(\d{2}:\d{2}:\d{2}\.\d{3},\d{3})\]')
+TS_PATTERN_RTC = re.compile(r'\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\]')
+TS_PATTERN_RAW = re.compile(r'\[\s*(\d+)\]')
+
+
+def detect_timestamp_format(content):
+    """Auto-detect timestamp format from native log lines in the content.
+
+    Scans the first few log-like lines and returns the detected format type.
+    Returns one of: TS_FORMAT_UPTIME, TS_FORMAT_RTC, TS_FORMAT_RAW.
+    """
+    for line in content.split('\n')[:100]:
+        if '<inf>' in line or '<err>' in line or '<wrn>' in line or '<dbg>' in line:
+            if TS_PATTERN_UPTIME.search(line):
+                return TS_FORMAT_UPTIME
+            if TS_PATTERN_RTC.search(line):
+                return TS_FORMAT_RTC
+            if TS_PATTERN_RAW.search(line):
+                return TS_FORMAT_RAW
+    # Default fallback
+    return TS_FORMAT_UPTIME
+
+
+def format_timestamp(timestamp_ms, ts_format, boot_time=None):
+    """Format a raw millisecond timestamp to match the detected log format.
+
+    Args:
+        timestamp_ms: raw timestamp in milliseconds (from k_uptime_get_32)
+        ts_format: one of TS_FORMAT_UPTIME, TS_FORMAT_RTC, TS_FORMAT_RAW
+        boot_time: datetime object for RTC mode (estimated boot time)
+
+    Returns: formatted timestamp string including brackets.
+    """
+    if ts_format == TS_FORMAT_UPTIME:
+        ts_sec = timestamp_ms // 1000
+        ts_ms = timestamp_ms % 1000
+        ts_h = ts_sec // 3600
+        ts_m = (ts_sec % 3600) // 60
+        ts_s = ts_sec % 60
+        return f"[{ts_h:02d}:{ts_m:02d}:{ts_s:02d}.{ts_ms:03d},000]"
+
+    elif ts_format == TS_FORMAT_RTC:
+        if boot_time is not None:
+            from datetime import timedelta
+            wall_time = boot_time + timedelta(milliseconds=timestamp_ms)
+            return f"[{wall_time.strftime('%Y-%m-%d %H:%M:%S')}.{timestamp_ms % 1000:03d}]"
+        else:
+            # Can't reconstruct wall clock without boot time — use uptime format
+            ts_sec = timestamp_ms // 1000
+            ts_ms = timestamp_ms % 1000
+            ts_h = ts_sec // 3600
+            ts_m = (ts_sec % 3600) // 60
+            ts_s = ts_sec % 60
+            return f"[{ts_h:02d}:{ts_m:02d}:{ts_s:02d}.{ts_ms:03d},000]"
+
+    elif ts_format == TS_FORMAT_RAW:
+        return f"[{timestamp_ms:>10}]"
+
+    # Fallback
+    return f"[{timestamp_ms:>10}]"
+
+
+def estimate_boot_time(content):
+    """For RTC timestamp mode, estimate boot time from the first log line.
+
+    If the first log line has RTC timestamp and we know it corresponds to
+    a small uptime value (~10ms), we can compute boot_time = rtc_time - uptime.
+    Returns a datetime object or None.
+    """
+    from datetime import datetime
+    for line in content.split('\n')[:50]:
+        m = TS_PATTERN_RTC.search(line)
+        if m and ('<inf>' in line or '<err>' in line or '<wrn>' in line or '<dbg>' in line):
+            try:
+                rtc_str = m.group(1)
+                rtc_time = datetime.strptime(rtc_str, '%Y-%m-%d %H:%M:%S.%f')
+                # Assume first log is at ~10ms uptime
+                from datetime import timedelta
+                return rtc_time - timedelta(milliseconds=10)
+            except ValueError:
+                pass
+    return None
+
+
+# Module-level state for timestamp format and color (set during decode)
+_ts_format = TS_FORMAT_UPTIME
+_boot_time = None
+_native_has_color = False  # whether native log lines have ANSI codes
+
+
+def detect_native_color(content):
+    """Check if native log lines contain ANSI escape codes.
+
+    If they do, our decoded lines should also have colors (matching Zephyr's
+    color scheme). If they don't (plain text file capture), decoded lines
+    should be white/plain to stay consistent.
+    """
+    for line in content.split('\n')[:100]:
+        if '<inf>' in line or '<err>' in line or '<wrn>' in line or '<dbg>' in line:
+            if '\x1b[' in line:
+                return True
+    return False
+
+
+# Regex to extract ANSI color code before a log level tag
+_ANSI_BEFORE_LEVEL = re.compile(r'(\x1b\[[0-9;]*m)\s*<(err|wrn|inf|dbg)>')
+
+
+def detect_native_colors_per_level(content):
+    """Auto-detect ANSI color codes used by native logs for each level.
+
+    Scans native log lines and extracts the ANSI escape sequence that
+    precedes each level tag. Returns a dict: {level_name: ansi_code}.
+    If a level is not found or has no color, its value is "".
+
+    This allows matching whatever color scheme Zephyr is configured with,
+    even if it differs from the default.
+    """
+    colors = {"err": "", "wrn": "", "inf": "", "dbg": ""}
+    found = set()
+
+    for line in content.split('\n')[:200]:
+        if len(found) == 4:
+            break
+        m = _ANSI_BEFORE_LEVEL.search(line)
+        if m:
+            ansi_code = m.group(1)
+            level = m.group(2)
+            if level not in found:
+                # \x1b[0m is "reset" = no color (default/white)
+                if ansi_code == '\x1b[0m':
+                    colors[level] = ""
+                else:
+                    colors[level] = ansi_code
+                found.add(level)
+
+    return colors
+
+
+# Module-level detected color map (set during init)
+_detected_colors = {"err": "", "wrn": "", "inf": "", "dbg": ""}
+_auto_color = False  # whether to use auto-detected colors
+
+
+def init_timestamp_format(content, auto_color=False):
+    """Detect and initialize timestamp format and color mode from log content.
+
+    Args:
+        content: the full log file content
+        auto_color: if True, auto-detect per-level colors from native logs
+                    instead of using hardcoded defaults
+    """
+    global _ts_format, _boot_time, _native_has_color, _detected_colors, _auto_color
+    _ts_format = detect_timestamp_format(content)
+    _native_has_color = detect_native_color(content)
+    _auto_color = auto_color
+
+    if _native_has_color and auto_color:
+        _detected_colors = detect_native_colors_per_level(content)
+        logger.debug("Auto-detected colors: %s",
+                     {k: repr(v) for k, v in _detected_colors.items()})
+
+    if _ts_format == TS_FORMAT_RTC:
+        _boot_time = estimate_boot_time(content)
+    logger.debug("Detected timestamp format: %s, native colors: %s, auto_color: %s",
+                 _ts_format, _native_has_color, auto_color)
+
+
+def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
     """Decode a single WASM dictionary packet starting at offset.
 
     Returns (decoded_text, bytes_consumed) or (None, bytes_consumed) on error.
     The decoded_text is a fully formatted log line.
 
     wasm_dbs is a dict mapping app_id -> (dictionary, app_name).
+    use_color: if False, don't apply ANSI colors (for text mode merging).
     """
     if offset + 14 > len(data):
         logger.debug("Truncated WASM packet header at offset %d", offset)
@@ -203,10 +386,16 @@ def decode_wasm_packet(data, offset, wasm_dbs):
     entry = db[str_key]
     fmt = entry["fmt"]
 
-    # Format the message
+    # Format the message — only colorize if native logs also have colors
     level_info = WASM_LOG_LEVELS.get(log_level, ("lvl%d" % log_level, ""))
     level_str, color = level_info
-    reset = Fore.RESET if HAS_COLOR else ""
+    apply_color = use_color and _native_has_color
+    if apply_color and _auto_color:
+        # Use auto-detected colors from native logs
+        color = _detected_colors.get(level_str, "")
+    elif not apply_color:
+        color = ""
+    reset = "\x1b[0m" if (apply_color and color) else ""
 
     try:
         message = fmt % tuple(args)
@@ -217,7 +406,10 @@ def decode_wasm_packet(data, offset, wasm_dbs):
         )
         message = f"[RAW] id={string_id} fmt={fmt!r} args={args!r}"
 
-    line = f"{color}[{timestamp:>10}] <{level_str}> {app_name}: {message}{reset}"
+    # Format timestamp to match detected native log format
+    ts_str = format_timestamp(timestamp, _ts_format, _boot_time)
+
+    line = f"{color}{ts_str} <{level_str}> {app_name}: {message}{reset}"
     return line, bytes_consumed
 
 
@@ -331,8 +523,6 @@ def extract_wasm_from_text_hexdump(content):
     i = 0
     while i < len(lines):
         line = lines[i]
-        # Match Zephyr text log line with wasm_dict as module name
-        # Format: [timestamp] <level> wasm_dict:
         if '> wasm_dict:' in line:
             hex_bytes = []
             i += 1
@@ -341,7 +531,6 @@ def extract_wasm_from_text_hexdump(content):
                 if not hex_line:
                     i += 1
                     continue
-                # Hex dump lines: "80 00 03 00 ..." possibly with "|...|" ASCII part
                 if '|' in hex_line:
                     hex_line = hex_line[:hex_line.index('|')].strip()
                 parts = hex_line.split()
@@ -360,6 +549,82 @@ def extract_wasm_from_text_hexdump(content):
         else:
             i += 1
     return packets
+
+
+def decode_text_mode(content, wasm_dbs):
+    """Decode dict OFF mode: merge native text logs with decoded WASM hexdumps.
+
+    In dict OFF mode, the serial output contains:
+    - Human-readable native/baseline logs: [timestamp] <level> module: message
+    - LOG_HEXDUMP blocks from wasm_dict module (our binary packets as text hex)
+
+    This function outputs a unified log: native lines pass through as-is,
+    wasm_dict hexdump blocks are decoded and replaced with formatted log lines.
+
+    Returns (wasm_count, error_count).
+    """
+    lines = content.split('\n')
+    i = 0
+    wasm_count = 0
+    error_count = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # Check if this is a wasm_dict hexdump header line.
+        # A hexdump header has NOTHING after "wasm_dict:" (or just whitespace),
+        # followed by indented hex lines. If there's text content after the colon
+        # (like "My_APP: message"), it's a regular baseline log — pass through.
+        if '> wasm_dict:' in line:
+            # Check if line has content after "wasm_dict:"
+            after_module = line.split('> wasm_dict:', 1)[1].strip()
+            # Strip ANSI codes for the check
+            after_clean = ANSI_ESCAPE_RE.sub('', after_module).strip()
+            if after_clean:
+                # Has content after module name — it's a regular text log, pass through
+                print(line.rstrip())
+                i += 1
+                continue
+
+            # Empty after "wasm_dict:" — this is a hexdump header
+            hex_bytes = []
+            i += 1
+            while i < len(lines):
+                hex_line = lines[i].strip()
+                if not hex_line:
+                    i += 1
+                    continue
+                if '|' in hex_line:
+                    hex_line = hex_line[:hex_line.index('|')].strip()
+                parts = hex_line.split()
+                valid_hex = True
+                for part in parts:
+                    if len(part) == 2 and all(c in '0123456789abcdefABCDEF' for c in part):
+                        hex_bytes.append(int(part, 16))
+                    else:
+                        valid_hex = False
+                        break
+                if not valid_hex:
+                    break
+                i += 1
+
+            # Decode the WASM packet and print in place of the hexdump
+            if hex_bytes and hex_bytes[0] == MSG_WASM_LOG:
+                pkt_data = bytes(hex_bytes)
+                decoded_line, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
+                if decoded_line is not None:
+                    print(decoded_line)
+                    wasm_count += 1
+                else:
+                    error_count += 1
+            # Skip the hexdump header line (don't print it)
+        else:
+            # Regular text log line — pass through as-is
+            if line.strip():
+                print(line)
+            i += 1
+
+    return wasm_count, error_count
 
 
 def extract_hex_data(content):
@@ -636,6 +901,12 @@ Examples:
         help="Sort output by timestamp (needed when WASM and Zephyr packets are in separate hex blocks)",
     )
     parser.add_argument(
+        "--auto-color",
+        action="store_true",
+        help="Auto-detect color scheme from native log lines instead of using "
+             "hardcoded defaults. Use this if Zephyr's color config differs from default.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose/debug output",
@@ -671,34 +942,45 @@ Examples:
         logger.error("Failed to read log file %s: %s", args.logfile, exc)
         sys.exit(1)
 
-    # Extract binary data
-    if args.hex:
+    # Auto-detect timestamp format and optionally color scheme from native log lines
+    init_timestamp_format(content, auto_color=args.auto_color)
+
+    # Detect mode: dict ON (##ZLOGV1## present) or dict OFF (text mode)
+    has_separator = "##ZLOGV1##" in content
+
+    if has_separator:
+        # Dict ON: extract binary data and decode packet stream
         data = extract_hex_data(content)
+        if data is None:
+            sys.exit(1)
+
+        logger.debug("Decoded %d bytes of binary log data", len(data))
+
+        zephyr_n, wasm_n, skip_n, err_n = decode_log_stream(
+            data, wasm_dbs, zephyr_parser, sort_output=args.sort
+        )
+
+        print(
+            f"\n--- Decode summary ---\n"
+            f"  Zephyr native packets: {zephyr_n}\n"
+            f"  WASM dict packets:     {wasm_n}\n"
+            f"  Skipped bytes:         {skip_n}\n"
+            f"  Decode errors:         {err_n}\n"
+            f"  Total binary bytes:    {len(data)}",
+            file=sys.stderr,
+        )
     else:
-        # Raw binary mode (future extension)
-        logger.error("Raw binary mode not yet supported, use --hex")
-        sys.exit(1)
+        # Dict OFF: text mode — merge native text logs with decoded WASM hexdumps
+        logger.debug("No ##ZLOGV1## — using text mode (dict OFF)")
+        wasm_n, err_n = decode_text_mode(content, wasm_dbs)
 
-    if data is None:
-        sys.exit(1)
-
-    logger.debug("Decoded %d bytes of binary log data", len(data))
-
-    # Decode
-    zephyr_n, wasm_n, skip_n, err_n = decode_log_stream(
-        data, wasm_dbs, zephyr_parser, sort_output=args.sort
-    )
-
-    # Summary to stderr
-    print(
-        f"\n--- Decode summary ---\n"
-        f"  Zephyr native packets: {zephyr_n}\n"
-        f"  WASM dict packets:     {wasm_n}\n"
-        f"  Skipped bytes:         {skip_n}\n"
-        f"  Decode errors:         {err_n}\n"
-        f"  Total binary bytes:    {len(data)}",
-        file=sys.stderr,
-    )
+        print(
+            f"\n--- Decode summary (text mode) ---\n"
+            f"  WASM dict packets decoded: {wasm_n}\n"
+            f"  Decode errors:             {err_n}\n"
+            f"  (Native logs passed through as-is)",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

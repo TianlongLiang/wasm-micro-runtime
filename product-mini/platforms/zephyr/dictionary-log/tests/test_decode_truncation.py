@@ -105,7 +105,8 @@ class TestValidDecode:
     def test_timestamp_in_output(self):
         pkt = build_wasm_packet(string_id=0, timestamp=12345, args=[])
         line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert '12345' in line
+        # Timestamp 12345ms = 00:00:12.345,000 in Zephyr format
+        assert '00:00:12.345,000' in line
 
     def test_app_name_in_output(self):
         pkt = build_wasm_packet(string_id=0, args=[])

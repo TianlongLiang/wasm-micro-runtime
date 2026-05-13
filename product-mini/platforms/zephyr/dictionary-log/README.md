@@ -15,11 +15,11 @@ Demonstrates how WASM apps on Zephyr can use dictionary-based logging to elimina
 - Zephyr SDK and `west` tool
 - wasi-sdk (set `WASI_SDK_DIR` if not in `/opt/wasi-sdk*`)
 - Python 3
-- `colorama` Python package (for colored log output matching Zephyr's style):
+- `colorama` Python package (for colored output):
   ```bash
   pip install colorama
   ```
-  The decoder works without it (falls back to plain text), but colors make the output much easier to read: err=red, wrn=yellow, inf=green, dbg=blue.
+  The decoder works without it (falls back to plain text). Colors are applied only when the input file has ANSI codes (matching native Zephyr log style). By default: ERR=bright red, WRN=bright yellow, INF/DBG=white (matching Zephyr's text backend). Use `--auto-color` to detect and match custom Zephyr color configurations.
 
 ## Build
 
@@ -114,6 +114,12 @@ python3 scripts/decode_wasm_log.py \
 python3 scripts/decode_wasm_log.py \
     --wasm-db build/wasm_log_dict.json \
     /tmp/serial.log --hex
+
+# Auto-detect colors (use if Zephyr color config differs from default):
+python3 scripts/decode_wasm_log.py \
+    --wasm-db 0:build/wasm_log_dict.json \
+    --wasm-db 1:build/wasm_log_dict_network.json \
+    /tmp/serial.log --hex --auto-color
 ```
 
 ### Troubleshooting: Missing Native Logs
@@ -304,7 +310,7 @@ cd product-mini/platforms/zephyr/dictionary-log
 python3 -m pytest tests/ -v
 ```
 
-Three test suites (90 tests total):
+Three test suites (112 tests total):
 
 - **`test_multifile_extraction.py`** (54 tests) — invokes the extraction script
   as a subprocess on C fixture files:
@@ -332,15 +338,17 @@ Three test suites (90 tests total):
   - Unknown string_id, unknown app_id, unknown arg_type
   - Offset handling and sequential packet decoding
 
-- **`test_structured_output.py`** (15 tests) — tests the LOG_HEXDUMP structured
-  output layer:
+- **`test_structured_output.py`** (37 tests) — tests the LOG_HEXDUMP structured output layer:
   - Embedded WASM packet extraction from native msg data field
   - Native msgs without data or with non-WASM data correctly skipped
   - Mixed stream (native + embedded WASM) decoded correctly
   - Legacy standalone 0x80 packet backward compatibility
-  - Text hexdump parsing (dict OFF mode): basic, multiline, multi-block,
-    other modules ignored, non-0x80 data ignored, all log levels
+  - Text hexdump parsing (dict OFF mode): basic, multiline, multi-block, other modules ignored, non-0x80 data ignored, all log levels
   - Unified stream extraction (all hex after separator, pre-separator ignored)
+  - Auto-color detection: detects per-level ANSI codes from native logs, custom colors, plain text fallback
+  - Timestamp format auto-detection: uptime, RTC, raw integer, non-log lines skipped, default fallback
+  - Timestamp formatting: uptime with hours, raw integer, RTC with/without boot time
+  - Dict OFF text mode merge: native pass-through, hexdump decoded in-place, baseline `wasm_dict:` lines pass through, mixed all-three-types output, no-color in text mode
 
 Test fixtures:
 ```

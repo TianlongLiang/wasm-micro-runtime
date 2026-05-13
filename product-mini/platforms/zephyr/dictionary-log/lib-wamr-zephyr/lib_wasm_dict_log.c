@@ -13,6 +13,23 @@
 
 LOG_MODULE_REGISTER(wasm_dict, LOG_LEVEL_DBG);
 
+/*
+ * Disable function name prefix for WASM App log at every severity level.
+ *
+ * Zephyr uses Z_LOG_FUNC_PREFIX_<level> (1=ERR … 4=DBG) to decide whether
+ * to prepend __func__.  Redefining them to 0 removes the prefix for this
+ * translation unit only, so other modules keep their normal behaviour.
+ */
+#undef  Z_LOG_FUNC_PREFIX_1
+#define Z_LOG_FUNC_PREFIX_1 0
+#undef  Z_LOG_FUNC_PREFIX_2
+#define Z_LOG_FUNC_PREFIX_2 0
+#undef  Z_LOG_FUNC_PREFIX_3
+#define Z_LOG_FUNC_PREFIX_3 0
+#undef  Z_LOG_FUNC_PREFIX_4
+#define Z_LOG_FUNC_PREFIX_4 0
+
+
 /* Log levels matching wasm-apps/wasm_log.h (WASM-side definitions).
  * These are the numeric values the WASM app passes to wasm_log(). */
 #define WASM_LOG_LEVEL_NONE    0
@@ -381,7 +398,7 @@ wasm_log_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
     int ret;
 
     ctx.log_level = log_level;
-    ctx.app_name = "My_APP";
+    ctx.app_name = "My_APP: ";
 
     /* format has been checked by runtime */
     if (!validate_native_addr(va_args, (uint64)sizeof(int32))) {
