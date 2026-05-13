@@ -1,26 +1,14 @@
 # WASM Dictionary-based Logging for Zephyr
 
-Demonstrates how WASM apps on Zephyr can use dictionary-based logging to
-eliminate format strings from the WASM data segment, reducing binary size.
+Demonstrates how WASM apps on Zephyr can use dictionary-based logging to eliminate format strings from the WASM data segment, reducing binary size.
 
 ## How It Works
 
-1. **Build time:** `extract_log_strings.py` preprocesses WASM app C sources
-   (`clang -E`), then scans the preprocessed output for `wasm_log()` calls
-   (all macros, PRI format specifiers, and header includes already resolved).
-   It assigns integer IDs, computes type descriptors, and generates transformed
-   `.i` files where log calls use `wasm_log_dict(level, string_id, type_desc, args)`.
-   Supports multi-file WASM apps (multiple `.c` files compiled and linked together).
+1. **Build time:** `extract_log_strings.py` preprocesses WASM app C sources (`clang -E`), then scans the preprocessed output for `wasm_log()` calls (all macros, PRI format specifiers, and header includes already resolved). It assigns integer IDs, computes type descriptors, and generates transformed `.i` files where log calls use `wasm_log_dict(level, string_id, type_desc, args)`. Supports multi-file WASM apps (multiple `.c` files compiled and linked together).
 
-2. **Runtime:** The native `wasm_log_dict()` wrapper packs a compact binary
-   packet (msg_type=0x80) with the string ID, timestamp, and typed argument
-   values, then emits it via Zephyr's `LOG_HEXDUMP_*` macros through a dedicated
-   `wasm_dict` log module. This automatically works with any Zephyr log backend
-   (UART, RTT, network, BLE, filesystem) — no backend-specific code needed.
+2. **Runtime:** The native `wasm_log_dict()` wrapper packs a compact binary packet (msg_type=0x80) with the string ID, timestamp, and typed argument values, then emits it via Zephyr's `LOG_HEXDUMP_*` macros through a dedicated `wasm_dict` log module. This automatically works with any Zephyr log backend (UART, RTT, network, BLE, filesystem) — no backend-specific code needed.
 
-3. **Offline:** `decode_wasm_log.py` reads the captured output, identifies WASM
-   dict packets embedded inside Zephyr native log messages (by checking the data
-   field for our 0x80 marker), and decodes them using the generated dictionary.
+3. **Offline:** `decode_wasm_log.py` reads the captured output, identifies WASM dict packets embedded inside Zephyr native log messages (by checking the data field for our 0x80 marker), and decodes them using the generated dictionary.
 
 ## Prerequisites
 
@@ -31,8 +19,7 @@ eliminate format strings from the WASM data segment, reducing binary size.
   ```bash
   pip install colorama
   ```
-  The decoder works without it (falls back to plain text), but colors make
-  the output much easier to read: err=red, wrn=yellow, inf=green, dbg=blue.
+  The decoder works without it (falls back to plain text), but colors make the output much easier to read: err=red, wrn=yellow, inf=green, dbg=blue.
 
 ## Build
 
@@ -57,11 +44,7 @@ The sensor app demonstrates multi-file compilation (2 `.c` files + 1 `.h` header
 
 ### Zephyr Dictionary Logging Toggle
 
-By default, both native Zephyr logs and WASM logs use dictionary (binary)
-mode — all output is hex-encoded and requires offline decoding.
-
-To see native Zephyr logs as readable text in the terminal while keeping
-WASM dictionary logging active:
+By default, both native Zephyr logs and WASM logs use dictionary (binary) mode — all output is hex-encoded and requires offline decoding. To see native Zephyr logs as readable text in the terminal while keeping WASM dictionary logging active:
 
 ```bash
 west build -b qemu_x86 . --pristine -- -DWAMR_ZEPHYR_DICT_LOG=OFF
@@ -72,8 +55,7 @@ west build -b qemu_x86 . --pristine -- -DWAMR_ZEPHYR_DICT_LOG=OFF
 | ON (default) | Binary hex (needs `--zephyr-db`) | Binary hex (embedded in native stream) | Full decode |
 | OFF | Human-readable in terminal | Text hexdump (from `wasm_dict` module) | Only `--wasm-db` |
 
-With dict OFF, WASM packets appear as `LOG_HEXDUMP` text output from the
-`wasm_dict` module. The decoder parses these text hexdumps automatically:
+With dict OFF, WASM packets appear as `LOG_HEXDUMP` text output from the `wasm_dict` module. The decoder parses these text hexdumps automatically:
 
 ```bash
 # Dict OFF: only WASM decode needed (native logs visible in raw output)
@@ -83,9 +65,7 @@ python3 scripts/decode_wasm_log.py \
     /tmp/serial.log --hex
 ```
 
-This is useful during development — you see native Zephyr logs immediately
-in the terminal without needing to run the decoder, while WASM logs are
-still compressed for binary size savings.
+This is useful during development — you see native Zephyr logs immediately in the terminal without needing to run the decoder, while WASM logs are still compressed for binary size savings.
 
 ## Run
 
@@ -107,8 +87,7 @@ The decoder needs two things to show full output:
 1. **WASM dictionary** (`--wasm-db`) — always required, decodes WASM 0x80 packets
 2. **Zephyr dictionary** (`--zephyr-db`) + Zephyr parser scripts — needed for native log packets
 
-The decoder auto-discovers Zephyr's parser scripts from `~/zephyrproject/zephyr/`.
-If your Zephyr is installed elsewhere, set `ZEPHYR_BASE` explicitly:
+The decoder auto-discovers Zephyr's parser scripts from `~/zephyrproject/zephyr/`. If your Zephyr is installed elsewhere, set `ZEPHYR_BASE` explicitly:
 
 ```bash
 # Full decode (dict ON mode): native + WASM packets (already in timestamp order)
@@ -141,27 +120,18 @@ python3 scripts/decode_wasm_log.py \
 
 If you only see WASM dictionary logs and no native `dict_log_demo` messages:
 
-1. **Built with `WAMR_ZEPHYR_DICT_LOG=OFF`**: Native logs are human-readable text
-   in the raw serial output — they don't appear in decoder output because they
-   were never binary-encoded. Check `/tmp/serial.log` directly.
-2. **Missing `--zephyr-db`**: Without this flag, native packets are skipped entirely
-3. **Missing `colorama`**: The Zephyr parser requires `pip install colorama` — without it,
-   the parser import fails silently and native packets are skipped
-4. **Zephyr parser not found**: Run with `-v` to see debug output — look for
-   "ZEPHYR_BASE not set" or "Failed to import" messages. Fix by setting `ZEPHYR_BASE`
+1. **Built with `WAMR_ZEPHYR_DICT_LOG=OFF`**: Native logs are human-readable text in the raw serial output — they don't appear in decoder output because they were never binary-encoded. Check `/tmp/serial.log` directly.
+2. **Missing `--zephyr-db`**: Without this flag, native packets are skipped entirely.
+3. **Missing `colorama`**: The Zephyr parser requires `pip install colorama` — without it, the parser import fails silently and native packets are skipped.
+4. **Zephyr parser not found**: Run with `-v` to see debug output — look for "ZEPHYR_BASE not set" or "Failed to import" messages. Fix by setting `ZEPHYR_BASE`.
 
 ### The `--sort` Flag
 
-With the structured LOG_HEXDUMP approach, all packets (native + WASM) flow
-through Zephyr's unified log stream and are already in timestamp order.
-The `--sort` flag is no longer needed for basic ordering but remains available
-if you want to enforce strict timestamp sorting across all decoded lines.
+With the structured LOG_HEXDUMP approach, all packets (native + WASM) flow through Zephyr's unified log stream and are already in timestamp order. The `--sort` flag is no longer needed for basic ordering but remains available if you want to enforce strict timestamp sorting across all decoded lines.
 
-### Expected Output (with --sort)
+### Expected Output
 
-The output shows three distinct groups of log messages in chronological order.
-With `colorama` installed, each log level has a matching color (err=red,
-wrn=yellow, inf=green, dbg=blue) — same as Zephyr's native `log_parser.py`.
+The output shows five groups of log messages in chronological order (native logs, baseline sensor, dict sensor, baseline network, dict network). With `colorama` installed, each log level has a matching color (err=red, wrn=yellow, inf=green, dbg=blue) — same as Zephyr's native `log_parser.py`.
 
 ```
 *** Booting Zephyr OS build v4.4.0-rc2 ***
@@ -190,9 +160,7 @@ wrn=yellow, inf=green, dbg=blue) — same as Zephyr's native `log_parser.py`.
 [       200] <inf> dict_log_demo: --- Demo complete ---
 ```
 
-The contrast between baseline (messy `My_APP` prefix, `printf_out:` function
-leak) and dictionary apps (clean message text, distinct app names) demonstrates
-both the quality improvement and multi-app capability.
+The contrast between baseline (messy `My_APP` prefix, `printf_out:` function leak) and dictionary apps (clean message text, distinct app names) demonstrates both the quality improvement and multi-app capability.
 
 ## Size Comparison
 
@@ -208,24 +176,15 @@ Baseline:      3,091 bytes  ( 28 log calls, format strings in binary)
 Dictionary:    1,525 bytes  ( 28 log calls, string IDs only) — 51% smaller
 ```
 
-The savings come from eliminating format string literals from the WASM data
-segment. Both apps show 50%+ reduction. The sensor app (multi-file) demonstrates
-that the preprocessor-based extraction handles multiple source files with shared
-headers seamlessly.
+The savings come from eliminating format string literals from the WASM data segment. Both apps show 50%+ reduction. The sensor app (multi-file) demonstrates that the preprocessor-based extraction handles multiple source files with shared headers seamlessly.
 
 ## Key Advantage
 
-Unlike Zephyr's native dictionary logging (which embeds format strings in the
-ELF and requires recompilation when logs change), our approach keeps the Zephyr
-ELF unchanged. Only the WASM binary and its dictionary JSON need updating when
-log messages change. Different WASM apps with different log strings can run on
-the same firmware.
+Unlike Zephyr's native dictionary logging (which embeds format strings in the ELF and requires recompilation when logs change), our approach keeps the Zephyr ELF unchanged. Only the WASM binary and its dictionary JSON need updating when log messages change. Different WASM apps with different log strings can run on the same firmware.
 
 ## Multi-App Support
 
-Multiple WASM apps can run on the same firmware, each with its own dictionary.
-The host assigns an `app_id` (0-255) to each app via exec_env user_data —
-the WASM app cannot choose or forge its own ID.
+Multiple WASM apps can run on the same firmware, each with its own dictionary. The host assigns an `app_id` (0-255) to each app via exec_env user_data — the WASM app cannot choose or forge its own ID.
 
 ```bash
 # Decode with multiple app dictionaries:
@@ -233,7 +192,7 @@ python3 scripts/decode_wasm_log.py \
     --wasm-db 0:build/wasm_log_dict.json \
     --wasm-db 1:build/wasm_log_dict_network.json \
     --zephyr-db build/zephyr/log_dictionary.json \
-    /tmp/serial.log --hex --sort
+    /tmp/serial.log --hex
 ```
 
 Output shows distinct app names derived from the JSON filename:
@@ -244,36 +203,23 @@ Output shows distinct app names derived from the JSON filename:
 
 ### Why Per-App Dictionaries (Not Unified)
 
-We evaluated merging all apps into a single shared dictionary to deduplicate
-common format strings. Finding: **not worth it**.
+We evaluated merging all apps into a single shared dictionary to deduplicate common format strings. Finding: **not worth it**.
 
 - Only 4 shared strings out of 163 total (< 1% overlap)
-- A unified dictionary would only save ~240 bytes of **JSON file size on the
-  host PC** — it does NOT reduce WASM binary size at all, since the WASM binary
-  only contains integer IDs regardless of how the JSON is organized
-- Cost: apps can no longer be built/deployed independently, ID offset
-  coordination required, more complex decoder setup
+- A unified dictionary would only save ~240 bytes of **JSON file size on the host PC** — it does NOT reduce WASM binary size at all, since the WASM binary only contains integer IDs regardless of how the JSON is organized
+- Cost: apps can no longer be built/deployed independently, ID offset coordination required, more complex decoder setup
 
-The per-app approach is correct: each app gets its own dictionary, can be
-updated independently, and the WASM binary size (the thing that matters on
-the embedded device) is unaffected by dictionary organization.
+The per-app approach is correct: each app gets its own dictionary, can be updated independently, and the WASM binary size (the thing that matters on the embedded device) is unaffected by dictionary organization.
 
 ## Limitations
 
 ### Max 8 Arguments Per Log Call
 
-The type descriptor is a uint32 with 4 bits per argument, limiting each log
-call to 8 typed arguments maximum. Calls exceeding this are skipped with a
-warning at build time.
+The type descriptor is a uint32 with 4 bits per argument, limiting each log call to 8 typed arguments maximum. Calls exceeding this are skipped with a warning at build time.
 
 ### String Argument Length Limit
 
-String arguments (`%s`) are packed into the binary packet as length-prefixed
-data: `[type=0x04][len:2B LE][string bytes]`. The total packet size is capped
-at 256 bytes (`WASM_LOG_DICT_MAX_PACKET`). After the 14-byte header and other
-args, this leaves roughly 200 bytes for string content. Strings exceeding the
-remaining space are truncated at runtime (no build-time warning — the string
-value isn't known until runtime).
+String arguments (`%s`) are packed into the binary packet as length-prefixed data: `[type=0x04][len:2B LE][string bytes]`. The total packet size is capped at 256 bytes (`WASM_LOG_DICT_MAX_PACKET`). After the 14-byte header and other args, this leaves roughly 200 bytes for string content. Strings exceeding the remaining space are truncated at runtime (no build-time warning — the string value isn't known until runtime).
 
 ### What IS Supported (Not Limitations)
 
@@ -289,8 +235,7 @@ The following are fully handled by the preprocessor-based extraction:
 
 ## Design: Why Regex on Preprocessed Output (Not AST)
 
-The extraction tool uses regex pattern matching on `clang -E` preprocessed output
-rather than C AST parsing (e.g., libclang). This is a deliberate choice:
+The extraction tool uses regex pattern matching on `clang -E` preprocessed output rather than C AST parsing (e.g., libclang). This is a deliberate choice:
 
 **Why regex works perfectly here:**
 
@@ -300,10 +245,7 @@ After `clang -E`, the preprocessor has already:
 - Merged string concatenation
 - Stripped comments
 
-The resulting `.i` file contains `wasm_log(level, "literal_string", args)` — a
-simple, unambiguous pattern. The format string is guaranteed to be a literal
-(the preprocessor ensures this). Our paren-matching parser correctly handles
-`wasm_log` text appearing inside format strings by tracking `in_string` state.
+The resulting `.i` file contains `wasm_log(level, "literal_string", args)` — a simple, unambiguous pattern. The format string is guaranteed to be a literal (the preprocessor ensures this). Our paren-matching parser correctly handles `wasm_log` text appearing inside format strings by tracking `in_string` state.
 
 **Why AST adds no benefit:**
 
@@ -324,9 +266,7 @@ Source → [clang -fsyntax-only] → [clang -E] → [our regex] → [clang compi
           validates input          resolves       transforms    validates output   validates runtime
 ```
 
-Our regex is sandwiched between two clang validation passes. It cannot produce
-dangerous output — only wrong output (which clang's second pass rejects). AST
-would add complexity without improving correctness or security.
+Our regex is sandwiched between two clang validation passes. It cannot produce dangerous output — only wrong output (which clang's second pass rejects). AST would add complexity without improving correctness or security.
 
 ## Binary Packet Format (msg_type=0x80)
 
@@ -345,9 +285,7 @@ Arg types: 0x01=int32(4B), 0x02=int64(8B), 0x03=float64(8B), 0x04=string(2B len 
 
 ## Security Analysis
 
-The dictionary logging transformation does NOT weaken the WASM sandbox.
-A malicious WASM app controls `log_level`, `string_id`, `arg_type_descriptor`,
-and `va_args` — but none of these provide an escape vector:
+The dictionary logging transformation does NOT weaken the WASM sandbox. A malicious WASM app controls `log_level`, `string_id`, `arg_type_descriptor`, and `va_args` — but none of these provide an escape vector:
 
 | Attack Vector | Why It Fails |
 |---------------|-------------|
@@ -357,10 +295,7 @@ and `va_args` — but none of these provide an escape vector:
 | Forge app_id | Host-assigned via exec_env user_data — WASM has no API to modify it |
 | Malicious string_id/type_desc | Only affects offline decoder (Python on host), not runtime memory |
 
-The worst case: a malicious WASM app emits garbage packets that decode to
-nonsense — a denial-of-observability, not a sandbox escape. This is equivalent
-to the baseline `wasm_log()` path where a malicious app could print misleading
-text.
+The worst case: a malicious WASM app emits garbage packets that decode to nonsense — a denial-of-observability, not a sandbox escape. This is equivalent to the baseline `wasm_log()` path where a malicious app could print misleading text.
 
 ## Tests
 
@@ -369,7 +304,7 @@ cd product-mini/platforms/zephyr/dictionary-log
 python3 -m pytest tests/ -v
 ```
 
-Two test suites (75 tests total):
+Three test suites (90 tests total):
 
 - **`test_multifile_extraction.py`** (54 tests) — invokes the extraction script
   as a subprocess on C fixture files:
@@ -390,17 +325,27 @@ Two test suites (75 tests total):
     empty files, no-log-call files
   - **Single file**: basic sanity, output file naming
 
-- **`test_decode_truncation.py`** (21 tests) — tests the offline decoder:
+- **`test_decode_truncation.py`** (21 tests) — tests the offline decoder core:
   - Valid packet decoding (all arg types: int32, int64, float64, string)
   - Truncated packets at every level (header, int32, int64, float64, string
     length, string data)
   - Unknown string_id, unknown app_id, unknown arg_type
   - Offset handling and sequential packet decoding
 
+- **`test_structured_output.py`** (15 tests) — tests the LOG_HEXDUMP structured
+  output layer:
+  - Embedded WASM packet extraction from native msg data field
+  - Native msgs without data or with non-WASM data correctly skipped
+  - Mixed stream (native + embedded WASM) decoded correctly
+  - Legacy standalone 0x80 packet backward compatibility
+  - Text hexdump parsing (dict OFF mode): basic, multiline, multi-block,
+    other modules ignored, non-0x80 data ignored, all log levels
+  - Unified stream extraction (all hex after separator, pre-separator ignored)
+
 Test fixtures:
 ```
 tests/
 ├── multifile/       3 .c + 2 .h (multi-file compilation scenarios)
 ├── singlefile/      types_test.c + edge_cases.c (single-file type/edge tests)
-└── error_cases/     syntax_error.c, missing_include.c, no_log_calls.c, empty_file.c
+└── error_cases/     syntax_error.c, missing_include.c, no_log_calls.c, empty_file.c, rejected.cpp
 ```
