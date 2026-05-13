@@ -583,12 +583,44 @@ class TestEdgeCases:
         assert len(matching) == 1
         assert matching[0]['arg_types'] == ['int32']
 
+    def test_wasm_log_in_other_function_not_extracted(self):
+        """wasm_log text inside another function's string arg is not extracted."""
+        # dummy_printf("... wasm_log(...) ...") should NOT produce entries
+        assert not any('try calling' in fmt for fmt in self.fmts)
+        assert not any('API is simple' in fmt for fmt in self.fmts)
+
+    def test_valid_after_other_function_wasm_log(self):
+        """Valid LOG after tricky other-function strings still works."""
+        assert any('valid after other-function wasm_log strings' in fmt
+                   for fmt in self.fmts)
+
+    def test_function_pointer_not_extracted(self):
+        """wasm_log used as a function pointer (no call parens) is not extracted."""
+        assert not any('register' in fmt for fmt in self.fmts)
+
+    def test_valid_after_function_pointer(self):
+        """Valid LOG after function pointer usage still works."""
+        assert any('valid after function pointer usage' in fmt
+                   for fmt in self.fmts)
+
+    def test_struct_field_wasm_log_not_extracted(self):
+        """obj.wasm_log(...) — struct field named wasm_log is NOT extracted."""
+        assert not any('struct field call' in fmt for fmt in self.fmts)
+
+    def test_valid_after_struct_field(self):
+        """Valid LOG after struct field wasm_log usage still works."""
+        assert any('valid after struct field wasm_log' in fmt
+                   for fmt in self.fmts)
+
     def test_total_valid_calls(self):
         """Only the valid LOG calls are extracted, not dead code or variable fmt."""
         # edge_cases.c has: 1 in #if 0 (excluded), 1 variable (skipped),
-        # 1 "valid after variable fmt", 1 "after comment",
-        # 3 wasm_log-in-string tests = 5 valid
-        assert len(self.d) == 5
+        # 2 dummy_printf with wasm_log in string (skipped),
+        # 1 struct.wasm_log (skipped),
+        # Valid: 1 "valid after variable fmt", 1 "after comment",
+        # 3 wasm_log-in-string tests, 1 valid-after-other-function,
+        # 1 valid-after-function-pointer, 1 valid-after-struct = 8 valid
+        assert len(self.d) == 8
 
 
 class TestEmptyAndMinimal:
@@ -622,3 +654,15 @@ class TestEmptyAndMinimal:
             expect_fail=True,
         )
         assert rc != 0
+
+    def test_cpp_file_rejected(self):
+        """C++ files (.cpp) are rejected with a clear error."""
+        sources = [os.path.join(ERROR_DIR, 'rejected.cpp')]
+        rc, stdout, stderr, _, _ = run_extract(
+            sources,
+            include_dirs=[ERROR_DIR],
+            output_dir=self.tmpdir,
+            expect_fail=True,
+        )
+        assert rc != 0
+        assert 'not supported' in stderr.lower() or 'c++' in stderr.lower()

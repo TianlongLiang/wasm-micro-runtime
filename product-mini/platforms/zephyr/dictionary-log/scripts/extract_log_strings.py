@@ -294,6 +294,14 @@ def extract_wasm_log_calls(source):
     results = []
 
     for match in WASM_LOG_PATTERN.finditer(source):
+        # Skip struct/object member access: obj.wasm_log() or ptr->wasm_log()
+        # These are method calls on a struct field, not our wasm_log import.
+        start = match.start()
+        if start > 0 and source[start - 1] == '.':
+            continue
+        if start > 1 and source[start - 2:start] == '->':
+            continue
+
         paren_pos = match.end() - 1  # position of '('
         close_paren = find_matching_paren(source, paren_pos)
         if close_paren < 0:
@@ -448,6 +456,22 @@ def main():
     parser.add_argument("-j", "--json", required=True,
                         help="Output JSON dictionary file")
     args = parser.parse_args()
+
+    # Reject C++ source files — this tool is designed for C only.
+    # C++ introduces templates, namespaces, method calls (obj.wasm_log()),
+    # and overloads that the regex-based extraction cannot handle correctly.
+    CPP_EXTENSIONS = ('.cpp', '.cc', '.cxx', '.C', '.c++')
+    for src in args.sources:
+        if src.endswith(CPP_EXTENSIONS):
+            print(f"Error: C++ source files are not supported: {src}",
+                  file=sys.stderr)
+            print("  This tool only handles C (.c) source files.",
+                  file=sys.stderr)
+            print("  C++ introduces templates, namespaces, and method calls",
+                  file=sys.stderr)
+            print("  that cannot be handled by regex-based extraction.",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Build common clang flags
     common_flags = []
