@@ -5,16 +5,13 @@
 
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_output_dict.h>
-#include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
-#include <zephyr/sys/util.h>
 
 #include "bh_platform.h"
 #include "bh_assert.h"
 #include "wasm_export.h"
 #include "lib_export.h"
 
-LOG_MODULE_REGISTER(wasm_app, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(wasm_dict, LOG_LEVEL_DBG);
 
 /* Log levels matching wasm-apps/wasm_log.h (WASM-side definitions).
  * These are the numeric values the WASM app passes to wasm_log(). */
@@ -421,32 +418,10 @@ _Static_assert(MSG_WASM_LOG >= 0x80,
 
 #define WASM_LOG_DICT_MAX_PACKET 256
 
-/* Emit a binary packet as hex characters directly to UART.
- * Bypasses Zephyr's log backend — the packet appears in the raw UART stream
- * before the ##ZLOGV1## separator. */
-static void
-emit_dict_packet(const uint8 *data, uint32 len)
-{
-    const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-
-    if (!device_is_ready(uart_dev))
-        return;
-
-    for (uint32 i = 0; i < len; i++) {
-        char c;
-        uint8 x;
-        x = data[i] >> 4;
-        (void)hex2char(x, &c);
-        uart_poll_out(uart_dev, c);
-        x = data[i] & 0x0FU;
-        (void)hex2char(x, &c);
-        uart_poll_out(uart_dev, c);
-    }
-}
-
 /* Dictionary native API: wasm_log_dict(level, string_id, type_desc, args...).
  * Packs a 14-byte header + typed args into a binary packet (msg_type=0x80)
- * and emits it as hex via UART. No format string processing at runtime.
+ * and emits it via Zephyr's LOG_HEXDUMP (works with any backend: UART, RTT, etc.)
+ * No format string processing at runtime.
  * app_id is retrieved from exec_env user_data (host-assigned, not from WASM). */
 static int
 wasm_log_dict_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
@@ -557,7 +532,25 @@ wasm_log_dict_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
     }
 
 emit:
-    emit_dict_packet(pkt, pos);
+    /* Emit packet through Zephyr's log subsystem — automatically uses
+     * whatever backend is configured (UART, RTT, network, etc.) */
+    switch (log_level) {
+        case WASM_LOG_LEVEL_ERR:
+            LOG_HEXDUMP_ERR(pkt, pos, "");
+            break;
+        case WASM_LOG_LEVEL_WRN:
+            LOG_HEXDUMP_WRN(pkt, pos, "");
+            break;
+        case WASM_LOG_LEVEL_INF:
+            LOG_HEXDUMP_INF(pkt, pos, "");
+            break;
+        case WASM_LOG_LEVEL_DBG:
+        case WASM_LOG_LEVEL_VERBOSE:
+            LOG_HEXDUMP_DBG(pkt, pos, "");
+            break;
+        default:
+            break;
+    }
     return 0;
 }
 

@@ -14,12 +14,13 @@ eliminate format strings from the WASM data segment, reducing binary size.
 
 2. **Runtime:** The native `wasm_log_dict()` wrapper packs a compact binary
    packet (msg_type=0x80) with the string ID, timestamp, and typed argument
-   values, then emits it over UART in hex-encoded format alongside Zephyr's
-   native dictionary log stream.
+   values, then emits it via Zephyr's `LOG_HEXDUMP_*` macros through a dedicated
+   `wasm_dict` log module. This automatically works with any Zephyr log backend
+   (UART, RTT, network, BLE, filesystem) — no backend-specific code needed.
 
-3. **Offline:** `decode_wasm_log.py` reads the UART output, dispatches native
-   Zephyr packets to Zephyr's own parser, and decodes WASM packets using the
-   generated `wasm_log_dict.json` dictionary.
+3. **Offline:** `decode_wasm_log.py` reads the captured output, identifies WASM
+   dict packets embedded inside Zephyr native log messages (by checking the data
+   field for our 0x80 marker), and decodes them using the generated dictionary.
 
 ## Prerequisites
 
@@ -68,18 +69,18 @@ west build -b qemu_x86 . --pristine -- -DWAMR_ZEPHYR_DICT_LOG=OFF
 
 | Mode | Native Logs | WASM Dict Logs | Decode Needed |
 |------|------------|----------------|---------------|
-| ON (default) | Binary hex (needs `--zephyr-db`) | Binary hex | Full decode |
-| OFF | Human-readable in terminal | Binary hex (unchanged) | Only `--wasm-db` |
+| ON (default) | Binary hex (needs `--zephyr-db`) | Binary hex (embedded in native stream) | Full decode |
+| OFF | Human-readable in terminal | Text hexdump (from `wasm_dict` module) | Only `--wasm-db` |
 
-With dict OFF, the decoder automatically detects the missing `##ZLOGV1##`
-separator and scans for WASM hex data directly:
+With dict OFF, WASM packets appear as `LOG_HEXDUMP` text output from the
+`wasm_dict` module. The decoder parses these text hexdumps automatically:
 
 ```bash
 # Dict OFF: only WASM decode needed (native logs visible in raw output)
 python3 scripts/decode_wasm_log.py \
     --wasm-db 0:build/wasm_log_dict.json \
     --wasm-db 1:build/wasm_log_dict_network.json \
-    /tmp/serial.log --hex --sort
+    /tmp/serial.log --hex
 ```
 
 This is useful during development — you see native Zephyr logs immediately
@@ -110,25 +111,25 @@ The decoder auto-discovers Zephyr's parser scripts from `~/zephyrproject/zephyr/
 If your Zephyr is installed elsewhere, set `ZEPHYR_BASE` explicitly:
 
 ```bash
-# Full decode (dict ON mode): native + WASM packets
+# Full decode (dict ON mode): native + WASM packets (already in timestamp order)
 python3 scripts/decode_wasm_log.py \
     --wasm-db 0:build/wasm_log_dict.json \
     --wasm-db 1:build/wasm_log_dict_network.json \
     --zephyr-db build/zephyr/log_dictionary.json \
-    /tmp/serial.log --hex --sort
+    /tmp/serial.log --hex
 
 # If Zephyr is installed elsewhere, set ZEPHYR_BASE:
 ZEPHYR_BASE=/path/to/zephyr python3 scripts/decode_wasm_log.py \
     --wasm-db 0:build/wasm_log_dict.json \
     --wasm-db 1:build/wasm_log_dict_network.json \
     --zephyr-db build/zephyr/log_dictionary.json \
-    /tmp/serial.log --hex --sort
+    /tmp/serial.log --hex
 
 # Dict OFF mode: only WASM decode needed (native logs already in terminal)
 python3 scripts/decode_wasm_log.py \
     --wasm-db 0:build/wasm_log_dict.json \
     --wasm-db 1:build/wasm_log_dict_network.json \
-    /tmp/serial.log --hex --sort
+    /tmp/serial.log --hex
 
 # Single app only (backward compatible, no app_id prefix = app_id 0):
 python3 scripts/decode_wasm_log.py \
@@ -151,17 +152,10 @@ If you only see WASM dictionary logs and no native `dict_log_demo` messages:
 
 ### The `--sort` Flag
 
-WASM dictionary packets are emitted via direct `uart_poll_out` before Zephyr's
-log backend prints its `##ZLOGV1##` separator. Without `--sort`, WASM packets
-appear first regardless of actual timestamp. With `--sort`, all decoded lines
-are sorted by timestamp into chronological order:
-
-```
-[10]  native Zephyr logs first
-[50]  baseline WASM logs (runtime formatted)
-[100] dictionary WASM logs (binary packets)
-[180] native Zephyr post-summary
-```
+With the structured LOG_HEXDUMP approach, all packets (native + WASM) flow
+through Zephyr's unified log stream and are already in timestamp order.
+The `--sort` flag is no longer needed for basic ordering but remains available
+if you want to enforce strict timestamp sorting across all decoded lines.
 
 ### Expected Output (with --sort)
 
@@ -359,7 +353,7 @@ and `va_args` — but none of these provide an escape vector:
 |---------------|-------------|
 | Read host memory via string offset | `validate_app_str_addr()` bounds-checks within WASM linear memory |
 | Read past va_args bounds | `wasm_runtime_get_native_addr_range()` enforces limits |
-| Buffer overflow in packet | Every arg write checked against `WASM_LOG_DICT_MAX_PACKET` (256B) |
+| Buffer overflow in packet | Every arg write checked against `WASM_LOG_DICT_MAX_PACKET` (256B), emitted via kernel LOG_HEXDUMP |
 | Forge app_id | Host-assigned via exec_env user_data — WASM has no API to modify it |
 | Malicious string_id/type_desc | Only affects offline decoder (Python on host), not runtime memory |
 
@@ -375,9 +369,9 @@ cd product-mini/platforms/zephyr/dictionary-log
 python3 -m pytest tests/ -v
 ```
 
-Two test suites (65 tests total):
+Two test suites (75 tests total):
 
-- **`test_multifile_extraction.py`** (44 tests) — invokes the extraction script
+- **`test_multifile_extraction.py`** (54 tests) — invokes the extraction script
   as a subprocess on C fixture files:
   - **Multi-file** (3 `.c` + 2 `.h`): flat ID space, header inline LOG extracted,
     PRI macros resolved, shared headers get separate IDs per call site,
@@ -389,7 +383,9 @@ Two test suites (65 tests total):
     zero args, max 8 args, escaped quotes, backslash sequences, long strings,
     adjacent calls on same line
   - **Edge cases** (`edge_cases.c`): `#if 0` block excluded, variable format
-    string skipped, valid call after skip, comments before LOG, empty functions
+    string skipped, valid call after skip, comments before LOG, empty functions,
+    `wasm_log` text inside format strings, `wasm_log` in other function args,
+    function pointer usage, struct field named `wasm_log`, C++ file rejected
   - **Error handling**: syntax errors caught, missing includes caught,
     empty files, no-log-call files
   - **Single file**: basic sanity, output file naming

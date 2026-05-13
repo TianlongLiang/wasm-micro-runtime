@@ -312,64 +312,88 @@ def create_zephyr_parser(zephyr_db_path):
 # ---------------------------------------------------------------------------
 
 
+def extract_wasm_from_text_hexdump(content):
+    """Extract WASM dict packets from text-mode hexdump output (dict OFF).
+
+    When Zephyr dictionary logging is OFF, LOG_HEXDUMP produces text like:
+        [00:00:00.100,000] <inf> wasm_dict:
+          80 00 03 00 00 64 00 00  00 00 00 00 00 00 01 01 |.....d..........|
+          2a 00 00 00                                       |*...            |
+
+    This function finds those hexdump blocks and reconstructs binary packets.
+
+    Limitation: if another module logs text containing '> wasm_dict:' at the
+    standard module name position, it could produce false positives. This is
+    unlikely in practice.
+    """
+    packets = []
+    lines = content.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Match Zephyr text log line with wasm_dict as module name
+        # Format: [timestamp] <level> wasm_dict:
+        if '> wasm_dict:' in line:
+            hex_bytes = []
+            i += 1
+            while i < len(lines):
+                hex_line = lines[i].strip()
+                if not hex_line:
+                    i += 1
+                    continue
+                # Hex dump lines: "80 00 03 00 ..." possibly with "|...|" ASCII part
+                if '|' in hex_line:
+                    hex_line = hex_line[:hex_line.index('|')].strip()
+                parts = hex_line.split()
+                valid_hex = True
+                for part in parts:
+                    if len(part) == 2 and all(c in '0123456789abcdefABCDEF' for c in part):
+                        hex_bytes.append(int(part, 16))
+                    else:
+                        valid_hex = False
+                        break
+                if not valid_hex:
+                    break
+                i += 1
+            if hex_bytes and hex_bytes[0] == MSG_WASM_LOG:
+                packets.append(bytes(hex_bytes))
+        else:
+            i += 1
+    return packets
+
+
 def extract_hex_data(content):
     """Extract hex-encoded log data from UART output.
 
     Two modes:
-    1. ##ZLOGV1## found (Zephyr dict ON): extract hex before (WASM) and after
-       (Zephyr native) the separator.
-    2. No separator (Zephyr dict OFF): scan all lines for hex-only prefixes.
-       Only WASM 0x80 packets will be present.
+    1. ##ZLOGV1## found (Zephyr dict ON): all packets (native + WASM) are after
+       the separator in a unified stream.
+    2. No separator (Zephyr dict OFF): parse text hexdump from wasm_dict module.
 
     Returns the binary data, or None if no hex data found.
     """
     marker_idx = content.find("##ZLOGV1##")
 
     if marker_idx >= 0:
-        # Mode 1: separator present — Zephyr dict is ON
-        pre_hex = ""
-        before = content[:marker_idx]
-        for line in before.split("\n"):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            hex_prefix = ""
-            for c in stripped:
-                if c in "0123456789abcdefABCDEF":
-                    hex_prefix += c
-                else:
-                    break
-            if len(hex_prefix) >= 28:
-                pre_hex += hex_prefix
-
+        # All packets (native + WASM) are after the separator in unified stream
         after = content[marker_idx + len("##ZLOGV1##"):]
-        post_hex = ""
+        hexdata = ""
         for c in after:
             if c in "0123456789abcdefABCDEF":
-                post_hex += c
+                hexdata += c
             elif c in "\n\r \t":
                 continue
             else:
                 break
-
-        hexdata = pre_hex + post_hex
     else:
-        # Mode 2: no separator — Zephyr dict is OFF
-        # Scan all lines for hex-only prefixes (WASM packets only)
-        logger.debug("No ##ZLOGV1## marker — scanning for WASM hex data only")
-        hexdata = ""
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            hex_prefix = ""
-            for c in stripped:
-                if c in "0123456789abcdefABCDEF":
-                    hex_prefix += c
-                else:
-                    break
-            if len(hex_prefix) >= 28:
-                hexdata += hex_prefix
+        # Mode 2: no separator — Zephyr dict is OFF (text output)
+        # WASM packets appear as LOG_HEXDUMP text from wasm_dict module
+        logger.debug("No ##ZLOGV1## marker — parsing text hexdump from wasm_dict")
+        packets = extract_wasm_from_text_hexdump(content)
+        if packets:
+            hexdata = ''.join(pkt.hex() for pkt in packets)
+        else:
+            hexdata = ""
 
     if not hexdata:
         logger.error("No hex data found in input")
@@ -439,7 +463,29 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
                 )
                 break
 
-            if zephyr_parser is not None:
+            # Check if this native packet contains an embedded WASM dict packet
+            # (LOG_HEXDUMP data field starting with 0x80)
+            wasm_extracted = False
+            if offset + 14 <= len(data):
+                pkg_len = struct.unpack_from("<H", data, offset + 2)[0]
+                data_len = struct.unpack_from("<H", data, offset + 4)[0]
+                data_start = offset + 14 + pkg_len
+
+                if (data_len > 0
+                        and data_start + data_len <= len(data)
+                        and data_start < len(data)
+                        and data[data_start] == MSG_WASM_LOG):
+                    # Extract and decode the embedded WASM packet
+                    wasm_payload = data[data_start:data_start + data_len]
+                    line, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
+                    if line is not None:
+                        emit(line)
+                        wasm_count += 1
+                    else:
+                        error_count += 1
+                    wasm_extracted = True
+
+            if not wasm_extracted and zephyr_parser is not None:
                 try:
                     buf = io.StringIO()
                     old_stdout = sys.stdout
@@ -478,6 +524,7 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
             zephyr_count += 1
 
         elif msg_type == MSG_WASM_LOG:
+            # Legacy: standalone WASM packet (old direct uart_poll_out approach)
             line, consumed = decode_wasm_packet(data, offset, wasm_dbs)
             if line is not None:
                 emit(line)

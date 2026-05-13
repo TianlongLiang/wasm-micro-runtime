@@ -8,8 +8,6 @@
 #include <zephyr/version.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/app_memory/app_memdomain.h>
-#include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
 
 LOG_MODULE_REGISTER(dict_log_demo, LOG_LEVEL_DBG);
 
@@ -28,8 +26,7 @@ struct k_mem_domain wamr_domain;
 extern void
 iwasm_main(void *arg1, void *arg2, void *arg3);
 
-/* Set up a Zephyr userspace thread with memory domain for WAMR.
- * Grants UART device access so wasm_log_dict can emit binary packets. */
+/* Set up a Zephyr userspace thread with memory domain for WAMR. */
 static bool
 iwasm_user_mode(void)
 {
@@ -54,12 +51,6 @@ iwasm_user_mode(void)
     if (k_mem_domain_add_thread(&wamr_domain, tid) != 0) {
         printk("Failed to add memory domain to thread.\n");
         return false;
-    }
-
-    /* Grant UART access so wasm_log_dict can emit binary packets */
-    const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    if (device_is_ready(uart_dev)) {
-        k_object_access_grant(uart_dev, tid);
     }
 
 #if KERNEL_VERSION_NUMBER < 0x040000 /* version 4.0.0 */
