@@ -26,14 +26,15 @@ import sys
 
 try:
     import colorama
-    from colorama import Fore, Style
-    # Don't let colorama strip ANSI when piped — we handle color decisions
-    # ourselves based on whether native logs have colors. If native logs
-    # have ANSI codes, we add them too; if not, we don't.
-    colorama.init(strip=False)
     HAS_COLOR = True
 except ImportError:
     HAS_COLOR = False
+
+# Save raw stdout BEFORE any colorama.init() can wrap it.
+# Zephyr's log_parser_v3.py calls colorama.init() which installs a
+# stripping wrapper on sys.stdout. We bypass this by writing to the
+# original unwrapped stdout for our colored output.
+_RAW_STDOUT = sys.stdout
 
 logger = logging.getLogger("decode_wasm_log")
 
@@ -48,25 +49,43 @@ MSG_TYPE_DROPPED = 0x01
 # WASM dictionary packet type (from lib_wasm_dict_log.c)
 MSG_WASM_LOG = 0x80
 
-# WASM log levels — colors match Zephyr's TEXT mode backend:
-#   ERR = bright red, WRN = bright yellow, INF/DBG = default (no color)
-# This matches what native Zephyr logs look like in text mode output.
-if HAS_COLOR:
-    WASM_LOG_LEVELS = {
-        1: ("err", "\x1b[1;31m"),       # bright red (matches Zephyr ERR)
-        2: ("wrn", "\x1b[1;33m"),       # bright yellow (matches Zephyr WRN)
-        3: ("inf", ""),                  # no color (matches Zephyr INF)
-        4: ("dbg", ""),                  # no color (matches Zephyr DBG)
-        5: ("verbose", ""),              # no color
-    }
-else:
-    WASM_LOG_LEVELS = {
-        1: ("err", ""),
-        2: ("wrn", ""),
-        3: ("inf", ""),
-        4: ("dbg", ""),
-        5: ("verbose", ""),
-    }
+# Two color schemes to match Zephyr's two different output modes:
+#
+# Dict ON (binary mode, decoded by log_parser.py):
+#   ERR = red, WRN = yellow, INF = green, DBG = blue
+#
+# Dict OFF (text mode backend):
+#   ERR = bright red, WRN = bright yellow, INF = white, DBG = white
+
+WASM_LOG_LEVELS_DICT_ON = {
+    1: ("err", "\x1b[31m"),         # red (matches log_parser.py)
+    2: ("wrn", "\x1b[33m"),         # yellow (matches log_parser.py)
+    3: ("inf", "\x1b[32m"),         # green (matches log_parser.py)
+    4: ("dbg", "\x1b[34m"),         # blue (matches log_parser.py)
+    5: ("verbose", "\x1b[34m"),     # blue
+}
+
+WASM_LOG_LEVELS_DICT_OFF = {
+    1: ("err", "\x1b[1;31m"),       # bright red (matches text backend)
+    2: ("wrn", "\x1b[1;33m"),       # bright yellow (matches text backend)
+    3: ("inf", ""),                  # no color / white (matches text backend)
+    4: ("dbg", ""),                  # no color / white (matches text backend)
+    5: ("verbose", ""),
+}
+
+WASM_LOG_LEVELS_NO_COLOR = {
+    1: ("err", ""),
+    2: ("wrn", ""),
+    3: ("inf", ""),
+    4: ("dbg", ""),
+    5: ("verbose", ""),
+}
+
+# Active color table — selected at runtime based on mode
+WASM_LOG_LEVELS = WASM_LOG_LEVELS_NO_COLOR if not HAS_COLOR else WASM_LOG_LEVELS_DICT_OFF
+
+# Flag to indicate binary mode (set by main, read by decode_wasm_packet)
+_binary_mode = False
 
 # WASM argument type codes (from lib_wasm_dict_log.c)
 WASM_LOG_ARG_INT32 = 0x01
@@ -386,12 +405,16 @@ def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
     entry = db[str_key]
     fmt = entry["fmt"]
 
-    # Format the message — only colorize if native logs also have colors
-    level_info = WASM_LOG_LEVELS.get(log_level, ("lvl%d" % log_level, ""))
+    # Select color table based on mode and apply only if native logs are colored
+    if _binary_mode:
+        level_table = WASM_LOG_LEVELS_DICT_ON if HAS_COLOR else WASM_LOG_LEVELS_NO_COLOR
+    else:
+        level_table = WASM_LOG_LEVELS_DICT_OFF if HAS_COLOR else WASM_LOG_LEVELS_NO_COLOR
+
+    level_info = level_table.get(log_level, ("lvl%d" % log_level, ""))
     level_str, color = level_info
     apply_color = use_color and _native_has_color
     if apply_color and _auto_color:
-        # Use auto-detected colors from native logs
         color = _detected_colors.get(level_str, "")
     elif not apply_color:
         color = ""
@@ -582,7 +605,7 @@ def decode_text_mode(content, wasm_dbs):
             after_clean = ANSI_ESCAPE_RE.sub('', after_module).strip()
             if after_clean:
                 # Has content after module name — it's a regular text log, pass through
-                print(line.rstrip())
+                _RAW_STDOUT.write(line.rstrip() + "\n")
                 i += 1
                 continue
 
@@ -613,7 +636,7 @@ def decode_text_mode(content, wasm_dbs):
                 pkt_data = bytes(hex_bytes)
                 decoded_line, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
                 if decoded_line is not None:
-                    print(decoded_line)
+                    _RAW_STDOUT.write(decoded_line + "\n")
                     wasm_count += 1
                 else:
                     error_count += 1
@@ -621,7 +644,7 @@ def decode_text_mode(content, wasm_dbs):
         else:
             # Regular text log line — pass through as-is
             if line.strip():
-                print(line)
+                _RAW_STDOUT.write(line + "\n")
             i += 1
 
     return wasm_count, error_count
@@ -715,7 +738,9 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
         if sort_output:
             lines.append(text)
         else:
-            print(text, end="" if text.endswith("\n") else "\n")
+            _RAW_STDOUT.write(text)
+            if not text.endswith("\n"):
+                _RAW_STDOUT.write("\n")
 
     while offset < len(data):
         msg_type = data[offset]
@@ -816,7 +841,7 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
     if sort_output and lines:
         lines.sort(key=extract_timestamp)
         for line in lines:
-            print(line)
+            _RAW_STDOUT.write(line + "\n")
 
     return zephyr_count, wasm_count, skipped_count, error_count
 
@@ -861,6 +886,8 @@ def parse_wasm_dbs(wasm_db_args):
 
 
 def main():
+    global _ts_format, _native_has_color, WASM_LOG_LEVELS, _binary_mode
+
     parser = argparse.ArgumentParser(
         description="Decode WASM dictionary log packets from Zephyr UART hex output.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -942,14 +969,37 @@ Examples:
         logger.error("Failed to read log file %s: %s", args.logfile, exc)
         sys.exit(1)
 
-    # Auto-detect timestamp format and optionally color scheme from native log lines
-    init_timestamp_format(content, auto_color=args.auto_color)
-
-    # Detect mode: dict ON (##ZLOGV1## present) or dict OFF (text mode)
+    # Detect mode: if --zephyr-db is provided, use binary dict mode.
+    # Otherwise use text mode. ##ZLOGV1## is a secondary indicator.
+    binary_mode = args.zephyr_db is not None or "##ZLOGV1##" in content
     has_separator = "##ZLOGV1##" in content
 
-    if has_separator:
-        # Dict ON: extract binary data and decode packet stream
+    # Auto-detect timestamp format and optionally color scheme from native log lines.
+    # In binary mode, --auto-color is ignored (no text lines to scan; we use
+    # log_parser.py's color scheme which is fixed).
+    auto_color = args.auto_color and not binary_mode
+    init_timestamp_format(content, auto_color=auto_color)
+
+    if binary_mode:
+        # Dict ON: Zephyr's log_parser.py uses raw integer format [%10d]
+        # and colors (ERR=red, WRN=yellow, INF=green, DBG=blue).
+        # --auto-color is forced off — colors are hardcoded to match log_parser.py.
+        _ts_format = TS_FORMAT_RAW
+        _native_has_color = True
+        _binary_mode = True
+    else:
+        # Dict OFF: text mode
+        _binary_mode = False
+
+    if binary_mode and zephyr_parser is None:
+        print("Warning: binary dict mode detected (##ZLOGV1## present) but "
+              "--zephyr-db not provided.\n"
+              "  Native Zephyr log packets will not be decoded.\n"
+              "  Add --zephyr-db build/zephyr/log_dictionary.json to see native logs.\n",
+              file=sys.stderr)
+
+    if binary_mode:
+        # Dict ON (binary): extract binary data and decode packet stream
         data = extract_hex_data(content)
         if data is None:
             sys.exit(1)

@@ -43,14 +43,15 @@ from decode_wasm_log import (
 
 
 def capture_decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
-    """Run decode_log_stream and capture stdout output as a list of lines."""
+    """Run decode_log_stream and capture output as a list of lines."""
+    import decode_wasm_log
     buf = io.StringIO()
-    old_stdout = sys.stdout
-    sys.stdout = buf
+    old_raw = decode_wasm_log._RAW_STDOUT
+    decode_wasm_log._RAW_STDOUT = buf
     try:
         zn, wn, sn, en = decode_log_stream(data, wasm_dbs, zephyr_parser, sort_output)
     finally:
-        sys.stdout = old_stdout
+        decode_wasm_log._RAW_STDOUT = old_raw
     lines = [l for l in buf.getvalue().splitlines() if l.strip()]
     return zn, wn, sn, en, lines
 
@@ -402,13 +403,14 @@ class TestTextModeMerge:
         """Regular native log lines are printed as-is."""
         content = "[00:00:00.010,000] <inf> dict_log_demo: hello world\n"
         init_timestamp_format(content)
+        import decode_wasm_log
         buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = buf
+        old_raw = decode_wasm_log._RAW_STDOUT
+        decode_wasm_log._RAW_STDOUT = buf
         try:
             wn, en = decode_text_mode(content, TEST_DBS)
         finally:
-            sys.stdout = old_stdout
+            decode_wasm_log._RAW_STDOUT = old_raw
         output = buf.getvalue()
         assert "dict_log_demo: hello world" in output
         assert wn == 0
@@ -424,13 +426,14 @@ class TestTextModeMerge:
             "[00:00:00.200,000] <inf> dict_log_demo: after\n"
         )
         init_timestamp_format(content)
+        import decode_wasm_log
         buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = buf
+        old_raw = decode_wasm_log._RAW_STDOUT
+        decode_wasm_log._RAW_STDOUT = buf
         try:
             wn, en = decode_text_mode(content, TEST_DBS)
         finally:
-            sys.stdout = old_stdout
+            decode_wasm_log._RAW_STDOUT = old_raw
         output = buf.getvalue()
         assert "dict_log_demo: before" in output
         assert "dict_log_demo: after" in output
@@ -442,13 +445,14 @@ class TestTextModeMerge:
         """wasm_dict lines WITH content after colon (baseline) pass through."""
         content = "[00:00:00.050,000] <inf> wasm_dict: My_APP: sensor starting\n"
         init_timestamp_format(content)
+        import decode_wasm_log
         buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = buf
+        old_raw = decode_wasm_log._RAW_STDOUT
+        decode_wasm_log._RAW_STDOUT = buf
         try:
             wn, en = decode_text_mode(content, TEST_DBS)
         finally:
-            sys.stdout = old_stdout
+            decode_wasm_log._RAW_STDOUT = old_raw
         output = buf.getvalue()
         assert "My_APP: sensor starting" in output
         assert wn == 0  # not decoded as WASM dict — passed through
@@ -465,13 +469,14 @@ class TestTextModeMerge:
             "[00:00:00.300,000] <inf> dict_log_demo: end\n"
         )
         init_timestamp_format(content)
+        import decode_wasm_log
         buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = buf
+        old_raw = decode_wasm_log._RAW_STDOUT
+        decode_wasm_log._RAW_STDOUT = buf
         try:
             wn, en = decode_text_mode(content, TEST_DBS)
         finally:
-            sys.stdout = old_stdout
+            decode_wasm_log._RAW_STDOUT = old_raw
         output = buf.getvalue()
         assert "native log" in output
         assert "My_APP: baseline log" in output
@@ -488,13 +493,14 @@ class TestTextModeMerge:
             f"  {hex_lines}                    |...|\n"
         )
         init_timestamp_format(content)
+        import decode_wasm_log
         buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = buf
+        old_raw = decode_wasm_log._RAW_STDOUT
+        decode_wasm_log._RAW_STDOUT = buf
         try:
             wn, en = decode_text_mode(content, TEST_DBS)
         finally:
-            sys.stdout = old_stdout
+            decode_wasm_log._RAW_STDOUT = old_raw
         output = buf.getvalue()
         assert 'hello world' in output
 
