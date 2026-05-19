@@ -16,7 +16,17 @@ import sys
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 sys.path.insert(0, SCRIPT_DIR)
 
-from decode_wasm_log import decode_wasm_packet
+from decode_wasm_log import decode_wasm_packet as _decode_wasm_packet
+
+
+def decode_wasm_packet(data, offset, wasm_dbs, **kwargs):
+    """Wrapper that returns (assembled_msg_or_None, bytes_consumed)."""
+    result, consumed = _decode_wasm_packet(data, offset, wasm_dbs, **kwargs)
+    if result is None:
+        return None, consumed
+    text, color, reset = result
+    return f"{color}{text}{reset}", consumed
+
 
 # Arg type constants (must match lib_wasm_dict_log.c)
 ARG_INT32 = 0x01

@@ -436,7 +436,7 @@ def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
     # Use negative lookbehind to avoid matching the second % of %%
     fmt = re.sub(r'(?<!%)%([-+ #0]*\*?\d*\.?\*?\d*)p', r'%\g<1>#x', fmt)
 
-    # Select color table based on mode and apply only if native logs are colored
+    # Determine level string and color
     if _binary_mode:
         level_table = WASM_LOG_LEVELS_DICT_ON if HAS_COLOR else WASM_LOG_LEVELS_NO_COLOR
     else:
@@ -460,9 +460,10 @@ def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
         )
         message = f"[RAW] id={string_id} fmt={fmt!r} args={args!r}"
 
-    # Return message portion only (no timestamp — caller prepends it)
-    msg = f"{color}<{level_str}> {app_name}: {message}{reset}"
-    return msg, bytes_consumed
+    # Return: (text, color, reset, bytes_consumed)
+    # Caller is responsible for assembling the full colored line (including timestamp)
+    text = f"<{level_str}> {app_name}: {message}"
+    return (text, color, reset), bytes_consumed
 
 
 # ---------------------------------------------------------------------------
@@ -664,12 +665,13 @@ def decode_text_mode(content, wasm_dbs):
             # Decode the WASM packet and print in place of the hexdump
             if hex_bytes:
                 pkt_data = bytes(hex_bytes)
-                msg, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
-                if msg is not None:
+                result, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
+                if result is not None:
+                    text, color, reset = result
                     # Use timestamp from the hexdump header line
                     ts_match = re.search(r'(\[[^\]]+\])', header_line)
                     ts_prefix = ts_match.group(1) + ' ' if ts_match else ''
-                    _RAW_STDOUT.write(ts_prefix + msg + "\n")
+                    _RAW_STDOUT.write(f"{color}{ts_prefix}{text}{reset}\n")
                     wasm_count += 1
                 else:
                     error_count += 1
@@ -801,10 +803,11 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False,
                 wasm_result = identify_wasm_packet(data, offset, source_map)
                 if wasm_result is not None:
                     wasm_payload, pkt_timestamp = wasm_result
-                    msg, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
-                    if msg is not None:
+                    result, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
+                    if result is not None:
+                        text, color, reset = result
                         ts_str = format_timestamp(pkt_timestamp, _ts_format)
-                        emit(f"{ts_str} {msg}")
+                        emit(f"{color}{ts_str} {text}{reset}")
                         wasm_count += 1
                     else:
                         error_count += 1
@@ -822,9 +825,13 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False,
                             and data[data_start] == MSG_WASM_LOG):
                         # Extract WASM packet, skipping the 0x80 marker byte
                         wasm_payload = data[data_start + 1:data_start + data_len]
-                        line, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
-                        if line is not None:
-                            emit(line)
+                        result, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
+                        if result is not None:
+                            text, color, reset = result
+                            ts_str = format_timestamp(
+                                struct.unpack_from("<I", data, offset + 10)[0],
+                                _ts_format)
+                            emit(f"{color}{ts_str} {text}{reset}")
                             wasm_count += 1
                         else:
                             error_count += 1
@@ -1003,10 +1010,10 @@ Examples:
         logger.error("Failed to read log file %s: %s", args.logfile, exc)
         sys.exit(1)
 
-    # Detect mode: if --zephyr-db is provided, use binary dict mode.
-    # Otherwise use text mode. ##ZLOGV1## is a secondary indicator.
-    binary_mode = args.zephyr_db is not None or "##ZLOGV1##" in content
-    has_separator = "##ZLOGV1##" in content
+    # Detect mode: binary (dict ON) if ##ZLOGV1## separator is present in the
+    # captured file. --zephyr-db provides the dictionary but does not force mode.
+    binary_mode = "##ZLOGV1##" in content
+    has_separator = binary_mode
 
     # Auto-detect timestamp format and optionally color scheme from native log lines.
     # In binary mode, --auto-color is ignored (no text lines to scan; we use

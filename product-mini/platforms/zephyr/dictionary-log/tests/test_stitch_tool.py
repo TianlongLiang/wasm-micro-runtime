@@ -246,7 +246,17 @@ class TestStitchErrors:
 
 # Add scripts/ to path so we can import decode_wasm_log
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-from decode_wasm_log import parse_wasm_dbs, decode_wasm_packet  # noqa: E402
+from decode_wasm_log import parse_wasm_dbs  # noqa: E402
+from decode_wasm_log import decode_wasm_packet as _decode_wasm_packet  # noqa: E402
+
+
+def decode_wasm_packet(data, offset, wasm_dbs, **kwargs):
+    """Wrapper that assembles the tuple return into a single string."""
+    result, consumed = _decode_wasm_packet(data, offset, wasm_dbs, **kwargs)
+    if result is None:
+        return None, consumed
+    text, color, reset = result
+    return f"{color}{text}{reset}", consumed
 
 
 def build_wasm_packet(app_id=0, level=3, string_id=0, args=None):
