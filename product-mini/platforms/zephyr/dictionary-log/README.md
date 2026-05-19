@@ -19,7 +19,7 @@ Demonstrates how WASM apps on Zephyr can use dictionary-based logging to elimina
   ```bash
   pip install colorama
   ```
-  The decoder works without it (falls back to plain text). Colors are applied only when the input file has ANSI codes (matching native Zephyr log style). By default: ERR=bright red, WRN=bright yellow, INF/DBG=white (matching Zephyr's text backend). Use `--auto-color` to detect and match custom Zephyr color configurations.
+  The decoder works without it (falls back to plain text). In dict ON (binary) mode, colors match Zephyr's `log_parser.py` scheme: ERR=red, WRN=yellow, INF=green, DBG=blue. In dict OFF (text) mode, colors match Zephyr's text backend: ERR=bright red, WRN=bright yellow, INF/DBG=white. Use `--auto-color` in dict OFF mode to detect and match custom Zephyr color configurations (ignored in dict ON mode).
 
 ## Build
 
@@ -127,13 +127,27 @@ python3 scripts/decode_wasm_log.py \
 If you only see WASM dictionary logs and no native `dict_log_demo` messages:
 
 1. **Built with `WAMR_ZEPHYR_DICT_LOG=OFF`**: Native logs are human-readable text in the raw serial output — they don't appear in decoder output because they were never binary-encoded. Check `/tmp/serial.log` directly.
-2. **Missing `--zephyr-db`**: Without this flag, native packets are skipped entirely.
+2. **Missing `--zephyr-db`**: Without this flag, native packets are skipped. The decoder prints a warning: `"binary dict mode detected but --zephyr-db not provided"`. Add `--zephyr-db build/zephyr/log_dictionary.json` to see native logs.
 3. **Missing `colorama`**: The Zephyr parser requires `pip install colorama` — without it, the parser import fails silently and native packets are skipped.
 4. **Zephyr parser not found**: Run with `-v` to see debug output — look for "ZEPHYR_BASE not set" or "Failed to import" messages. Fix by setting `ZEPHYR_BASE`.
 
 ### The `--sort` Flag
 
 With the structured LOG_HEXDUMP approach, all packets (native + WASM) flow through Zephyr's unified log stream and are already in timestamp order. The `--sort` flag is no longer needed for basic ordering but remains available if you want to enforce strict timestamp sorting across all decoded lines.
+
+### Timestamp Format
+
+The decoder auto-detects the timestamp format from native log lines in the captured file and formats decoded WASM packet timestamps to match. Three formats are supported:
+
+| Format | Example | Source | When Used |
+|--------|---------|--------|-----------|
+| Zephyr uptime | `[00:00:12.345,000]` | `k_uptime_get_32()` | Default on QEMU/most boards |
+| RTC wall-clock | `[2026-05-13 02:36:13.218]` | Real-time clock | Boards with RTC configured |
+| Raw integer | `[     12345]` | Raw ms counter | Minimal timestamp configurations |
+
+Detection is automatic: the decoder scans the first ~100 lines for native log entries and matches the timestamp pattern. The raw value in the WASM binary packet is always milliseconds from `k_uptime_get_32()`. For uptime format, this is converted to `HH:MM:SS.mmm,000`. For RTC format, boot time is estimated from the first native log line and added to the uptime value. For raw format, the integer is right-aligned in the bracket field.
+
+If the log file has no recognizable native log lines (e.g., only hexdump data), the decoder defaults to Zephyr uptime format.
 
 ### Expected Output
 

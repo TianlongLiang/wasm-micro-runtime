@@ -405,6 +405,10 @@ def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
     entry = db[str_key]
     fmt = entry["fmt"]
 
+    # Python's % operator doesn't support %p — convert to hex output
+    # Use negative lookbehind to avoid matching the second % of %%
+    fmt = re.sub(r'(?<!%)%([-+ #0]*\*?\d*\.?\*?\d*)p', r'%\g<1>#x', fmt)
+
     # Select color table based on mode and apply only if native logs are colored
     if _binary_mode:
         level_table = WASM_LOG_LEVELS_DICT_ON if HAS_COLOR else WASM_LOG_LEVELS_NO_COLOR

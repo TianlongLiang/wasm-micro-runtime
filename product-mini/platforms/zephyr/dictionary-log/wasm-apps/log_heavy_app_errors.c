@@ -13,9 +13,20 @@ handle_errors(void)
     int32_t timeout_ms = 500, bus_id = 2;
     uint32_t crc_expected = 0xA3B7, crc_actual = 0xA3B8;
     int32_t sensor_id = 5, threshold = 100;
+    void *fault_addr = (void *)0x0000DEAD;
+    void *stack_top = (void *)0x20008000;
+    void *handler_fn = (void *)0x00000400;
+
+    const char *task_name = "sensor_read";
+    const char *bus_name = "i2c0";
 
     LOG_ERR("Sensor %d read timeout after %d ms on bus %d", sensor_id,
             timeout_ms, bus_id);
+    LOG_ERR("Task '%s' faulted at address %p, stack pointer=%p", task_name,
+            fault_addr, stack_top);
+    LOG_WRN("Bus '%s' error: device at 0x%x not responding", bus_name, 0x48);
+    LOG_WRN("ISR handler at %p replaced, new handler at %p", handler_fn,
+            (char *)handler_fn + 0x100);
     LOG_WRN("CRC mismatch: expected=0x%x actual=0x%x on packet %u",
             crc_expected, crc_actual, 1023);
     LOG_ERR("Bus %d arbitration lost, error code=0x%x", bus_id, error_code);

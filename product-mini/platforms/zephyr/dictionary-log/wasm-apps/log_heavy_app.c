@@ -14,9 +14,13 @@ init_subsystem(void)
     int32_t sensor_count = 8;
     int32_t i;
 
+    const char *board_name = "qemu_x86";
+    const char *sensor_driver = "bme280_i2c";
+
     LOG_INF("=== WASM Sensor Monitor starting ===");
-    LOG_INF("Firmware version %d.%d.%d built for qemu_x86", major, minor,
-            patch);
+    LOG_INF("Firmware version %d.%d.%d built for %s", major, minor,
+            patch, board_name);
+    LOG_INF("Primary sensor driver: %s on bus %d", sensor_driver, 0);
     LOG_INF("Memory config: heap=%u bytes, stack=%u bytes", heap_size,
             stack_size);
     LOG_DBG("Initializing %d sensor channels", sensor_count);
@@ -73,8 +77,15 @@ read_sensors(void)
     uint32_t timestamp_ms = 1234567, seq_num = 42;
     int32_t adc_val = 1650, offset = -12;
     uint32_t sample_rate = 100, oversampling = 4;
+    int32_t samples[4] = { 100, 200, 300, 400 };
+    int32_t *sample_ptr = &samples[0];
+    void *dma_buf = (void *)0x20001000;
+    void *ring_buf = (void *)0x20002000;
 
     LOG_INF("Starting sensor read cycle, timestamp=%u ms", timestamp_ms);
+    LOG_DBG("Sample buffer at %p, DMA target at %p", sample_ptr, dma_buf);
+    LOG_DBG("Ring buffer base=%p, write head=%p", ring_buf,
+            (char *)ring_buf + 256);
     LOG_DBG("ADC raw value=%d, offset correction=%d applied", adc_val, offset);
     LOG_DBG("Temperature sensor raw=%d, scaled=%d milli-celsius", temp_raw,
             temp_raw * 10);

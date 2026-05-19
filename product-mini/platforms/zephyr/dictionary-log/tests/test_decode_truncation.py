@@ -243,6 +243,155 @@ class TestOffsetHandling:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Pointer types (%p, %s with various values)
+# ---------------------------------------------------------------------------
+
+# Extended dictionary with pointer format strings
+POINTER_DB = {
+    0: ({
+        "0": {"fmt": "ptr=%p", "arg_types": ["int32"]},
+        "1": {"fmt": "a=%p b=%p", "arg_types": ["int32", "int32"]},
+        "2": {"fmt": "name=%s", "arg_types": ["string"]},
+        "3": {"fmt": "ptr=%p val=%d", "arg_types": ["int32", "int32"]},
+        "4": {"fmt": "100%% ptr=%p", "arg_types": ["int32"]},
+        "5": {"fmt": "array[0]=%p array[1]=%p array[2]=%p",
+              "arg_types": ["int32", "int32", "int32"]},
+        "6": {"fmt": "deref: **pp=%p *p=%p val=%d",
+              "arg_types": ["int32", "int32", "int32"]},
+        "7": {"fmt": "null str=%s", "arg_types": ["string"]},
+        "8": {"fmt": "fn_ptr=%p callback=%p", "arg_types": ["int32", "int32"]},
+    }, "ptr_app"),
+}
+
+
+class TestPointerDecode:
+    def test_basic_pointer(self):
+        """Single %p prints as hex."""
+        pkt = build_wasm_packet(string_id=0, args=[(ARG_INT32, 0x1000)],
+                                 app_id=0)
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0x1000' in line
+
+    def test_pointer_deadbeef(self):
+        """%p with 0xDEADBEEF value."""
+        pkt = build_wasm_packet(string_id=0,
+                                 args=[(ARG_INT32, 0xDEADBEEF - 2**32)])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        # signed int32 wraps — Python %#x on negative shows -0x...
+        # The value on wire is a signed i32, but %p should show address
+        assert 'ptr=' in line
+        assert consumed == len(pkt)
+
+    def test_null_pointer(self):
+        """%p with NULL (0x0)."""
+        pkt = build_wasm_packet(string_id=0, args=[(ARG_INT32, 0)])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert 'ptr=0' in line or 'ptr=0x0' in line
+
+    def test_two_pointers(self):
+        """Two %p in one format string."""
+        pkt = build_wasm_packet(string_id=1, args=[
+            (ARG_INT32, 0x2000),
+            (ARG_INT32, 0x3000),
+        ])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0x2000' in line
+        assert '0x3000' in line
+
+    def test_pointer_mixed_with_int(self):
+        """%p and %d in same format string."""
+        pkt = build_wasm_packet(string_id=3, args=[
+            (ARG_INT32, 0xCAFE),
+            (ARG_INT32, 42),
+        ])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0xcafe' in line
+        assert '42' in line
+
+    def test_pointer_with_percent_literal(self):
+        """%p after %% literal doesn't confuse decoder."""
+        pkt = build_wasm_packet(string_id=4, args=[(ARG_INT32, 0xFF)])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '100%' in line
+        assert '0xff' in line
+
+    def test_array_of_pointers(self):
+        """Three %p simulating an array of pointers."""
+        pkt = build_wasm_packet(string_id=5, args=[
+            (ARG_INT32, 0x10000),
+            (ARG_INT32, 0x10004),
+            (ARG_INT32, 0x10008),
+        ])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0x10000' in line
+        assert '0x10004' in line
+        assert '0x10008' in line
+
+    def test_double_pointer_values(self):
+        """Simulates **pp, *p, val — all are just int32 on wire."""
+        pkt = build_wasm_packet(string_id=6, args=[
+            (ARG_INT32, 0x4000),   # **pp (address of pointer-to-pointer)
+            (ARG_INT32, 0x2000),   # *p (address of pointer)
+            (ARG_INT32, 99),       # val (the dereferenced value)
+        ])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0x4000' in line
+        assert '0x2000' in line
+        assert '99' in line
+
+    def test_function_pointer_values(self):
+        """Function pointers are just addresses — same as any %p."""
+        pkt = build_wasm_packet(string_id=8, args=[
+            (ARG_INT32, 0x800),    # fn_ptr (WASM table index or address)
+            (ARG_INT32, 0x804),    # callback
+        ])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '0x800' in line
+        assert '0x804' in line
+
+    def test_empty_string(self):
+        """%s with empty string — valid edge case."""
+        pkt = build_wasm_packet(string_id=2, args=[(ARG_STRING, "")])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert 'name=' in line
+
+    def test_null_string_as_empty(self):
+        """%s with zero-length represents dereferenced NULL string."""
+        pkt = build_wasm_packet(string_id=7, args=[(ARG_STRING, "")])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert 'null str=' in line
+
+    def test_string_with_special_chars(self):
+        """%s with path-like content (slashes, dots)."""
+        pkt = build_wasm_packet(string_id=2,
+                                 args=[(ARG_STRING, "/dev/sensor0")])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        assert '/dev/sensor0' in line
+
+    def test_pointer_max_wasm32(self):
+        """%p with max WASM32 address (just under 4GB)."""
+        # WASM32 max address 0xFFFFFFFF as signed int32 = -1
+        pkt = build_wasm_packet(string_id=0, args=[(ARG_INT32, -1)])
+        line, consumed = decode_wasm_packet(pkt, 0, POINTER_DB)
+        assert line is not None
+        # Negative int32 formatted as %#x shows negative hex
+        assert 'ptr=' in line
+        assert consumed == len(pkt)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

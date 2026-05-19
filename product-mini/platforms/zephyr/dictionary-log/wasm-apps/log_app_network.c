@@ -23,6 +23,12 @@ static void net_init(void)
 
 static void net_traffic(void)
 {
+    char tx_buf[64];
+    char *rx_buf = tx_buf + 32;
+    void *socket_ctx = (void *)0x20004000;
+
+    LOG_DBG("TX buffer at %p, RX buffer at %p", tx_buf, rx_buf);
+    LOG_DBG("Socket context: %p", socket_ctx);
     LOG_INF("TCP connection established: remote port=%d, local port=%d", 443, 49152);
     LOG_DBG("TLS handshake complete: protocol version=%d, cipher=0x%x", 0x0304, 0x1301);
     LOG_INF("HTTP request sent: method=%d, content length=%d bytes", 1, 256);
@@ -37,7 +43,9 @@ static void net_traffic(void)
 
 static void net_errors(void)
 {
-    LOG_ERR("DNS resolution failed: timeout after %d ms for query ID %d", 5000, 42);
+    const char *hostname = "telemetry.example.com";
+
+    LOG_ERR("DNS resolution failed for '%s': timeout after %d ms", hostname, 5000);
     LOG_WRN("ICMP destination unreachable: type=%d code=%d from hop %d", 3, 1, 5);
     LOG_ERR("TLS certificate validation failed: error=0x%x, chain depth=%d", 0x2700, 1);
     LOG_WRN("Network congestion detected: RTT=%d ms, packet loss=%d percent", 450, 12);
