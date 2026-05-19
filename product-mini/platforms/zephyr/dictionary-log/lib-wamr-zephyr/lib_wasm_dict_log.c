@@ -4,7 +4,6 @@
  */
 
 #include <zephyr/logging/log.h>
-#include <zephyr/logging/log_output_dict.h>
 
 #include "bh_platform.h"
 #include "bh_assert.h"
@@ -419,15 +418,6 @@ wasm_log_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
 
 /* --- Dictionary mode: binary packet emission --- */
 
-#define MSG_WASM_LOG 0x80
-
-_Static_assert(MSG_WASM_LOG != MSG_NORMAL,
-               "MSG_WASM_LOG collides with Zephyr MSG_NORMAL");
-_Static_assert(MSG_WASM_LOG != MSG_DROPPED_MSG,
-               "MSG_WASM_LOG collides with Zephyr MSG_DROPPED_MSG");
-_Static_assert(MSG_WASM_LOG >= 0x80,
-               "MSG_WASM_LOG must be in vendor extension range (>= 0x80)");
-
 #define WASM_LOG_ARG_INT32   0x01
 #define WASM_LOG_ARG_INT64   0x02
 #define WASM_LOG_ARG_FLOAT64 0x03
@@ -435,14 +425,15 @@ _Static_assert(MSG_WASM_LOG >= 0x80,
 
 #define WASM_LOG_DICT_MAX_PACKET 256
 
-/* Dictionary native API: wasm_log_dict(level, string_id, type_desc, args...).
- * Packs a 14-byte header + typed args into a binary packet (msg_type=0x80)
- * and emits it via Zephyr's LOG_HEXDUMP (works with any backend: UART, RTT, etc.)
- * No format string processing at runtime.
+/* Dictionary native API: wasm_log_dict(level, log_string_id, type_desc, args...).
+ * Packs a 5-byte header + typed args into a binary packet and emits via
+ * Zephyr's LOG_HEXDUMP (works with any backend: UART, RTT, etc.)
+ * No format string processing at runtime. Timestamp comes from Zephyr's
+ * log subsystem (native packet header).
  * app_id is retrieved from exec_env user_data (host-assigned, not from WASM). */
 static int
 wasm_log_dict_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
-                      uint32 string_id, uint32 arg_type_desc,
+                      uint32 log_string_id, uint32 arg_type_desc,
                       _va_list va_args)
 {
     wasm_module_inst_t module_inst = get_module_inst(exec_env);
@@ -460,18 +451,12 @@ wasm_log_dict_wrapper(wasm_exec_env_t exec_env, uint32 log_level,
         tmp >>= 4;
     }
 
-    /* Build 14-byte header */
+    /* Build 5-byte header (V2 format — no msg_type, no timestamp) */
     uint8 app_id = (uint8)(uintptr_t)wasm_runtime_get_user_data(exec_env);
-    pkt[pos++] = MSG_WASM_LOG;                        /* msg_type */
     pkt[pos++] = app_id;                              /* app_id */
     pkt[pos++] = (uint8)log_level;                    /* log_level */
-    pkt[pos++] = (uint8)(string_id & 0xFF);           /* string_id LE */
-    pkt[pos++] = (uint8)((string_id >> 8) & 0xFF);
-    {
-        uint64 ts = (uint64)k_uptime_get_32();
-        for (int b = 0; b < 8; b++)
-            pkt[pos++] = (uint8)((ts >> (b * 8)) & 0xFF);
-    }
+    pkt[pos++] = (uint8)(log_string_id & 0xFF);       /* log_string_id LE */
+    pkt[pos++] = (uint8)((log_string_id >> 8) & 0xFF);
     pkt[pos++] = (uint8)arg_count;                    /* arg_count */
 
     /* Pack each argument */

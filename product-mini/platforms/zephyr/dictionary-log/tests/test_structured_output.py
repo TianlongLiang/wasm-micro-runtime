@@ -69,13 +69,41 @@ TEST_DBS = {
 
 
 def build_wasm_packet(app_id=0, level=3, string_id=0, timestamp=100, args=None):
-    """Build a WASM dict binary packet."""
+    """Build a WASM dict binary packet with 0x80 prefix (for legacy fallback tests).
+
+    Format: [0x80][V2_payload]
+    The legacy fallback in decode_log_stream strips the 0x80 marker then
+    passes the rest to decode_wasm_packet() which expects V2 format.
+    The timestamp parameter is kept for API compat but not encoded in the packet.
+    """
     pkt = bytearray()
     pkt.append(MSG_WASM_LOG)
     pkt.append(app_id)
     pkt.append(level)
     pkt += struct.pack('<H', string_id)
-    pkt += struct.pack('<Q', timestamp)
+    if args is None:
+        args = []
+    pkt.append(len(args))
+    for atype, value in args:
+        pkt.append(atype)
+        if atype == ARG_INT32:
+            pkt += struct.pack('<i', value)
+        elif atype == ARG_STRING:
+            encoded = value.encode('utf-8')
+            pkt += struct.pack('<H', len(encoded))
+            pkt += encoded
+    return bytes(pkt)
+
+
+def build_wasm_v2_packet(app_id=0, level=3, string_id=0, args=None):
+    """Build a WASM dict V2 binary packet (no 0x80 prefix, no timestamp).
+
+    V2 header: [app_id:1B][level:1B][string_id:2B LE][arg_count:1B]
+    """
+    pkt = bytearray()
+    pkt.append(app_id)
+    pkt.append(level)
+    pkt += struct.pack('<H', string_id)
     if args is None:
         args = []
     pkt.append(len(args))
@@ -204,14 +232,17 @@ class TestEmbeddedPacketExtraction:
 # ---------------------------------------------------------------------------
 
 class TestLegacyStandalonePacket:
-    """Test that standalone 0x80 packets (old format) still decode."""
+    """Test legacy 0x80 identification in binary stream."""
 
-    def test_standalone_wasm_packet_still_works(self):
-        """A raw 0x80 packet at the top level is decoded (legacy support)."""
+    def test_legacy_0x80_in_native_data_field(self):
+        """0x80-prefixed WASM packet inside a native msg's data field is decoded."""
+        # The legacy fallback identifies WASM packets by finding 0x80 as the
+        # first byte of the data field in a MSG_NORMAL packet (no source_map).
         wasm_pkt = build_wasm_packet(string_id=0, timestamp=100)
+        native_msg = build_native_packet_with_wasm_data(wasm_pkt)
 
         zn, wn, sn, en, lines = capture_decode_log_stream(
-            wasm_pkt, TEST_DBS, zephyr_parser=None, sort_output=False
+            native_msg, TEST_DBS, zephyr_parser=None, sort_output=False
         )
         assert wn == 1
         assert any('hello world' in l for l in lines)
@@ -255,14 +286,15 @@ class TestTextHexdumpExtraction:
         packets = extract_wasm_from_text_hexdump(text)
         assert len(packets) == 0
 
-    def test_data_not_starting_with_0x80_ignored(self):
-        """Hexdump from wasm_dict but data not starting with 0x80 is ignored."""
+    def test_any_hex_data_from_wasm_dict_extracted(self):
+        """Hexdump from wasm_dict is extracted regardless of first byte (V2 format)."""
         text = """\
 [00:00:00.100,000] <inf> wasm_dict:
   01 02 03 04 05                                    |.....|
 """
         packets = extract_wasm_from_text_hexdump(text)
-        assert len(packets) == 0
+        assert len(packets) == 1
+        assert packets[0] == bytes([0x01, 0x02, 0x03, 0x04, 0x05])
 
     def test_multiline_hexdump(self):
         """Hexdump spanning multiple lines is concatenated."""
@@ -379,17 +411,10 @@ class TestTimestampDetection:
         result = format_timestamp(12345, TS_FORMAT_RAW)
         assert result == "[     12345]"
 
-    def test_format_rtc_without_boot_time(self):
-        """format_timestamp falls back to uptime when no boot_time for RTC."""
-        result = format_timestamp(100, TS_FORMAT_RTC, boot_time=None)
+    def test_format_rtc_falls_back_to_uptime(self):
+        """format_timestamp renders RTC as uptime (can't reconstruct wall clock)."""
+        result = format_timestamp(100, TS_FORMAT_RTC)
         assert "00:00:00.100,000" in result
-
-    def test_format_rtc_with_boot_time(self):
-        """format_timestamp produces wall-clock time when boot_time given."""
-        from datetime import datetime
-        boot = datetime(2026, 5, 13, 10, 0, 0)
-        result = format_timestamp(5000, TS_FORMAT_RTC, boot_time=boot)
-        assert "2026-05-13 10:00:05" in result
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +442,7 @@ class TestTextModeMerge:
 
     def test_hexdump_decoded_and_replaces_block(self):
         """wasm_dict hexdump blocks are decoded into formatted log lines."""
-        wasm_pkt = build_wasm_packet(string_id=0, timestamp=100)
+        wasm_pkt = build_wasm_v2_packet(string_id=0)
         hex_lines = ' '.join(f'{b:02x}' for b in wasm_pkt)
         content = (
             "[00:00:00.010,000] <inf> dict_log_demo: before\n"
@@ -438,6 +463,7 @@ class TestTextModeMerge:
         assert "dict_log_demo: before" in output
         assert "dict_log_demo: after" in output
         assert "hello world" in output  # decoded WASM message
+        assert "[00:00:00.100,000]" in output  # timestamp from header line
         assert wn == 1
         assert en == 0
 
@@ -459,7 +485,7 @@ class TestTextModeMerge:
 
     def test_mixed_all_three_types(self):
         """Native + baseline + dict hexdump all appear in output."""
-        wasm_pkt = build_wasm_packet(string_id=1, timestamp=200, args=[(ARG_INT32, 42)])
+        wasm_pkt = build_wasm_v2_packet(string_id=1, args=[(ARG_INT32, 42)])
         hex_lines = ' '.join(f'{b:02x}' for b in wasm_pkt)
         content = (
             "[00:00:00.010,000] <inf> dict_log_demo: native log\n"
@@ -486,7 +512,7 @@ class TestTextModeMerge:
 
     def test_color_in_text_mode_decode(self):
         """Decoded WASM lines in text mode have ANSI color codes (if colorama available)."""
-        wasm_pkt = build_wasm_packet(string_id=0, timestamp=100)
+        wasm_pkt = build_wasm_v2_packet(string_id=0)
         hex_lines = ' '.join(f'{b:02x}' for b in wasm_pkt)
         content = (
             "[00:00:00.100,000] <inf> wasm_dict:\n"
@@ -559,7 +585,7 @@ class TestAutoColorDetection:
         )
         init_timestamp_format(content, auto_color=True)
 
-        wasm_pkt = build_wasm_packet(app_id=0, level=4, string_id=0, timestamp=100)
+        wasm_pkt = build_wasm_v2_packet(app_id=0, level=4, string_id=0)
         line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
         # DBG detected as cyan (\x1b[36m), should appear in decoded line
         assert '\x1b[36m' in line
@@ -572,7 +598,7 @@ class TestAutoColorDetection:
         )
         init_timestamp_format(content, auto_color=False)
 
-        wasm_pkt = build_wasm_packet(app_id=0, level=4, string_id=0, timestamp=100)
+        wasm_pkt = build_wasm_v2_packet(app_id=0, level=4, string_id=0)
         line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
         # DBG with hardcoded defaults = no color (empty string)
         assert '\x1b[36m' not in line
@@ -582,6 +608,70 @@ class TestAutoColorDetection:
         content = "[00:00:00.010,000] <inf> mod: hello\n"
         init_timestamp_format(content, auto_color=True)
 
-        wasm_pkt = build_wasm_packet(app_id=0, level=3, string_id=0, timestamp=100)
+        wasm_pkt = build_wasm_v2_packet(app_id=0, level=3, string_id=0)
         line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
         assert '\x1b[' not in line
+
+
+# ---------------------------------------------------------------------------
+# Tests: Source-ID based WASM packet identification
+# ---------------------------------------------------------------------------
+
+class TestSourceIdIdentification:
+    """Test that WASM packets are identified by source field, not 0x80."""
+
+    def _build_zephyr_native_packet(self, source_id, timestamp_ms,
+                                     pkg_data=b'', hexdump_data=b''):
+        """Build a Zephyr MSG_NORMAL packet."""
+        pkt = bytearray()
+        pkt.append(0x00)  # msg_type = MSG_NORMAL
+        pkt.append(0x30)  # domain_lvl
+        pkt += struct.pack('<H', len(pkg_data))   # pkg_len
+        pkt += struct.pack('<H', len(hexdump_data))  # data_len
+        pkt += struct.pack('<I', source_id)        # source
+        pkt += struct.pack('<I', timestamp_ms)     # timestamp
+        pkt += pkg_data
+        pkt += hexdump_data
+        return bytes(pkt)
+
+    def test_wasm_dict_source_identified(self):
+        from decode_wasm_log import identify_wasm_packet
+        source_map = {0x1234: "wasm_dict", 0x5678: "other_module"}
+        # Build a minimal V2 WASM payload (app_id=0, level=3, string_id=0, 0 args)
+        wasm_payload = bytes([0x00, 0x03, 0x00, 0x00, 0x00])
+        native_pkt = self._build_zephyr_native_packet(
+            source_id=0x1234, timestamp_ms=100, hexdump_data=wasm_payload
+        )
+        result = identify_wasm_packet(native_pkt, 0, source_map)
+        assert result is not None
+        data_payload, timestamp = result
+        assert data_payload == wasm_payload
+        assert timestamp == 100
+
+    def test_non_wasm_source_not_identified(self):
+        from decode_wasm_log import identify_wasm_packet
+        source_map = {0x1234: "wasm_dict", 0x5678: "other_module"}
+        some_data = b'\x80\x00\x03\x00\x00'  # starts with 0x80 but wrong source
+        native_pkt = self._build_zephyr_native_packet(
+            source_id=0x5678, timestamp_ms=200, hexdump_data=some_data
+        )
+        result = identify_wasm_packet(native_pkt, 0, source_map)
+        assert result is None
+
+    def test_no_data_field_not_identified(self):
+        from decode_wasm_log import identify_wasm_packet
+        source_map = {0x1234: "wasm_dict"}
+        native_pkt = self._build_zephyr_native_packet(
+            source_id=0x1234, timestamp_ms=300, hexdump_data=b''
+        )
+        result = identify_wasm_packet(native_pkt, 0, source_map)
+        assert result is None
+
+    def test_unknown_source_not_identified(self):
+        from decode_wasm_log import identify_wasm_packet
+        source_map = {0x1234: "wasm_dict"}
+        native_pkt = self._build_zephyr_native_packet(
+            source_id=0x9999, timestamp_ms=400, hexdump_data=b'\x00\x03\x00\x00\x00'
+        )
+        result = identify_wasm_packet(native_pkt, 0, source_map)
+        assert result is None

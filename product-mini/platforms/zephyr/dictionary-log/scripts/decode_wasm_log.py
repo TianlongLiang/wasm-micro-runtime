@@ -6,11 +6,11 @@
 decode_wasm_log.py - Offline decoder for WASM dictionary log packets.
 
 Reads a Zephyr UART hex log stream and decodes both Zephyr native dictionary
-packets and WASM dictionary packets (msg_type=0x80) in a single pass.
+packets and WASM dictionary packets in a single pass.
 
 Usage:
     python3 decode_wasm_log.py \
-        --wasm-db build/wasm_log_dict.json \
+        --wasm-db build/unified_wasm_dict.json \
         [--zephyr-db build/zephyr/log_dictionary.json] \
         /tmp/serial.log --hex
 """
@@ -46,7 +46,8 @@ logger = logging.getLogger("decode_wasm_log")
 MSG_TYPE_NORMAL = 0x00
 MSG_TYPE_DROPPED = 0x01
 
-# WASM dictionary packet type (from lib_wasm_dict_log.c)
+# WASM dictionary packet type marker (legacy V1, still used by decode_log_stream
+# to identify standalone WASM packets in the binary stream)
 MSG_WASM_LOG = 0x80
 
 # Two color schemes to match Zephyr's two different output modes:
@@ -123,6 +124,66 @@ def calc_zephyr_native_packet_size(data, offset):
     return total
 
 
+def identify_wasm_packet(data, offset, source_map):
+    """Check if a Zephyr native packet at offset contains a WASM dict payload.
+
+    Uses the source field to determine if the packet came from 'wasm_dict' module.
+
+    Args:
+        data: binary data buffer
+        offset: start of the Zephyr native packet (msg_type byte)
+        source_map: dict mapping source_id (int) -> module_name (str)
+
+    Returns:
+        (wasm_payload_bytes, timestamp_ms) if this is a wasm_dict packet,
+        None otherwise.
+    """
+    if offset + 14 > len(data):
+        return None
+
+    pkg_len = struct.unpack_from("<H", data, offset + 2)[0]
+    data_len = struct.unpack_from("<H", data, offset + 4)[0]
+    source_id = struct.unpack_from("<I", data, offset + 6)[0]
+    timestamp = struct.unpack_from("<I", data, offset + 10)[0]
+
+    if data_len == 0:
+        return None
+
+    module_name = source_map.get(source_id)
+    if module_name != "wasm_dict":
+        return None
+
+    data_start = offset + 14 + pkg_len
+    if data_start + data_len > len(data):
+        return None
+
+    wasm_payload = data[data_start:data_start + data_len]
+    return wasm_payload, timestamp
+
+
+def build_source_map(zephyr_db_path):
+    """Build a source_id -> module_name mapping from Zephyr log dictionary.
+
+    The Zephyr log_dictionary.json has: log_subsys.log_instances.{source_id: {name: "..."}}
+    """
+    try:
+        with open(zephyr_db_path, 'r') as f:
+            db = json.load(f)
+    except (IOError, json.JSONDecodeError) as exc:
+        logger.error("Failed to load Zephyr dictionary %s: %s", zephyr_db_path, exc)
+        return {}
+
+    source_map = {}
+    log_instances = db.get('log_subsys', {}).get('log_instances', {})
+    for src_id_str, info in log_instances.items():
+        try:
+            source_map[int(src_id_str)] = info['name']
+        except (KeyError, ValueError):
+            continue
+
+    return source_map
+
+
 # ---------------------------------------------------------------------------
 # WASM dictionary packet decoding
 # ---------------------------------------------------------------------------
@@ -160,13 +221,12 @@ def detect_timestamp_format(content):
     return TS_FORMAT_UPTIME
 
 
-def format_timestamp(timestamp_ms, ts_format, boot_time=None):
+def format_timestamp(timestamp_ms, ts_format):
     """Format a raw millisecond timestamp to match the detected log format.
 
     Args:
         timestamp_ms: raw timestamp in milliseconds (from k_uptime_get_32)
         ts_format: one of TS_FORMAT_UPTIME, TS_FORMAT_RTC, TS_FORMAT_RAW
-        boot_time: datetime object for RTC mode (estimated boot time)
 
     Returns: formatted timestamp string including brackets.
     """
@@ -178,52 +238,20 @@ def format_timestamp(timestamp_ms, ts_format, boot_time=None):
         ts_s = ts_sec % 60
         return f"[{ts_h:02d}:{ts_m:02d}:{ts_s:02d}.{ts_ms:03d},000]"
 
-    elif ts_format == TS_FORMAT_RTC:
-        if boot_time is not None:
-            from datetime import timedelta
-            wall_time = boot_time + timedelta(milliseconds=timestamp_ms)
-            return f"[{wall_time.strftime('%Y-%m-%d %H:%M:%S')}.{timestamp_ms % 1000:03d}]"
-        else:
-            # Can't reconstruct wall clock without boot time — use uptime format
-            ts_sec = timestamp_ms // 1000
-            ts_ms = timestamp_ms % 1000
-            ts_h = ts_sec // 3600
-            ts_m = (ts_sec % 3600) // 60
-            ts_s = ts_sec % 60
-            return f"[{ts_h:02d}:{ts_m:02d}:{ts_s:02d}.{ts_ms:03d},000]"
-
     elif ts_format == TS_FORMAT_RAW:
         return f"[{timestamp_ms:>10}]"
 
-    # Fallback
-    return f"[{timestamp_ms:>10}]"
-
-
-def estimate_boot_time(content):
-    """For RTC timestamp mode, estimate boot time from the first log line.
-
-    If the first log line has RTC timestamp and we know it corresponds to
-    a small uptime value (~10ms), we can compute boot_time = rtc_time - uptime.
-    Returns a datetime object or None.
-    """
-    from datetime import datetime
-    for line in content.split('\n')[:50]:
-        m = TS_PATTERN_RTC.search(line)
-        if m and ('<inf>' in line or '<err>' in line or '<wrn>' in line or '<dbg>' in line):
-            try:
-                rtc_str = m.group(1)
-                rtc_time = datetime.strptime(rtc_str, '%Y-%m-%d %H:%M:%S.%f')
-                # Assume first log is at ~10ms uptime
-                from datetime import timedelta
-                return rtc_time - timedelta(milliseconds=10)
-            except ValueError:
-                pass
-    return None
+    # Fallback (includes RTC — render as uptime since we can't reconstruct wall clock)
+    ts_sec = timestamp_ms // 1000
+    ts_ms = timestamp_ms % 1000
+    ts_h = ts_sec // 3600
+    ts_m = (ts_sec % 3600) // 60
+    ts_s = ts_sec % 60
+    return f"[{ts_h:02d}:{ts_m:02d}:{ts_s:02d}.{ts_ms:03d},000]"
 
 
 # Module-level state for timestamp format and color (set during decode)
 _ts_format = TS_FORMAT_UPTIME
-_boot_time = None
 _native_has_color = False  # whether native log lines have ANSI codes
 
 
@@ -289,7 +317,7 @@ def init_timestamp_format(content, auto_color=False):
         auto_color: if True, auto-detect per-level colors from native logs
                     instead of using hardcoded defaults
     """
-    global _ts_format, _boot_time, _native_has_color, _detected_colors, _auto_color
+    global _ts_format, _native_has_color, _detected_colors, _auto_color
     _ts_format = detect_timestamp_format(content)
     _native_has_color = detect_native_color(content)
     _auto_color = auto_color
@@ -299,33 +327,32 @@ def init_timestamp_format(content, auto_color=False):
         logger.debug("Auto-detected colors: %s",
                      {k: repr(v) for k, v in _detected_colors.items()})
 
-    if _ts_format == TS_FORMAT_RTC:
-        _boot_time = estimate_boot_time(content)
     logger.debug("Detected timestamp format: %s, native colors: %s, auto_color: %s",
                  _ts_format, _native_has_color, auto_color)
 
 
 def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
-    """Decode a single WASM dictionary packet starting at offset.
+    """Decode a single WASM dictionary V2 packet starting at offset.
 
-    Returns (decoded_text, bytes_consumed) or (None, bytes_consumed) on error.
-    The decoded_text is a fully formatted log line.
+    V2 header (5 bytes): [app_id:1B][level:1B][string_id:2B LE][arg_count:1B]
+
+    Returns (decoded_message, bytes_consumed) or (None, bytes_consumed) on error.
+    The decoded_message is the message portion only (level + app_name + text),
+    without a timestamp prefix. The caller prepends the timestamp.
 
     wasm_dbs is a dict mapping app_id -> (dictionary, app_name).
     use_color: if False, don't apply ANSI colors (for text mode merging).
     """
-    if offset + 14 > len(data):
+    if offset + 5 > len(data):
         logger.debug("Truncated WASM packet header at offset %d", offset)
         return None, len(data) - offset
 
-    msg_type = data[offset]
-    app_id = data[offset + 1]
-    log_level = data[offset + 2]
-    string_id = struct.unpack_from("<H", data, offset + 3)[0]
-    timestamp = struct.unpack_from("<Q", data, offset + 5)[0]
-    arg_count = data[offset + 13]
+    app_id = data[offset]
+    log_level = data[offset + 1]
+    string_id = struct.unpack_from("<H", data, offset + 2)[0]
+    arg_count = data[offset + 4]
 
-    pos = offset + 14
+    pos = offset + 5
 
     # Decode arguments
     args = []
@@ -433,11 +460,9 @@ def decode_wasm_packet(data, offset, wasm_dbs, use_color=True):
         )
         message = f"[RAW] id={string_id} fmt={fmt!r} args={args!r}"
 
-    # Format timestamp to match detected native log format
-    ts_str = format_timestamp(timestamp, _ts_format, _boot_time)
-
-    line = f"{color}{ts_str} <{level_str}> {app_name}: {message}{reset}"
-    return line, bytes_consumed
+    # Return message portion only (no timestamp — caller prepends it)
+    msg = f"{color}<{level_str}> {app_name}: {message}{reset}"
+    return msg, bytes_consumed
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +596,7 @@ def extract_wasm_from_text_hexdump(content):
                 if not valid_hex:
                     break
                 i += 1
-            if hex_bytes and hex_bytes[0] == MSG_WASM_LOG:
+            if hex_bytes:
                 packets.append(bytes(hex_bytes))
         else:
             i += 1
@@ -614,6 +639,7 @@ def decode_text_mode(content, wasm_dbs):
                 continue
 
             # Empty after "wasm_dict:" — this is a hexdump header
+            header_line = line  # Save for timestamp extraction
             hex_bytes = []
             i += 1
             while i < len(lines):
@@ -636,11 +662,14 @@ def decode_text_mode(content, wasm_dbs):
                 i += 1
 
             # Decode the WASM packet and print in place of the hexdump
-            if hex_bytes and hex_bytes[0] == MSG_WASM_LOG:
+            if hex_bytes:
                 pkt_data = bytes(hex_bytes)
-                decoded_line, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
-                if decoded_line is not None:
-                    _RAW_STDOUT.write(decoded_line + "\n")
+                msg, _ = decode_wasm_packet(pkt_data, 0, wasm_dbs)
+                if msg is not None:
+                    # Use timestamp from the hexdump header line
+                    ts_match = re.search(r'(\[[^\]]+\])', header_line)
+                    ts_prefix = ts_match.group(1) + ' ' if ts_match else ''
+                    _RAW_STDOUT.write(ts_prefix + msg + "\n")
                     wasm_count += 1
                 else:
                     error_count += 1
@@ -715,14 +744,19 @@ def extract_timestamp(line):
     return 0
 
 
-def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
+def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False,
+                      source_map=None):
     """Decode the binary log stream.
 
     Iterates through packets, dispatching based on msg_type:
-    - 0x00 (MSG_NORMAL): Zephyr native packet
+    - 0x00 (MSG_NORMAL): Zephyr native packet (may contain embedded WASM payload
+      identified by source_map lookup)
     - 0x01 (MSG_DROPPED): Zephyr dropped message notification
-    - 0x80 (MSG_WASM_LOG): WASM dictionary packet
     - Others: skip with warning
+
+    If source_map is provided, WASM packets are identified by matching the
+    source field against the 'wasm_dict' module in the map. If source_map is
+    None or empty, falls back to legacy 0x80 magic byte check.
 
     If sort_output is True, collects all lines and sorts by timestamp
     before printing. Otherwise prints in packet order.
@@ -731,6 +765,9 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
 
     Returns counts: (zephyr_count, wasm_count, skipped_count, error_count)
     """
+    if source_map is None:
+        source_map = {}
+
     offset = 0
     zephyr_count = 0
     wasm_count = 0
@@ -758,26 +795,40 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
                 break
 
             # Check if this native packet contains an embedded WASM dict packet
-            # (LOG_HEXDUMP data field starting with 0x80)
             wasm_extracted = False
-            if offset + 14 <= len(data):
-                pkg_len = struct.unpack_from("<H", data, offset + 2)[0]
-                data_len = struct.unpack_from("<H", data, offset + 4)[0]
-                data_start = offset + 14 + pkg_len
-
-                if (data_len > 0
-                        and data_start + data_len <= len(data)
-                        and data_start < len(data)
-                        and data[data_start] == MSG_WASM_LOG):
-                    # Extract and decode the embedded WASM packet
-                    wasm_payload = data[data_start:data_start + data_len]
-                    line, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
-                    if line is not None:
-                        emit(line)
+            if source_map:
+                # Source-ID based identification
+                wasm_result = identify_wasm_packet(data, offset, source_map)
+                if wasm_result is not None:
+                    wasm_payload, pkt_timestamp = wasm_result
+                    msg, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
+                    if msg is not None:
+                        ts_str = format_timestamp(pkt_timestamp, _ts_format)
+                        emit(f"{ts_str} {msg}")
                         wasm_count += 1
                     else:
                         error_count += 1
                     wasm_extracted = True
+            else:
+                # Legacy fallback: identify by 0x80 magic byte in data field
+                if offset + 14 <= len(data):
+                    pkg_len = struct.unpack_from("<H", data, offset + 2)[0]
+                    data_len = struct.unpack_from("<H", data, offset + 4)[0]
+                    data_start = offset + 14 + pkg_len
+
+                    if (data_len > 0
+                            and data_start + data_len <= len(data)
+                            and data_start < len(data)
+                            and data[data_start] == MSG_WASM_LOG):
+                        # Extract WASM packet, skipping the 0x80 marker byte
+                        wasm_payload = data[data_start + 1:data_start + data_len]
+                        line, _ = decode_wasm_packet(wasm_payload, 0, wasm_dbs)
+                        if line is not None:
+                            emit(line)
+                            wasm_count += 1
+                        else:
+                            error_count += 1
+                        wasm_extracted = True
 
             if not wasm_extracted and zephyr_parser is not None:
                 try:
@@ -817,16 +868,6 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
             offset += 3
             zephyr_count += 1
 
-        elif msg_type == MSG_WASM_LOG:
-            # Legacy: standalone WASM packet (old direct uart_poll_out approach)
-            line, consumed = decode_wasm_packet(data, offset, wasm_dbs)
-            if line is not None:
-                emit(line)
-                wasm_count += 1
-            else:
-                error_count += 1
-            offset += consumed
-
         elif 0x02 <= msg_type <= 0x7F:
             logger.warning(
                 "Unknown Zephyr message type 0x%02x at offset %d, skipping 1 byte",
@@ -855,36 +896,27 @@ def decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
 # ---------------------------------------------------------------------------
 
 
-def parse_wasm_dbs(wasm_db_args):
-    """Parse --wasm-db arguments into {app_id: (dict, app_name)} mapping."""
+def parse_wasm_dbs(unified_json_path):
+    """Load unified WASM dictionary JSON and return {app_id: (dict, app_name)} mapping."""
+    try:
+        with open(unified_json_path, 'r') as f:
+            data = json.load(f)
+    except (IOError, json.JSONDecodeError) as exc:
+        logger.error("Failed to load WASM dictionary %s: %s", unified_json_path, exc)
+        sys.exit(1)
+
+    if not isinstance(data, list):
+        logger.error("WASM dictionary must be a JSON array (unified format): %s",
+                     unified_json_path)
+        sys.exit(1)
+
     dbs = {}
-    for arg in wasm_db_args:
-        if ':' in arg and arg.split(':')[0].isdigit():
-            app_id_str, path = arg.split(':', 1)
-            app_id = int(app_id_str)
-        else:
-            app_id = 0
-            path = arg
-
-        try:
-            with open(path, 'r') as f:
-                db = json.load(f)
-        except (IOError, json.JSONDecodeError) as exc:
-            logger.error("Failed to load WASM dictionary %s: %s", path, exc)
-            sys.exit(1)
-
-        # Derive app name from filename
-        basename = os.path.splitext(os.path.basename(path))[0]
-        if basename.startswith("wasm_log_dict_"):
-            app_name = basename[len("wasm_log_dict_"):] + "_app"
-        elif basename == "wasm_log_dict":
-            app_name = "wasm_app"
-        else:
-            app_name = basename
-
-        dbs[app_id] = (db, app_name)
-        logger.debug("Loaded app_id=%d (%s): %d entries from %s",
-                     app_id, app_name, len(db), path)
+    for entry in data:
+        app_id = entry["app_id"]
+        app_name = entry["app_name"]
+        dict_data = entry["dict"]
+        dbs[app_id] = (dict_data, app_name)
+        logger.debug("Loaded app_id=%d (%s): %d entries", app_id, app_name, len(dict_data))
 
     return dbs
 
@@ -898,19 +930,17 @@ def main():
         epilog="""\
 Examples:
   # Decode WASM packets only
-  python3 %(prog)s --wasm-db build/wasm_log_dict.json /tmp/serial.log --hex
+  python3 %(prog)s --wasm-db build/unified_wasm_dict.json /tmp/serial.log --hex
 
   # Also decode Zephyr native packets (requires ZEPHYR_BASE)
-  python3 %(prog)s --wasm-db build/wasm_log_dict.json \\
+  python3 %(prog)s --wasm-db build/unified_wasm_dict.json \\
       --zephyr-db build/zephyr/log_dictionary.json /tmp/serial.log --hex
 """,
     )
     parser.add_argument(
         "--wasm-db",
-        action="append",
         required=True,
-        help="WASM dictionary in 'app_id:path' format (e.g., '0:dict.json'). "
-             "Without app_id prefix, defaults to 0. Can be repeated.",
+        help="Path to unified WASM dictionary JSON (output of stitch_wasm_dicts.py)",
     )
     parser.add_argument(
         "--zephyr-db",
@@ -1010,8 +1040,18 @@ Examples:
 
         logger.debug("Decoded %d bytes of binary log data", len(data))
 
+        # Build source_map from Zephyr dictionary for source-ID based identification
+        source_map = {}
+        if args.zephyr_db:
+            source_map = build_source_map(args.zephyr_db)
+            if source_map:
+                logger.debug("Built source map with %d entries", len(source_map))
+            else:
+                logger.debug("Source map empty, falling back to 0x80 identification")
+
         zephyr_n, wasm_n, skip_n, err_n = decode_log_stream(
-            data, wasm_dbs, zephyr_parser, sort_output=args.sort
+            data, wasm_dbs, zephyr_parser, sort_output=args.sort,
+            source_map=source_map
         )
 
         print(

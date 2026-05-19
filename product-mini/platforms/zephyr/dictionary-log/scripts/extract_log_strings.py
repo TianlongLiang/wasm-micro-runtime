@@ -332,10 +332,11 @@ def extract_wasm_log_calls(source):
 
         # Skip if more than 8 args
         if len(type_codes) > 8:
-            print(f"Warning: wasm_log at {src_file}:{src_line} has "
-                  f"{len(type_codes)} format args (max 8). Skipping.",
+            print(f"Error: wasm_log at {src_file}:{src_line} has "
+                  f"{len(type_codes)} format args (max 8). "
+                  f"Reduce arguments or split into multiple log calls.",
                   file=sys.stderr)
-            continue
+            sys.exit(1)
 
         type_names = [type_code_to_name(tc) for tc in type_codes]
         descriptor = build_type_descriptor(type_codes)

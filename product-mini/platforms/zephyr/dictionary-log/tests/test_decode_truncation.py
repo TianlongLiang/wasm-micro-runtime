@@ -16,7 +16,7 @@ import sys
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 sys.path.insert(0, SCRIPT_DIR)
 
-from decode_wasm_log import decode_wasm_packet, MSG_WASM_LOG
+from decode_wasm_log import decode_wasm_packet
 
 # Arg type constants (must match lib_wasm_dict_log.c)
 ARG_INT32 = 0x01
@@ -25,15 +25,16 @@ ARG_FLOAT64 = 0x03
 ARG_STRING = 0x04
 
 
-def build_wasm_packet(app_id=0, level=3, string_id=0, timestamp=100,
-                       args=None):
-    """Build a valid WASM dict packet for testing."""
+def build_wasm_packet(app_id=0, level=3, string_id=0, args=None):
+    """Build a valid WASM dict V2 packet for testing.
+
+    V2 header (5 bytes): [app_id:1B][level:1B][string_id:2B LE][arg_count:1B]
+    No msg_type marker, no timestamp.
+    """
     pkt = bytearray()
-    pkt.append(MSG_WASM_LOG)         # msg_type
     pkt.append(app_id)               # app_id
     pkt.append(level)                # log_level
     pkt += struct.pack('<H', string_id)  # string_id LE
-    pkt += struct.pack('<Q', timestamp)  # timestamp LE
     if args is None:
         args = []
     pkt.append(len(args))            # arg_count
@@ -74,50 +75,54 @@ TEST_DB = {
 class TestValidDecode:
     def test_no_args(self):
         pkt = build_wasm_packet(string_id=0, args=[])
-        line, consumed = decode_wasm_packet(bytes(pkt), 0, TEST_DB)
-        assert line is not None
-        assert 'hello world' in line
+        msg, consumed = decode_wasm_packet(bytes(pkt), 0, TEST_DB)
+        assert msg is not None
+        assert 'hello world' in msg
         assert consumed == len(pkt)
 
     def test_int32_arg(self):
         pkt = build_wasm_packet(string_id=1, args=[(ARG_INT32, 42)])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert 'value=42' in line
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert 'value=42' in msg
 
     def test_string_arg(self):
         pkt = build_wasm_packet(string_id=2, args=[
             (ARG_STRING, "sensor"),
             (ARG_INT32, 7),
         ])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert 'name=sensor id=7' in line
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert 'name=sensor id=7' in msg
 
     def test_int64_arg(self):
         pkt = build_wasm_packet(string_id=3, args=[(ARG_INT64, 9999999999)])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert '9999999999' in line
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert '9999999999' in msg
 
     def test_float64_arg(self):
         pkt = build_wasm_packet(string_id=4, args=[(ARG_FLOAT64, 3.14)])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert '3.14' in line
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert '3.14' in msg
 
-    def test_timestamp_in_output(self):
-        pkt = build_wasm_packet(string_id=0, timestamp=12345, args=[])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        # Timestamp 12345ms = 00:00:12.345,000 in Zephyr format
-        assert '00:00:12.345,000' in line
+    def test_no_timestamp_in_message(self):
+        """V2 packets have no timestamp — returned message must not start with '['."""
+        pkt = build_wasm_packet(string_id=0, args=[])
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is not None
+        # Strip any ANSI color prefix to check actual content
+        import re
+        stripped = re.sub(r'\x1b\[[0-9;]*m', '', msg)
+        assert not stripped.startswith('[')
 
     def test_app_name_in_output(self):
         pkt = build_wasm_packet(string_id=0, args=[])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert 'test_app:' in line
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert 'test_app:' in msg
 
     def test_level_names(self):
         for level, name in [(1, 'err'), (2, 'wrn'), (3, 'inf'), (4, 'dbg')]:
             pkt = build_wasm_packet(string_id=0, level=level, args=[])
-            line, _ = decode_wasm_packet(pkt, 0, TEST_DB)
-            assert f'<{name}>' in line
+            msg, _ = decode_wasm_packet(pkt, 0, TEST_DB)
+            assert f'<{name}>' in msg
 
 
 # ---------------------------------------------------------------------------
@@ -126,55 +131,55 @@ class TestValidDecode:
 
 class TestTruncatedPackets:
     def test_truncated_header(self):
-        # Only 10 bytes — less than 14-byte header
-        pkt = build_wasm_packet(string_id=0, args=[])[:10]
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        # Only 3 bytes — less than 5-byte V2 header
+        pkt = build_wasm_packet(string_id=0, args=[])[:3]
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_truncated_int32_arg(self):
         # Full header + arg_count=1 + type byte, but missing value bytes
         pkt = build_wasm_packet(string_id=1, args=[(ARG_INT32, 42)])
         # Chop off last 2 bytes of the int32 value
         pkt = pkt[:-2]
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_truncated_int64_arg(self):
         pkt = build_wasm_packet(string_id=3, args=[(ARG_INT64, 999)])
         # Chop off last 4 bytes
         pkt = pkt[:-4]
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_truncated_float64_arg(self):
         pkt = build_wasm_packet(string_id=4, args=[(ARG_FLOAT64, 1.0)])
         pkt = pkt[:-4]
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_truncated_string_length(self):
         # String arg with only 1 byte of the 2-byte length field
         pkt = build_wasm_packet(string_id=5, args=[(ARG_STRING, "hello")])
-        # Header(14) + arg_count(1) + type(1) + only 1 byte of len
-        truncated = pkt[:14 + 1 + 1 + 1]
-        line, consumed = decode_wasm_packet(truncated, 0, TEST_DB)
-        assert line is None
+        # Header(5) + type(1) + only 1 byte of len
+        truncated = pkt[:5 + 1 + 1]
+        msg, consumed = decode_wasm_packet(truncated, 0, TEST_DB)
+        assert msg is None
 
     def test_truncated_string_data(self):
         # String with correct length field but data cut short
         pkt = build_wasm_packet(string_id=5, args=[(ARG_STRING, "hello world this is long")])
         # Chop off last 10 bytes of string data
         pkt = pkt[:-10]
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_long_string_valid(self):
         # A 200-byte string — within the 256 byte packet limit
         long_str = "A" * 200
         pkt = build_wasm_packet(string_id=5, args=[(ARG_STRING, long_str)])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is not None
-        assert 'A' * 50 in line  # at least part of it decoded
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is not None
+        assert 'A' * 50 in msg  # at least part of it decoded
 
     def test_missing_args(self):
         # Header says 2 args but only 1 provided
@@ -182,11 +187,11 @@ class TestTruncatedPackets:
             (ARG_STRING, "x"),
             (ARG_INT32, 1),
         ])
-        # Modify arg_count to claim 3 args
+        # Modify arg_count to claim 3 args (arg_count is at offset 4 in V2)
         pkt_mut = bytearray(pkt)
-        pkt_mut[13] = 3  # claim 3 args but only 2 in data
-        line, consumed = decode_wasm_packet(bytes(pkt_mut), 0, TEST_DB)
-        assert line is None  # can't read the 3rd arg
+        pkt_mut[4] = 3  # claim 3 args but only 2 in data
+        msg, consumed = decode_wasm_packet(bytes(pkt_mut), 0, TEST_DB)
+        assert msg is None  # can't read the 3rd arg
 
 
 # ---------------------------------------------------------------------------
@@ -196,19 +201,19 @@ class TestTruncatedPackets:
 class TestUnknownIds:
     def test_unknown_string_id(self):
         pkt = build_wasm_packet(string_id=999, args=[])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_unknown_app_id(self):
         pkt = build_wasm_packet(app_id=99, string_id=0, args=[])
-        line, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
-        assert line is None
+        msg, consumed = decode_wasm_packet(pkt, 0, TEST_DB)
+        assert msg is None
 
     def test_unknown_arg_type(self):
         # Inject an invalid arg type (0xFF)
         pkt = build_wasm_packet(string_id=1, args=[(ARG_INT32, 42)])
         pkt_mut = bytearray(pkt)
-        pkt_mut[14] = 0xFF  # corrupt the arg type byte
+        pkt_mut[5] = 0xFF  # corrupt the arg type byte (header is 5 bytes in V2)
         line, consumed = decode_wasm_packet(bytes(pkt_mut), 0, TEST_DB)
         assert line is None
 
@@ -223,23 +228,23 @@ class TestOffsetHandling:
         padding = b'\x00' * 10
         pkt = build_wasm_packet(string_id=0, args=[])
         data = padding + pkt
-        line, consumed = decode_wasm_packet(data, 10, TEST_DB)
-        assert line is not None
-        assert 'hello world' in line
+        msg, consumed = decode_wasm_packet(data, 10, TEST_DB)
+        assert msg is not None
+        assert 'hello world' in msg
         assert consumed == len(pkt)
 
     def test_multiple_packets_sequential(self):
-        pkt1 = build_wasm_packet(string_id=0, timestamp=100, args=[])
-        pkt2 = build_wasm_packet(string_id=1, timestamp=200, args=[(ARG_INT32, 5)])
+        pkt1 = build_wasm_packet(string_id=0, args=[])
+        pkt2 = build_wasm_packet(string_id=1, args=[(ARG_INT32, 5)])
         data = pkt1 + pkt2
 
-        line1, consumed1 = decode_wasm_packet(data, 0, TEST_DB)
-        assert line1 is not None
-        assert '100' in line1
+        msg1, consumed1 = decode_wasm_packet(data, 0, TEST_DB)
+        assert msg1 is not None
+        assert 'hello world' in msg1
 
-        line2, consumed2 = decode_wasm_packet(data, consumed1, TEST_DB)
-        assert line2 is not None
-        assert 'value=5' in line2
+        msg2, consumed2 = decode_wasm_packet(data, consumed1, TEST_DB)
+        assert msg2 is not None
+        assert 'value=5' in msg2
 
 
 # ---------------------------------------------------------------------------

@@ -666,3 +666,38 @@ class TestEmptyAndMinimal:
         )
         assert rc != 0
         assert 'not supported' in stderr.lower() or 'c++' in stderr.lower()
+
+
+class TestArgLimitErrors:
+    """Test that extraction aborts on >8 args."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_nine_args_aborts(self):
+        """A log call with 9 args causes exit with non-zero code."""
+        source = os.path.join(ERROR_DIR, 'too_many_args.c')
+        rc, stdout, stderr, _, _ = run_extract(
+            [source],
+            include_dirs=[os.path.join(TEST_DIR, '..', 'wasm-apps')],
+            output_dir=self.tmpdir,
+            expect_fail=True,
+        )
+        assert rc != 0
+        assert 'too_many_args.c' in stderr
+        assert '9' in stderr or 'max 8' in stderr.lower()
+
+    def test_eight_args_still_passes(self):
+        """A log call with exactly 8 args succeeds (boundary check)."""
+        # The existing singlefile/types_test.c has a test with 8 args:
+        # LOG_DBG("eight: %d %d %d %d %d %d %d %d", 1, 2, 3, 4, 5, 6, 7, 8)
+        source = os.path.join(SINGLEFILE_DIR, 'types_test.c')
+        rc, _, _, _, _ = run_extract(
+            [source],
+            include_dirs=[os.path.join(TEST_DIR, '..', 'wasm-apps')],
+            output_dir=self.tmpdir,
+        )
+        assert rc == 0
