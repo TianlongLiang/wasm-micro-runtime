@@ -233,19 +233,37 @@ if(WASI_SDK_DIR)
 
   add_custom_target(wasm_network DEPENDS ${WASM_NET_DICT_HEADER} ${WASM_NET_DICT_JSON})
 
+  # --- Stitch per-app dictionaries into unified JSON ---
+  set(STITCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/scripts/stitch_wasm_dicts.py)
+  set(WASM_UNIFIED_DICT ${CMAKE_CURRENT_BINARY_DIR}/wasm_unified_dict.json)
+
+  add_custom_command(
+    OUTPUT ${WASM_UNIFIED_DICT}
+    COMMAND ${Python3_EXECUTABLE} ${STITCH_SCRIPT}
+      --app 0:sensor_app:${WASM_DICT_JSON}
+      --app 1:network_app:${WASM_NET_DICT_JSON}
+      -o ${WASM_UNIFIED_DICT}
+    DEPENDS ${WASM_DICT_JSON} ${WASM_NET_DICT_JSON} ${STITCH_SCRIPT}
+    COMMENT "Stitching per-app dictionaries -> wasm_unified_dict.json"
+  )
+
+  add_custom_target(wasm_unified_dict DEPENDS ${WASM_UNIFIED_DICT})
+  add_dependencies(wasm_unified_dict wasm_dict wasm_network)
+
 else()
   message(STATUS "WASI SDK not found - using pre-built headers")
   add_custom_target(wasm_baseline)
   add_custom_target(wasm_dict)
   add_custom_target(wasm_network_baseline)
   add_custom_target(wasm_network)
+  add_custom_target(wasm_unified_dict)
 endif()
 
 # --- WAMR library ---
 add_subdirectory(lib-wamr-zephyr)
 
-# Ensure the WASM header is generated before compiling the WAMR library
-add_dependencies(wamr_lib wasm_baseline wasm_dict wasm_network_baseline wasm_network)
+# Ensure the WASM headers and unified dict are generated before compiling the WAMR library
+add_dependencies(wamr_lib wasm_baseline wasm_dict wasm_network_baseline wasm_network wasm_unified_dict)
 
 set(WAMR_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
 
