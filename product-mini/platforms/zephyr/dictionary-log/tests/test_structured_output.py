@@ -22,36 +22,76 @@ import pytest
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 sys.path.insert(0, SCRIPT_DIR)
 
-from decode_wasm_log import (
-    decode_wasm_packet,
-    decode_log_stream,
-    decode_text_mode,
-    extract_hex_data,
-    extract_wasm_from_text_hexdump,
+from wasm_log_common import (
+    decode_wasm_packet as _decode_wasm_packet,
     detect_timestamp_format,
     detect_native_color,
     detect_native_colors_per_level,
     format_timestamp,
-    init_timestamp_format,
-    MSG_WASM_LOG,
-    MSG_TYPE_NORMAL,
-    MSG_TYPE_DROPPED,
     TS_FORMAT_UPTIME,
     TS_FORMAT_RTC,
     TS_FORMAT_RAW,
+)
+from decode_dict_on import (
+    decode_log_stream,
+    extract_hex_data,
+    extract_wasm_from_text_hexdump,
+    identify_wasm_packet,
+    MSG_WASM_LOG,
+    MSG_TYPE_NORMAL,
+    MSG_TYPE_DROPPED,
+)
+import decode_dict_on
+import decode_dict_off
+from decode_wasm_log import DecodeState
+
+
+def decode_wasm_packet(data, offset, wasm_dbs, **kwargs):
+    """Wrapper matching old interface: returns ((text, color, reset), consumed)."""
+    return _decode_wasm_packet(data, offset, wasm_dbs, **kwargs)
+
+
+def init_timestamp_format(content, auto_color=False):
+    """Set up module-level state on decode_dict_on and decode_dict_off for tests.
+
+    This replaces the old decode_wasm_log.init_timestamp_format() which set
+    module-level globals used by decode_wasm_packet and decode_text_mode.
+    Now we store the state where tests can access it.
+    """
+    global _test_decode_state
+    ts_format = detect_timestamp_format(content)
+    native_has_color = detect_native_color(content)
+    detected_colors = {}
+    if native_has_color and auto_color:
+        detected_colors = detect_native_colors_per_level(content)
+    _test_decode_state = DecodeState(
+        ts_format=ts_format,
+        native_has_color=native_has_color,
+        binary_mode=False,
+        auto_color=auto_color,
+        detected_colors=detected_colors,
+    )
+
+
+# Default test state
+_test_decode_state = DecodeState(
+    ts_format=TS_FORMAT_UPTIME,
+    native_has_color=False,
+    binary_mode=False,
+    auto_color=False,
+    detected_colors={},
 )
 
 
 def capture_decode_log_stream(data, wasm_dbs, zephyr_parser=None, sort_output=False):
     """Run decode_log_stream and capture output as a list of lines."""
-    import decode_wasm_log
     buf = io.StringIO()
-    old_raw = decode_wasm_log._RAW_STDOUT
-    decode_wasm_log._RAW_STDOUT = buf
+    old_raw = decode_dict_on._RAW_STDOUT
+    decode_dict_on._RAW_STDOUT = buf
     try:
         zn, wn, sn, en = decode_log_stream(data, wasm_dbs, zephyr_parser, sort_output)
     finally:
-        decode_wasm_log._RAW_STDOUT = old_raw
+        decode_dict_on._RAW_STDOUT = old_raw
     lines = [l for l in buf.getvalue().splitlines() if l.strip()]
     return zn, wn, sn, en, lines
 
@@ -422,21 +462,24 @@ class TestTimestampDetection:
 # ---------------------------------------------------------------------------
 
 class TestTextModeMerge:
-    """Test decode_text_mode — merging native text logs with decoded hexdumps."""
+    """Test decode_text_mode -- merging native text logs with decoded hexdumps."""
+
+    def _run_decode_text_mode(self, content, wasm_dbs):
+        """Run decode_dict_off.decode capturing stdout."""
+        init_timestamp_format(content)
+        buf = io.StringIO()
+        old_raw = decode_dict_off._RAW_STDOUT
+        decode_dict_off._RAW_STDOUT = buf
+        try:
+            wn, en = decode_dict_off.decode(content, wasm_dbs, _test_decode_state)
+        finally:
+            decode_dict_off._RAW_STDOUT = old_raw
+        return buf.getvalue(), wn, en
 
     def test_native_lines_pass_through(self):
         """Regular native log lines are printed as-is."""
         content = "[00:00:00.010,000] <inf> dict_log_demo: hello world\n"
-        init_timestamp_format(content)
-        import decode_wasm_log
-        buf = io.StringIO()
-        old_raw = decode_wasm_log._RAW_STDOUT
-        decode_wasm_log._RAW_STDOUT = buf
-        try:
-            wn, en = decode_text_mode(content, TEST_DBS)
-        finally:
-            decode_wasm_log._RAW_STDOUT = old_raw
-        output = buf.getvalue()
+        output, wn, en = self._run_decode_text_mode(content, TEST_DBS)
         assert "dict_log_demo: hello world" in output
         assert wn == 0
 
@@ -450,16 +493,7 @@ class TestTextModeMerge:
             f"  {hex_lines}                    |...|\n"
             "[00:00:00.200,000] <inf> dict_log_demo: after\n"
         )
-        init_timestamp_format(content)
-        import decode_wasm_log
-        buf = io.StringIO()
-        old_raw = decode_wasm_log._RAW_STDOUT
-        decode_wasm_log._RAW_STDOUT = buf
-        try:
-            wn, en = decode_text_mode(content, TEST_DBS)
-        finally:
-            decode_wasm_log._RAW_STDOUT = old_raw
-        output = buf.getvalue()
+        output, wn, en = self._run_decode_text_mode(content, TEST_DBS)
         assert "dict_log_demo: before" in output
         assert "dict_log_demo: after" in output
         assert "hello world" in output  # decoded WASM message
@@ -470,18 +504,9 @@ class TestTextModeMerge:
     def test_baseline_wasm_dict_logs_pass_through(self):
         """wasm_dict lines WITH content after colon (baseline) pass through."""
         content = "[00:00:00.050,000] <inf> wasm_dict: My_APP: sensor starting\n"
-        init_timestamp_format(content)
-        import decode_wasm_log
-        buf = io.StringIO()
-        old_raw = decode_wasm_log._RAW_STDOUT
-        decode_wasm_log._RAW_STDOUT = buf
-        try:
-            wn, en = decode_text_mode(content, TEST_DBS)
-        finally:
-            decode_wasm_log._RAW_STDOUT = old_raw
-        output = buf.getvalue()
+        output, wn, en = self._run_decode_text_mode(content, TEST_DBS)
         assert "My_APP: sensor starting" in output
-        assert wn == 0  # not decoded as WASM dict — passed through
+        assert wn == 0  # not decoded as WASM dict -- passed through
 
     def test_mixed_all_three_types(self):
         """Native + baseline + dict hexdump all appear in output."""
@@ -494,16 +519,7 @@ class TestTextModeMerge:
             f"  {hex_lines}                    |...|\n"
             "[00:00:00.300,000] <inf> dict_log_demo: end\n"
         )
-        init_timestamp_format(content)
-        import decode_wasm_log
-        buf = io.StringIO()
-        old_raw = decode_wasm_log._RAW_STDOUT
-        decode_wasm_log._RAW_STDOUT = buf
-        try:
-            wn, en = decode_text_mode(content, TEST_DBS)
-        finally:
-            decode_wasm_log._RAW_STDOUT = old_raw
-        output = buf.getvalue()
+        output, wn, en = self._run_decode_text_mode(content, TEST_DBS)
         assert "native log" in output
         assert "My_APP: baseline log" in output
         assert "value=42" in output  # decoded dict log
@@ -518,16 +534,7 @@ class TestTextModeMerge:
             "[00:00:00.100,000] <inf> wasm_dict:\n"
             f"  {hex_lines}                    |...|\n"
         )
-        init_timestamp_format(content)
-        import decode_wasm_log
-        buf = io.StringIO()
-        old_raw = decode_wasm_log._RAW_STDOUT
-        decode_wasm_log._RAW_STDOUT = buf
-        try:
-            wn, en = decode_text_mode(content, TEST_DBS)
-        finally:
-            decode_wasm_log._RAW_STDOUT = old_raw
-        output = buf.getvalue()
+        output, wn, en = self._run_decode_text_mode(content, TEST_DBS)
         assert 'hello world' in output
 
 
@@ -539,12 +546,12 @@ class TestAutoColorDetection:
     """Test auto-detection of per-level color codes from native log lines."""
 
     def test_detect_no_color_in_plain_text(self):
-        """Plain text file (no ANSI codes) → no colors detected."""
+        """Plain text file (no ANSI codes) -> no colors detected."""
         content = "[00:00:00.010,000] <inf> module: hello\n[00:00:00.020,000] <err> module: error\n"
         assert detect_native_color(content) is False
 
     def test_detect_color_present(self):
-        """File with ANSI codes → colors detected."""
+        """File with ANSI codes -> colors detected."""
         content = "[00:00:00.010,000] \x1b[1;31m<err> module: error\x1b[0m\n"
         assert detect_native_color(content) is True
 
@@ -578,7 +585,6 @@ class TestAutoColorDetection:
 
     def test_auto_color_applied_to_decoded_lines(self):
         """With --auto-color, decoded lines use detected colors."""
-        import decode_wasm_log
         content = (
             "[00:00:00.010,000] \x1b[36m<dbg> mod: debug\x1b[0m\n"
             "[00:00:00.020,000] \x1b[32m<inf> mod: info\x1b[0m\n"
@@ -586,9 +592,15 @@ class TestAutoColorDetection:
         init_timestamp_format(content, auto_color=True)
 
         wasm_pkt = build_wasm_v2_packet(app_id=0, level=4, string_id=0)
-        line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
-        # DBG detected as cyan (\x1b[36m), should appear in decoded line
-        assert '\x1b[36m' in line
+        result, _ = decode_wasm_packet(
+            wasm_pkt, 0, TEST_DBS,
+            native_has_color=_test_decode_state.native_has_color,
+            auto_color=_test_decode_state.auto_color,
+            detected_colors=_test_decode_state.detected_colors,
+        )
+        # DBG detected as cyan (\x1b[36m), should appear in decoded result
+        text, color, reset = result
+        assert '\x1b[36m' in (text, color, reset)
 
     def test_no_auto_color_uses_hardcoded(self):
         """Without --auto-color, hardcoded defaults are used."""
@@ -599,18 +611,32 @@ class TestAutoColorDetection:
         init_timestamp_format(content, auto_color=False)
 
         wasm_pkt = build_wasm_v2_packet(app_id=0, level=4, string_id=0)
-        line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
+        result, _ = decode_wasm_packet(
+            wasm_pkt, 0, TEST_DBS,
+            native_has_color=_test_decode_state.native_has_color,
+            auto_color=_test_decode_state.auto_color,
+            detected_colors=_test_decode_state.detected_colors,
+        )
         # DBG with hardcoded defaults = no color (empty string)
-        assert '\x1b[36m' not in line
+        text, color, reset = result
+        assert '\x1b[36m' not in (text, color, reset)
 
     def test_plain_text_no_color_regardless_of_auto(self):
-        """Plain text input → no colors even with --auto-color."""
+        """Plain text input -> no colors even with --auto-color."""
         content = "[00:00:00.010,000] <inf> mod: hello\n"
         init_timestamp_format(content, auto_color=True)
 
         wasm_pkt = build_wasm_v2_packet(app_id=0, level=3, string_id=0)
-        line, _ = decode_wasm_packet(wasm_pkt, 0, TEST_DBS)
-        assert '\x1b[' not in line
+        result, _ = decode_wasm_packet(
+            wasm_pkt, 0, TEST_DBS,
+            native_has_color=_test_decode_state.native_has_color,
+            auto_color=_test_decode_state.auto_color,
+            detected_colors=_test_decode_state.detected_colors,
+        )
+        text, color, reset = result
+        assert '\x1b[' not in text
+        assert '\x1b[' not in color
+        assert '\x1b[' not in reset
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +661,6 @@ class TestSourceIdIdentification:
         return bytes(pkt)
 
     def test_wasm_dict_source_identified(self):
-        from decode_wasm_log import identify_wasm_packet
         source_map = {0x1234: "wasm_dict", 0x5678: "other_module"}
         # Build a minimal V2 WASM payload (app_id=0, level=3, string_id=0, 0 args)
         wasm_payload = bytes([0x00, 0x03, 0x00, 0x00, 0x00])
@@ -649,7 +674,6 @@ class TestSourceIdIdentification:
         assert timestamp == 100
 
     def test_non_wasm_source_not_identified(self):
-        from decode_wasm_log import identify_wasm_packet
         source_map = {0x1234: "wasm_dict", 0x5678: "other_module"}
         some_data = b'\x80\x00\x03\x00\x00'  # starts with 0x80 but wrong source
         native_pkt = self._build_zephyr_native_packet(
@@ -659,7 +683,6 @@ class TestSourceIdIdentification:
         assert result is None
 
     def test_no_data_field_not_identified(self):
-        from decode_wasm_log import identify_wasm_packet
         source_map = {0x1234: "wasm_dict"}
         native_pkt = self._build_zephyr_native_packet(
             source_id=0x1234, timestamp_ms=300, hexdump_data=b''
@@ -668,7 +691,6 @@ class TestSourceIdIdentification:
         assert result is None
 
     def test_unknown_source_not_identified(self):
-        from decode_wasm_log import identify_wasm_packet
         source_map = {0x1234: "wasm_dict"}
         native_pkt = self._build_zephyr_native_packet(
             source_id=0x9999, timestamp_ms=400, hexdump_data=b'\x00\x03\x00\x00\x00'

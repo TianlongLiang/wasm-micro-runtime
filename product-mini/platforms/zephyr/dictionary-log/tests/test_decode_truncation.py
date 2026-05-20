@@ -16,7 +16,7 @@ import sys
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 sys.path.insert(0, SCRIPT_DIR)
 
-from decode_wasm_log import decode_wasm_packet as _decode_wasm_packet
+from wasm_log_common import decode_wasm_packet as _decode_wasm_packet
 
 
 def decode_wasm_packet(data, offset, wasm_dbs, **kwargs):

@@ -172,6 +172,62 @@ def resolve_source_location(source, pos):
     return (directive_file, directive_line_num + lines_after)
 
 
+def _parse_quoted_string(text, start):
+    """Parse one C string literal starting at position start (opening quote).
+
+    Handles escape sequences (\\, \", etc).
+    Returns (chars_list, end_index_after_closing_quote) or (None, start) if invalid.
+    """
+    if start >= len(text) or text[start] != '"':
+        return None, start
+
+    chars = []
+    i = start + 1
+    while i < len(text) and text[i] != '"':
+        if text[i] == '\\':
+            chars.append(text[i])
+            i += 1
+            if i < len(text):
+                chars.append(text[i])
+                i += 1
+        else:
+            chars.append(text[i])
+            i += 1
+
+    if i >= len(text):
+        return None, start
+
+    return chars, i + 1
+
+
+def _parse_format_string(text, start):
+    """Parse format string (possibly concatenated) starting at start.
+
+    Handles: "abc" "def" -> "abcdef" (C string concatenation).
+    Returns (format_string, end_index) or (None, start) if not parseable.
+    """
+    all_chars = []
+    i = start
+
+    while True:
+        # Skip whitespace between concatenated strings
+        while i < len(text) and text[i] in ' \t\n\r':
+            i += 1
+        if i >= len(text) or text[i] != '"':
+            break
+        chars, i = _parse_quoted_string(text, i)
+        if chars is None:
+            if not all_chars:
+                return None, start
+            break
+        all_chars.extend(chars)
+
+    if not all_chars:
+        return None, start
+
+    return ''.join(all_chars), i
+
+
 def parse_inner_content(inner):
     """
     Parse the inner content of a wasm_log(...) call.
@@ -232,52 +288,13 @@ def parse_inner_content(inner):
     if not rest or rest[0] != '"':
         return None  # second arg is not a string literal
 
-    # Parse the string literal (handle escape sequences)
-    i = 1  # skip opening quote
-    fmt_chars = []
-    while i < len(rest) and rest[i] != '"':
-        if rest[i] == '\\':
-            fmt_chars.append(rest[i])
-            i += 1
-            if i < len(rest):
-                fmt_chars.append(rest[i])
-                i += 1
-        else:
-            fmt_chars.append(rest[i])
-            i += 1
-
-    if i >= len(rest):
-        return None  # unterminated string
-
-    format_string = ''.join(fmt_chars)
-    i += 1  # skip closing quote
-
-    # Check for string concatenation (adjacent string literals)
-    # After preprocessing, strings should be fully resolved, but handle it anyway
-    while i < len(rest):
-        while i < len(rest) and rest[i] in ' \t\n\r':
-            i += 1
-        if i < len(rest) and rest[i] == '"':
-            # Another string literal - concatenate
-            i += 1
-            while i < len(rest) and rest[i] != '"':
-                if rest[i] == '\\':
-                    fmt_chars.append(rest[i])
-                    i += 1
-                    if i < len(rest):
-                        fmt_chars.append(rest[i])
-                        i += 1
-                else:
-                    fmt_chars.append(rest[i])
-                    i += 1
-            if i < len(rest):
-                i += 1
-            format_string = ''.join(fmt_chars)
-        else:
-            break
+    # Parse format string (handles concatenation)
+    format_string, end_idx = _parse_format_string(rest, 0)
+    if format_string is None:
+        return None
 
     # Remaining text after format string
-    after_fmt = rest[i:].strip()
+    after_fmt = rest[end_idx:].strip()
     if after_fmt.startswith(','):
         args_text = after_fmt[1:].strip()
     else:
@@ -437,6 +454,106 @@ def run_clang_command(clang, args, description):
         sys.exit(1)
 
 
+def _validate_sources(clang, common_flags, sources):
+    """Step 1: Dry-run compile (syntax check)."""
+    print("Step 1: Syntax check...", file=sys.stderr)
+    syntax_args = common_flags + ["-fsyntax-only"] + sources
+    rc, stdout, stderr = run_clang_command(clang, syntax_args, "syntax check")
+    if rc != 0:
+        print("Compilation failed:", file=sys.stderr)
+        if stdout:
+            sys.stdout.write(stdout)
+        if stderr:
+            sys.stderr.write(stderr)
+        sys.exit(rc)
+
+
+def _preprocess_sources(clang, common_flags, sources, output_dir):
+    """Step 2: Preprocess each source file. Returns {src: pp_path}."""
+    print("Step 2: Preprocessing...", file=sys.stderr)
+    preprocessed = {}
+    for src in sources:
+        basename = os.path.splitext(os.path.basename(src))[0]
+        pp_path = os.path.join(output_dir, basename + ".i")
+        preprocess_args = common_flags + ["-E", src, "-o", pp_path]
+        rc, stdout, stderr = run_clang_command(clang, preprocess_args,
+                                               f"preprocessing {src}")
+        if rc != 0:
+            print(f"Preprocessing failed for {src}:", file=sys.stderr)
+            if stdout:
+                sys.stdout.write(stdout)
+            if stderr:
+                sys.stderr.write(stderr)
+            sys.exit(rc)
+        preprocessed[src] = pp_path
+    return preprocessed
+
+
+def _extract_and_transform(sources, preprocessed, output_dir):
+    """Steps 3-4: Extract log calls, assign IDs, transform.
+    Returns (dictionary, file_calls, total_count)."""
+    print("Step 3: Extracting log strings...", file=sys.stderr)
+    file_calls = {}
+    all_calls = []
+
+    for src in sources:
+        pp_path = preprocessed[src]
+        with open(pp_path, 'r') as f:
+            pp_source = f.read()
+        calls = extract_wasm_log_calls(pp_source)
+        if not calls:
+            print(f"Warning: no wasm_log() calls found in {src}", file=sys.stderr)
+        file_calls[src] = (pp_path, pp_source, calls)
+        for call in calls:
+            all_calls.append((src, call))
+
+    if not all_calls:
+        print("Error: no wasm_log() calls found in any input file.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Step 4: Transforming...", file=sys.stderr)
+    dictionary = {}
+    id_offset = 0
+
+    for src in sources:
+        pp_path, pp_source, calls = file_calls[src]
+        basename = os.path.splitext(os.path.basename(src))[0]
+        out_path = os.path.join(output_dir, basename + "_dict.i")
+
+        transformed = transform_source(pp_source, calls, id_offset)
+        with open(out_path, 'w') as f:
+            f.write(transformed)
+
+        for i, call in enumerate(calls):
+            string_id = id_offset + i
+            dictionary[str(string_id)] = {
+                "fmt": call['fmt'],
+                "arg_types": call['arg_type_names'],
+                "type_descriptor": f"0x{call['type_descriptor']:08x}",
+                "source_file": call['source_file'],
+                "source_line": call['source_line'],
+            }
+        id_offset += len(calls)
+
+    return dictionary, file_calls, len(all_calls)
+
+
+def _write_dict_and_summary(dictionary, json_path, sources, file_calls, total_count):
+    """Step 5: Write JSON dictionary and print summary."""
+    with open(json_path, 'w') as f:
+        json.dump(dictionary, f, indent=2)
+        f.write('\n')
+
+    total_bytes = sum(len(v['fmt']) for v in dictionary.values())
+    print(f"\nExtracted {total_count} log strings", file=sys.stderr)
+    for src in sources:
+        _, _, calls = file_calls[src]
+        basename = os.path.splitext(os.path.basename(src))[0]
+        print(f"  {src}: {len(calls)} calls -> {basename}_dict.i", file=sys.stderr)
+    print(f"  Dictionary: {json_path}", file=sys.stderr)
+    print(f"  Total format string bytes eliminated: {total_bytes}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Preprocessor-based multi-file log string extraction "
@@ -483,114 +600,15 @@ def main():
     for define in args.defines:
         common_flags += ["-D", define]
 
-    # Ensure output directory exists
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Step 1: Dry-run compile (syntax check all sources at once)
-    print("Step 1: Syntax check...", file=sys.stderr)
-    syntax_args = common_flags + ["-fsyntax-only"] + args.sources
-    rc, stdout, stderr = run_clang_command(args.clang, syntax_args,
-                                           "syntax check")
-    if rc != 0:
-        print("Compilation failed:", file=sys.stderr)
-        if stdout:
-            sys.stdout.write(stdout)
-        if stderr:
-            sys.stderr.write(stderr)
-        sys.exit(rc)
-
-    # Step 2: Preprocess each source file
-    print("Step 2: Preprocessing...", file=sys.stderr)
-    preprocessed_files = {}
-    for src in args.sources:
-        basename = os.path.splitext(os.path.basename(src))[0]
-        pp_path = os.path.join(args.output_dir, basename + ".i")
-
-        preprocess_args = common_flags + ["-E", src, "-o", pp_path]
-        rc, stdout, stderr = run_clang_command(args.clang, preprocess_args,
-                                               f"preprocessing {src}")
-        if rc != 0:
-            print(f"Preprocessing failed for {src}:", file=sys.stderr)
-            if stdout:
-                sys.stdout.write(stdout)
-            if stderr:
-                sys.stderr.write(stderr)
-            sys.exit(rc)
-
-        preprocessed_files[src] = pp_path
-
-    # Step 3: Scan and transform
-    print("Step 3: Extracting log strings...", file=sys.stderr)
-    all_calls = []  # (source_file, call_dict) tuples
-    file_calls = {}  # src -> list of calls
-    global_id = 0
-
-    for src in args.sources:
-        pp_path = preprocessed_files[src]
-        with open(pp_path, 'r') as f:
-            pp_source = f.read()
-
-        calls = extract_wasm_log_calls(pp_source)
-
-        if not calls:
-            print(f"Warning: no wasm_log() calls found in {src}",
-                  file=sys.stderr)
-
-        file_calls[src] = (pp_path, pp_source, calls)
-        for call in calls:
-            all_calls.append((src, call))
-
-    if not all_calls:
-        print("Error: no wasm_log() calls found in any input file.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    # Step 4: Assign IDs and transform
-    print("Step 4: Transforming...", file=sys.stderr)
-    dictionary = {}
-    id_offset = 0
-
-    for src in args.sources:
-        pp_path, pp_source, calls = file_calls[src]
-        basename = os.path.splitext(os.path.basename(src))[0]
-        out_path = os.path.join(args.output_dir, basename + "_dict.i")
-
-        # Transform source
-        transformed = transform_source(pp_source, calls, id_offset)
-
-        # Write transformed file
-        with open(out_path, 'w') as f:
-            f.write(transformed)
-
-        # Add entries to dictionary
-        for i, call in enumerate(calls):
-            string_id = id_offset + i
-            dictionary[str(string_id)] = {
-                "fmt": call['fmt'],
-                "arg_types": call['arg_type_names'],
-                "type_descriptor": f"0x{call['type_descriptor']:08x}",
-                "source_file": call['source_file'],
-                "source_line": call['source_line'],
-            }
-
-        id_offset += len(calls)
-
-    # Step 5: Write JSON dictionary
-    with open(args.json, 'w') as f:
-        json.dump(dictionary, f, indent=2)
-        f.write('\n')
-
-    # Summary
-    total_bytes = sum(len(call['fmt']) for _, call in all_calls)
-    print(f"\nExtracted {len(all_calls)} log strings", file=sys.stderr)
-    for src in args.sources:
-        _, _, calls = file_calls[src]
-        basename = os.path.splitext(os.path.basename(src))[0]
-        print(f"  {src}: {len(calls)} calls -> "
-              f"{basename}_dict.i", file=sys.stderr)
-    print(f"  Dictionary: {args.json}", file=sys.stderr)
-    print(f"  Total format string bytes eliminated: {total_bytes}",
-          file=sys.stderr)
+    _validate_sources(args.clang, common_flags, args.sources)
+    preprocessed = _preprocess_sources(args.clang, common_flags,
+                                       args.sources, args.output_dir)
+    dictionary, file_calls, total = _extract_and_transform(
+        args.sources, preprocessed, args.output_dir)
+    _write_dict_and_summary(dictionary, args.json, args.sources,
+                            file_calls, total)
 
 
 if __name__ == "__main__":

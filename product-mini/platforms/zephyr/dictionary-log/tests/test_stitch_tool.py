@@ -246,8 +246,8 @@ class TestStitchErrors:
 
 # Add scripts/ to path so we can import decode_wasm_log
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-from decode_wasm_log import parse_wasm_dbs  # noqa: E402
-from decode_wasm_log import decode_wasm_packet as _decode_wasm_packet  # noqa: E402
+from wasm_log_common import parse_wasm_dbs  # noqa: E402
+from wasm_log_common import decode_wasm_packet as _decode_wasm_packet  # noqa: E402
 
 
 def decode_wasm_packet(data, offset, wasm_dbs, **kwargs):
