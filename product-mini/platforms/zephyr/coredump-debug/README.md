@@ -1,26 +1,27 @@
-# Zephyr Coredump Debug Demo
+# Zephyr Coredump Debug Demo (Optimized WASM)
 
-Demonstrates end-to-end crash debugging of a WASM app running on Zephyr,
-combining three debugging layers:
+Demonstrates end-to-end crash debugging of **production-optimized** WASM
+running on Zephyr. The WASM apps are compiled with `-Oz -flto` and post-build
+optimized with `wasm-opt -Oz`, which aggressively inlines functions and
+strips debug info. A "debug companion" binary built in parallel retains
+DWARF inline info, enabling full call stack recovery offline.
 
-- **WAMR call stack dump** — shows which WASM function crashed and the
-  call chain leading to it (function names + bytecode offsets).
-- **addr2line symbolication** — resolves WASM bytecode offsets to source
-  file, line, and column using DWARF debug info from the unstripped WASM
-  binary.
+Three debugging layers work together:
+
+- **WAMR call stack dump** — reports function index + bytecode offset at
+  the point of the WASM trap (no function names in the stripped binary).
+- **Offline inline decode** — `decode_callstack.py` uses `llvm-addr2line -i`
+  against the debug companion to reconstruct the full inlined call chain
+  with source file, line, and column.
 - **Zephyr native coredump** — dumps system-level state (registers, memory)
   for offline analysis with GDB.
 
-Together they provide full visibility: addr2line tells you *which source line*
-crashed, WAMR tells you *which WASM function* and call chain, and the Zephyr
-coredump tells you *what the native runtime state* looked like at the point of
-failure.
-
 ## Prerequisites
 
-- Zephyr SDK 1.0+ and Zephyr workspace (see [Zephyr Getting Started](https://docs.zephyrproject.org/latest/develop/getting_started/index.html))
-- wasi-sdk at `WASI_SDK_PATH` or `/opt/wasi-sdk` (required for building WASM apps)
-- wabt at `WABT_PATH` or `/opt/wabt` (required for addr2line symbolication)
+- Zephyr SDK 1.0+ and Zephyr workspace ([Getting Started](https://docs.zephyrproject.org/latest/develop/getting_started/index.html))
+- wasi-sdk at `WASI_SDK_PATH` or `/opt/wasi-sdk`
+- binaryen (wasm-opt) at `BINARYEN_PATH` or `/opt/binaryen`
+- wabt at `WABT_PATH` or `/opt/wabt`
 - Python 3
 - `xxd` (typically bundled with `vim`)
 
@@ -28,74 +29,77 @@ failure.
 
 ### Build pipeline
 
-`west build` automatically compiles the WASM apps using wasi-sdk via an
-ExternalProject:
+`west build` compiles the WASM apps through a 4-step pipeline:
 
-1. Compiles each WASM source with `-g` debug info → `<name>.wasm` (unstripped)
-2. Strips debug sections → `<name>.stripped.wasm` (small, for embedding)
-3. Generates C header via `xxd` → `test_wasm_<name>.h`
-4. The Zephyr app links against the stripped WASM embedded in the header
+1. `clang -Oz -g -flto` compiles all source files together (whole-program
+   via LTO for cross-translation-unit inlining) → `<name>.wasm` (intermediate)
+2. `wasm-opt -Oz -g` → `<name>.debug.wasm` (debug companion — same
+   optimized code, retains DWARF + name section)
+3. `llvm-strip --strip-all` on the debug companion → `<name>.prod.wasm`
+   (production — minimal, no debug info)
+4. `xxd` on `.prod.wasm` → C header for embedding in firmware
+
+The production binary is derived directly from the debug companion by
+stripping. This **guarantees byte-identical code sections** between the two,
+which is required for offset mapping to work correctly.
+
+### Why multi-file sources?
+
+The WASM apps use multiple source files (e.g., `oob_main.c` +
+`oob_access.c`) to demonstrate that cross-translation-unit inlining
+works correctly under `-Oz -flto` and that `llvm-addr2line -i` resolves
+inlined functions back to their original source files.
 
 ### WAMR call stack dump
 
-When `WAMR_BUILD_DUMP_CALL_STACK=1` is enabled (set in
-`lib-wamr-zephyr/CMakeLists.txt`), WAMR automatically prints the WASM-level
-call stack whenever a WASM trap occurs (e.g., out-of-bounds memory access,
-stack overflow). The output shows function names and bytecode offsets:
+With `WAMR_BUILD_DUMP_CALL_STACK=1` enabled, WAMR prints the WASM-level
+call stack on trap. Since the production binary has no name section, the
+output shows function indices and bytecode offsets only:
 
 ```
-#00: 0x0072 - do_bad_access
-#01: 0x0082 - trigger_oob
-#02: 0x008c - app_main
+#00: 0x0039 - $f0
 ```
 
-Function names are available because `WAMR_BUILD_CUSTOM_NAME_SECTION=1` is
-also enabled, which loads names from the WASM binary's custom name section.
+### Offline inline decode
 
-### addr2line symbolication
-
-The `capture_coredump.sh` script uses WAMR's
-[addr2line.py](../../../../test-tools/addr2line/addr2line.py) to resolve
-bytecode offsets to source locations using the unstripped WASM binary's
-DWARF debug info:
+The `decode_callstack.py` tool converts these raw offsets into full
+inlined call stacks using the debug companion:
 
 ```
-0: do_bad_access
-        at oob.c:12:5
-1: trigger_oob
-        at oob.c:21:5
-2: app_main
-        at oob.c:27:5
+#00: 0x0039 - $f0
+  Inlined call stack:
+    do_bad_access
+        at oob_access.c:11:5
+    trigger_oob
+        at oob_main.c:17:5
+    app_main
+        at oob_main.c:23:5
 ```
+
+**How it works:**
+1. Reads the Code section start offset from the debug companion
+2. Converts: `dwarf_addr = runtime_file_offset - code_section_start - 1`
+3. Calls `llvm-addr2line -e companion.debug.wasm -f -i` to resolve
+   the full inline chain from DWARF `DW_TAG_inlined_subroutine` entries
+
+The `-1` is needed because WAMR reports the instruction pointer *after*
+advancing past the faulting instruction (similar to a return address in
+native code). The DWARF ranges cover the instruction itself, so without
+the adjustment the address lands outside the inlined subroutine range.
 
 ### Zephyr coredump
 
-When `CONFIG_DEBUG_COREDUMP=y` is set in `prj.conf`, Zephyr's fatal error
-handler dumps the CPU registers and memory regions to the console as hex-encoded
-data, bracketed by `#CD:BEGIN#` and `#CD:END#` markers.
-
-This demo uses the **logging backend** (`CONFIG_DEBUG_COREDUMP_BACKEND_LOGGING=y`),
-which prints the coredump hex to the serial console. This is the simplest
-backend — no flash partition or special hardware needed.
-
-### The three layers together
-
-When the WASM app traps:
-
-1. WAMR catches the trap and prints the WASM call stack (function names + offsets)
-2. The host code calls `k_panic()` to trigger a Zephyr fatal error
-3. Zephyr's fatal handler dumps registers and memory as `#CD:` hex lines
-4. The capture script extracts the call stack and runs addr2line for source-level info
-5. The system halts
+When `CONFIG_DEBUG_COREDUMP=y` is set, Zephyr dumps CPU registers and
+memory to the console as hex-encoded data for offline GDB analysis.
 
 ## Crash apps
 
-Two WASM apps are included, selected at build time via `-DCRASH_APP=`:
+Two multi-file WASM apps are included, selected at build time:
 
-| App | Trigger | Purpose |
-|-----|---------|---------|
-| `oob` | Out-of-bounds memory write | Demonstrates WASM trap on invalid memory access |
-| `stackoverflow` | Deep recursion | Demonstrates WASM stack exhaustion |
+| App | Files | Trigger |
+|-----|-------|---------|
+| `oob` | `oob_main.c`, `oob_access.c` | Out-of-bounds memory write |
+| `stackoverflow` | `stackoverflow_main.c`, `stackoverflow_recurse.c` | Deep recursion |
 
 ## Quick start
 
@@ -109,18 +113,15 @@ west build -b qemu_x86 . -p always -- -DCRASH_APP=oob
 west build -b qemu_x86 . -p always -- -DCRASH_APP=stackoverflow
 ```
 
-This automatically compiles the WASM apps, generates headers, and builds the
-Zephyr firmware. wasi-sdk must be installed at `WASI_SDK_PATH` or `/opt/wasi-sdk`.
-
 ### Run and capture
 
 ```shell
 bash scripts/capture_coredump.sh
 ```
 
-The script runs QEMU, captures the full console output to `build/qemu_output.log`,
-extracts the WAMR call stack, runs addr2line for source-level symbolication,
-and extracts the Zephyr coredump hex.
+The script runs QEMU, captures console output, extracts the WAMR call
+stack, decodes it using the debug companion, and extracts the Zephyr
+coredump hex.
 
 Or run manually:
 
@@ -131,49 +132,58 @@ west build -t run
 
 ### What you'll see
 
+Runtime output (on device):
 ```
 Coredump debug demo: starting WAMR...
 Calling WASM app_main (expect crash)...
 
-#00: 0x0072 - do_bad_access
-#01: 0x0082 - trigger_oob
-#02: 0x008c - app_main
+#00: 0x0039 - $f0
 
 WASM exception: Exception: out of bounds memory access
 Triggering Zephyr coredump via k_panic()...
-
-<err> os: >>> ZEPHYR FATAL ERROR 4: Kernel panic on CPU 0
-<err> coredump: #CD:BEGIN#
-<err> coredump: #CD:5a4502000100050004000000
-...
-<err> coredump: #CD:END#
-<err> os: Halting system
 ```
 
-The capture script output includes the symbolicated call stack:
-
+Decoded output (offline, from capture script):
 ```
-=== WASM Symbolicated Call Stack ===
-0: do_bad_access
-        at oob.c:12:5
-1: trigger_oob
-        at oob.c:21:5
-2: app_main
-        at oob.c:27:5
+=== WASM Decoded Call Stack (inline resolution) ===
+#00: 0x0039 - $f0
+  Inlined call stack:
+    do_bad_access
+        at oob_access.c:11:5
+    trigger_oob
+        at oob_main.c:17:5
+    app_main
+        at oob_main.c:23:5
+```
+
+### Manual decode
+
+To decode a call stack captured from real hardware (e.g., via UART):
+
+```shell
+# Save the WAMR call stack lines to a file
+echo '#00: 0x0039 - $f0' > callstack.txt
+
+# Decode using the debug companion
+python3 ../../../../test-tools/decode-callstack/decode_callstack.py \
+    --wasi-sdk /opt/wasi-sdk \
+    --wabt /opt/wabt \
+    --debug-wasm build/wasm-apps/wasm/oob.debug.wasm \
+    callstack.txt
 ```
 
 ### Environment variables
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `WASI_SDK_PATH` | `/opt/wasi-sdk` | Build (clang, llvm-strip) and symbolication (llvm-dwarfdump) |
-| `WABT_PATH` | `/opt/wabt` | Symbolication (wasm-objdump) |
+| `WASI_SDK_PATH` | `/opt/wasi-sdk` | Build (clang, llvm-strip) and decode (llvm-addr2line) |
+| `BINARYEN_PATH` | `/opt/binaryen` | Build (wasm-opt) |
+| `WABT_PATH` | `/opt/wabt` | Decode (wasm-objdump) |
 
 ## Analyzing the Zephyr coredump with GDB
 
-The coredump hex in the console log can be converted to a binary and loaded
-into GDB for native-level debugging. Zephyr provides Python scripts for this
-(no `west` subcommand — these are standalone scripts).
+The coredump hex in the console log can be converted to a binary and
+loaded into GDB for native-level debugging.
 
 ### Step 1: Parse the serial log hex into a binary
 
@@ -182,8 +192,6 @@ python3 ${ZEPHYR_BASE}/scripts/coredump/coredump_serial_log_parser.py \
     build/qemu_output.log build/coredump.bin
 ```
 
-This reads the `#CD:BEGIN#` ... `#CD:END#` block and produces a binary file.
-
 ### Step 2: Start the coredump GDB server
 
 ```shell
@@ -191,48 +199,97 @@ python3 ${ZEPHYR_BASE}/scripts/coredump/coredump_gdbserver.py \
     build/zephyr/zephyr.elf build/coredump.bin
 ```
 
-This starts a GDB-compatible server on port 1234 that serves the crashed
-system's registers and memory to GDB.
-
-### Step 3: Connect GDB (in another terminal)
-
-Use the GDB from your Zephyr SDK:
+### Step 3: Connect GDB
 
 ```shell
-# For qemu_x86 (32-bit x86):
 ${ZEPHYR_SDK_INSTALL_DIR}/gnu/x86_64-zephyr-elf/bin/x86_64-zephyr-elf-gdb \
     build/zephyr/zephyr.elf
 
 (gdb) target remote localhost:1234
-(gdb) bt                    # native backtrace
-(gdb) info registers        # CPU register state at crash
-(gdb) frame 0               # inspect specific frame
-(gdb) list                   # show source at crash point
+(gdb) bt
+(gdb) info registers
 ```
 
-Or as a one-liner using pipe mode (single terminal):
+## The three debugging layers
 
-```shell
-${ZEPHYR_SDK_INSTALL_DIR}/gnu/x86_64-zephyr-elf/bin/x86_64-zephyr-elf-gdb \
-    build/zephyr/zephyr.elf \
-    -ex "target remote | python3 ${ZEPHYR_BASE}/scripts/coredump/coredump_gdbserver.py --pipe build/zephyr/zephyr.elf build/coredump.bin"
+| Layer | Answers | Requires |
+|-------|---------|----------|
+| WAMR call stack | Which WASM function trapped? What bytecode offset? | `WAMR_BUILD_DUMP_CALL_STACK=1` |
+| Offline inline decode | Which source functions were inlined? File + line? | Debug companion + decode_callstack.py |
+| GDB coredump | What was the native runtime state at the crash? | Zephyr coredump + zephyr.elf |
+
+## Technical notes
+
+### Why production is derived from the debug companion
+
+`wasm-opt -Oz` without `-g` applies additional inlining passes that `-g`
+inhibits (to preserve DWARF integrity). Running separate `wasm-opt` passes
+for production and debug would produce structurally different binaries with
+different code offsets, breaking the offline decode.
+
+Instead, the production binary is created by stripping the debug companion
+(`llvm-strip --strip-all`). This guarantees byte-identical code sections
+and makes offset mapping unconditionally correct.
+
+### LTO for cross-file inlining
+
+The `-flto` flag enables link-time optimization, which allows the compiler
+to inline functions across translation units. Without it, functions in
+separate `.c` files would remain as separate WASM functions even under `-Oz`.
+With LTO, the compiler sees all sources as one unit and inlines aggressively.
+
+### Tail-call optimization and its effect on call stacks
+
+`clang -flto -Oz` converts **tail-recursive** functions into loops at link
+time. A tail call is one where the recursive call is the very last thing
+the function does and its return value is passed through unchanged:
+
+```c
+return recurse(depth + 1);  // tail call — compiler can optimize
 ```
 
-### What GDB tells you
+The compiler recognizes that the current stack frame is no longer needed
+after the call, so it transforms the recursion into a loop that reuses
+the same frame:
 
-The `bt` (backtrace) command in GDB shows the native C call stack in the WAMR
-runtime at the point `k_panic()` was called. This complements the WAMR
-WASM-level call stack:
+```wasm
+func recurse:
+  loop              ;; just a branch target, not a call
+    ...             ;; function body
+    local.set depth ;; update depth = depth + 1
+    br 0            ;; jump back to top (no new stack frame)
+  end
+```
 
-- **WAMR call stack** answers: *which WASM function crashed and what was the
-  WASM call chain?*
-- **addr2line** answers: *which source file and line in the original C code?*
-- **GDB native backtrace** answers: *which C function in the WAMR runtime
-  handled the trap, and what was the native call chain?*
+**Effect on call stack:** Since there is no `call` instruction, each
+"recursive" iteration reuses the same WASM stack frame. When a trap
+occurs inside the loop, the runtime reports only **one frame** for
+`recurse` — not the full recursion depth:
+
+```
+#00: 0x0071 - $f1    ← recurse (one frame, regardless of depth)
+#01: 0x0036 - app_main
+```
+
+This is correct behavior — it accurately reflects the optimized code
+structure. The call stack shows the actual WASM frames that existed at
+the point of the trap.
+
+**To preserve the full recursive call chain** (e.g., for testing stack
+overflow traps), make the call non-tail-recursive by using the return
+value after the call:
+
+```c
+int r = recurse(depth + 1);
+return r + buf[0];  // buf[0] forces the frame to stay alive
+```
+
+The compiler cannot discard the current frame before the call returns
+(it still needs `buf[0]`), so it emits a real `call` instruction. Each
+call pushes a new frame until the WASM operand stack overflows.
 
 ## References
 
 - [Zephyr Coredump Documentation](https://docs.zephyrproject.org/latest/services/debugging/coredump.html)
 - [WAMR Dump Call Stack Feature](../../../../doc/build_wamr.md#dump-call-stack-feature)
-- [WAMR Debug Tools Sample](../../../../samples/debug-tools/README.md)
-- [addr2line.py](../../../../test-tools/addr2line/addr2line.py)
+- [decode_callstack.py](../../../../test-tools/decode-callstack/decode_callstack.py)

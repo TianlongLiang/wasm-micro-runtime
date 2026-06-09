@@ -4,15 +4,11 @@
  */
 
 /* Deliberate out-of-bounds memory access for coredump debug demo.
-   Call chain: app_main -> trigger_oob -> do_bad_access */
+   Multi-file: app_main -> trigger_oob (this file) -> do_bad_access (oob_access.c)
+   Under -Oz, these get inlined into app_main. The debug companion
+   retains DWARF inline info so the full chain can be recovered offline. */
 
-void
-do_bad_access(int offset)
-{
-    volatile int *p = (volatile int *)0;
-    /* Write to an address way beyond linear memory to trigger OOB trap */
-    p[offset] = 0xDEAD;
-}
+void do_bad_access(int offset);
 
 void
 trigger_oob(void)

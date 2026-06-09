@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # Runs QEMU, captures console output, extracts WAMR call stack and
-# Zephyr coredump hex for offline analysis, and symbolicates the
-# WASM call stack using addr2line.py.
+# Zephyr coredump hex for offline analysis, and decodes the
+# WASM call stack using decode_callstack.py.
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_DIR="${SCRIPT_DIR}/.."
@@ -16,7 +16,6 @@ COREDUMP_BIN="${BUILD_DIR}/coredump.bin"
 WASM_CALL_STACK="${BUILD_DIR}/wasm_call_stack.txt"
 
 WAMR_ROOT=$(cd "${SCRIPT_DIR}/../../../../.." && pwd)
-ADDR2LINE="${WAMR_ROOT}/test-tools/addr2line/addr2line.py"
 
 # Tool paths: env var -> default
 WASI_SDK_PATH="${WASI_SDK_PATH:-/opt/wasi-sdk}"
@@ -65,56 +64,58 @@ echo "=== WASM Exception ==="
 grep "WASM exception:" "${LOG_FILE}" || echo "(no exception found)"
 
 echo ""
-echo "=== WASM Symbolicated Call Stack ==="
+echo "=== WASM Decoded Call Stack (inline resolution) ==="
 
-# Extract call stack lines for addr2line
+DECODE_SCRIPT="${WAMR_ROOT}/test-tools/decode-callstack/decode_callstack.py"
+
+# Extract call stack lines for decode_callstack
 grep -E "#[0-9]+:.*0x[0-9a-f]+" "${LOG_FILE}" > "${WASM_CALL_STACK}" 2>/dev/null
 
+# Determine which crash app was built from CMakeCache
+CRASH_APP=$(grep "^CRASH_APP:" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+if [ -z "${CRASH_APP}" ]; then
+    CRASH_APP="oob"
+fi
+
+DEBUG_WASM="${BUILD_DIR}/wasm-apps/wasm/${CRASH_APP}.debug.wasm"
+
 if [ ! -s "${WASM_CALL_STACK}" ]; then
-    echo "(no WAMR call stack lines to symbolicate)"
+    echo "(no WAMR call stack lines to decode)"
 else
-    # Determine which crash app was built from CMakeCache
-    CRASH_APP=$(grep "^CRASH_APP:" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
-    if [ -z "${CRASH_APP}" ]; then
-        CRASH_APP="oob"
+    CAN_DECODE=true
+    if [ ! -f "${DECODE_SCRIPT}" ]; then
+        echo "decode_callstack.py not found at ${DECODE_SCRIPT}"
+        CAN_DECODE=false
     fi
-
-    WASM_FILE="${BUILD_DIR}/wasm-apps/wasm/${CRASH_APP}.wasm"
-
-    CAN_SYMBOLICATE=true
-    if [ ! -f "${ADDR2LINE}" ]; then
-        echo "addr2line.py not found at ${ADDR2LINE}"
-        CAN_SYMBOLICATE=false
-    fi
-    if [ ! -f "${WASM_FILE}" ]; then
-        echo "Unstripped WASM not found at ${WASM_FILE}"
-        echo "(Build with wasi-sdk to generate debug WASM binaries)"
-        CAN_SYMBOLICATE=false
+    if [ ! -f "${DEBUG_WASM}" ]; then
+        echo "Debug companion not found at ${DEBUG_WASM}"
+        echo "(Build produces this automatically)"
+        CAN_DECODE=false
     fi
     if [ ! -d "${WASI_SDK_PATH}" ]; then
         echo "wasi-sdk not found at ${WASI_SDK_PATH}"
         echo "Set WASI_SDK_PATH env var or install to /opt/wasi-sdk"
-        CAN_SYMBOLICATE=false
+        CAN_DECODE=false
     fi
     if [ ! -d "${WABT_PATH}" ]; then
         echo "wabt not found at ${WABT_PATH}"
         echo "Set WABT_PATH env var or install to /opt/wabt"
-        CAN_SYMBOLICATE=false
+        CAN_DECODE=false
     fi
 
-    if [ "${CAN_SYMBOLICATE}" = true ]; then
-        python3 "${ADDR2LINE}" \
+    if [ "${CAN_DECODE}" = true ]; then
+        python3 "${DECODE_SCRIPT}" \
             --wasi-sdk "${WASI_SDK_PATH}" \
             --wabt "${WABT_PATH}" \
-            --wasm-file "${WASM_FILE}" \
+            --debug-wasm "${DEBUG_WASM}" \
             "${WASM_CALL_STACK}"
     else
         echo ""
-        echo "To symbolicate manually:"
-        echo "  python3 ${ADDR2LINE} \\"
+        echo "To decode manually:"
+        echo "  python3 ${DECODE_SCRIPT} \\"
         echo "      --wasi-sdk \${WASI_SDK_PATH} \\"
         echo "      --wabt \${WABT_PATH} \\"
-        echo "      --wasm-file <path-to-unstripped.wasm> \\"
+        echo "      --debug-wasm ${DEBUG_WASM} \\"
         echo "      ${WASM_CALL_STACK}"
     fi
 fi

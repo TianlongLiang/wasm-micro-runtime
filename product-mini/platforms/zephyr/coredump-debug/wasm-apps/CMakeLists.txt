@@ -27,9 +27,25 @@ if(NOT EXISTS "${WASI_SDK_STRIP}")
         "Set WASI_SDK_PATH to your wasi-sdk installation.")
 endif()
 
+# --- binaryen (wasm-opt) discovery ---
+if(NOT DEFINED BINARYEN_PATH)
+    if(DEFINED ENV{BINARYEN_PATH})
+        set(BINARYEN_PATH "$ENV{BINARYEN_PATH}")
+    else()
+        set(BINARYEN_PATH "/opt/binaryen")
+    endif()
+endif()
+
+set(WASM_OPT "${BINARYEN_PATH}/bin/wasm-opt")
+
+if(NOT EXISTS "${WASM_OPT}")
+    message(FATAL_ERROR "wasm-opt not found at ${WASM_OPT}. "
+        "Set BINARYEN_PATH to your binaryen installation (e.g. /opt/binaryen).")
+endif()
+
 find_program(XXD xxd REQUIRED)
 
-# Helper script for xxd header generation (avoids CMake shell escaping issues)
+# Helper script for xxd header generation
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gen_header.sh"
 "#!/bin/sh
 \"${XXD}\" -i \"$1\" | sed 's/unsigned char.*\\[\\]/unsigned char __aligned(4) wasm_test_file[]/' | sed 's/unsigned int.*//' > \"$2\"
@@ -40,7 +56,7 @@ set(WAMR_DEFINED_SYMBOLS "${WAMR_SYSROOT}/share/defined-symbols.txt")
 
 set(WASM_COMPILE_FLAGS
     --target=wasm32
-    -O0 -g
+    -Oz -g -flto
     -z stack-size=4096
     -Wl,--initial-memory=65536
     --sysroot=${WAMR_SYSROOT}
@@ -51,49 +67,67 @@ set(WASM_COMPILE_FLAGS
 )
 
 # --- per-app build function ---
-function(build_wasm_app SOURCE_FILE)
-    get_filename_component(APP_NAME ${SOURCE_FILE} NAME_WLE)
+# Usage: build_wasm_app(<app_name> <source1.c> <source2.c> ...)
+function(build_wasm_app APP_NAME)
+    set(SOURCES ${ARGN})
 
-    set(WASM_UNSTRIPPED "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.wasm")
-    set(WASM_STRIPPED   "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.stripped.wasm")
-    set(HEADER_FILE     "${CMAKE_CURRENT_BINARY_DIR}/test_wasm_${APP_NAME}.h")
+    # Resolve source paths
+    set(SOURCE_PATHS "")
+    foreach(SRC ${SOURCES})
+        list(APPEND SOURCE_PATHS "${CMAKE_CURRENT_SOURCE_DIR}/${SRC}")
+    endforeach()
 
-    # 1. Compile unstripped (with -g debug info)
+    set(WASM_INTERMEDIATE "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.wasm")
+    set(WASM_DEBUG        "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.debug.wasm")
+    set(WASM_PROD         "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.prod.wasm")
+    set(HEADER_FILE       "${CMAKE_CURRENT_BINARY_DIR}/test_wasm_${APP_NAME}.h")
+
+    # 1. Compile all sources together (whole-program for cross-file inlining)
     add_custom_command(
-        OUTPUT "${WASM_UNSTRIPPED}"
+        OUTPUT "${WASM_INTERMEDIATE}"
         COMMAND ${WASI_SDK_CLANG} ${WASM_COMPILE_FLAGS}
-                -o "${WASM_UNSTRIPPED}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE_FILE}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE_FILE}"
-        COMMENT "Compiling ${SOURCE_FILE} -> ${APP_NAME}.wasm (unstripped)"
+                -o "${WASM_INTERMEDIATE}"
+                ${SOURCE_PATHS}
+        DEPENDS ${SOURCE_PATHS}
+        COMMENT "[${APP_NAME}] Compiling -> ${APP_NAME}.wasm (intermediate, -Oz -g)"
     )
 
-    # 2. Strip debug info for embedding
+    # 2. Debug companion (same optimizations + preserves DWARF and name section)
     add_custom_command(
-        OUTPUT "${WASM_STRIPPED}"
-        COMMAND ${WASI_SDK_STRIP} --strip-debug
-                -o "${WASM_STRIPPED}"
-                "${WASM_UNSTRIPPED}"
-        DEPENDS "${WASM_UNSTRIPPED}"
-        COMMENT "Stripping ${APP_NAME}.wasm -> ${APP_NAME}.stripped.wasm"
+        OUTPUT "${WASM_DEBUG}"
+        COMMAND ${WASM_OPT} -Oz -g
+                -o "${WASM_DEBUG}"
+                "${WASM_INTERMEDIATE}"
+        DEPENDS "${WASM_INTERMEDIATE}"
+        COMMENT "[${APP_NAME}] wasm-opt -Oz -g -> ${APP_NAME}.debug.wasm (debug companion)"
     )
 
-    # 3. Generate C header via xxd
+    # 3. Production (strip debug companion — guarantees identical code bytes)
+    add_custom_command(
+        OUTPUT "${WASM_PROD}"
+        COMMAND ${WASI_SDK_STRIP} --strip-all
+                -o "${WASM_PROD}"
+                "${WASM_DEBUG}"
+        DEPENDS "${WASM_DEBUG}"
+        COMMENT "[${APP_NAME}] strip -> ${APP_NAME}.prod.wasm (production)"
+    )
+
+    # 4. Generate C header from production binary
     add_custom_command(
         OUTPUT "${HEADER_FILE}"
         COMMAND sh "${CMAKE_CURRENT_BINARY_DIR}/gen_header.sh"
-                "${WASM_STRIPPED}" "${HEADER_FILE}"
-        DEPENDS "${WASM_STRIPPED}"
-        COMMENT "Generating test_wasm_${APP_NAME}.h"
+                "${WASM_PROD}" "${HEADER_FILE}"
+        DEPENDS "${WASM_PROD}"
+        COMMENT "[${APP_NAME}] xxd -> test_wasm_${APP_NAME}.h"
     )
 
     add_custom_target(${APP_NAME}_wasm ALL
-        DEPENDS "${WASM_UNSTRIPPED}" "${WASM_STRIPPED}" "${HEADER_FILE}"
+        DEPENDS "${WASM_INTERMEDIATE}" "${WASM_DEBUG}" "${WASM_PROD}" "${HEADER_FILE}"
     )
 
-    install(FILES "${WASM_UNSTRIPPED}" "${WASM_STRIPPED}" DESTINATION wasm)
+    install(FILES "${WASM_DEBUG}" "${WASM_PROD}" DESTINATION wasm)
     install(FILES "${HEADER_FILE}" DESTINATION include)
 endfunction()
 
-build_wasm_app(oob.c)
-build_wasm_app(stackoverflow.c)
+build_wasm_app(oob oob_main.c oob_access.c)
+build_wasm_app(stackoverflow stackoverflow_main.c stackoverflow_recurse.c)
