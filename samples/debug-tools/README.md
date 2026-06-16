@@ -56,17 +56,38 @@ The output should be something like:
 
 ```text
 0: c
-        at wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:5:1
-1: b
-        at wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:11:12
-2: a
-        at wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:17:12
-3: main
-        at wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:24:5
-4: __main_void
-        at unknown:?:?
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:15
+1: _start
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:22
+2: _start
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:28
+3: b
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:35
+4: calloc
+	at ??:0
 5: _start
+	at wasisdk://v25.0/build/sysroot/wasi-libc-wasm32-wasi/libc-bottom-half/crt/crt1-command.c:43
 ```
+
+### Inline expansion
+
+When the wasm code is compiled with optimizations (e.g. `-O2` or `-Oz`), or when functions
+are marked with `__attribute__((always_inline))`, addr2line.py automatically expands the
+inline call chain. The included `trap.c` has a `trap_helper` helper marked as always_inline,
+which demonstrates this behavior.
+
+If the trap address falls within an inlined region, addr2line.py prints all inline frames
+under a single index, with subsequent frames indented to align with the first:
+
+```text
+0: trap_helper
+        at trap.c:4:5
+   c
+        at trap.c:13:13
+```
+
+Inline expansion is automatic and requires no flags — it uses DWARF
+`DW_TAG_inlined_subroutine` entries when present.
 
 If WAMR is run in fast interpreter mode (`WAMR_BUILD_FAST_INTERP=1`), addresses in the stack trace cannot be tracked back to location info.
 If WAMR <= `1.3.2` is used, the stack trace does not contain addresses.
