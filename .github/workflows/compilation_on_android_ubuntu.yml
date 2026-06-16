@@ -75,6 +75,13 @@ permissions:
   contents: read
 
 jobs:
+  try_merge:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/try_merge.yml
+    # allow downstream jobs to run even if merge has conflicts
+    continue-on-error: true
+
   check_version_h:
     permissions:
       contents: read
@@ -91,7 +98,7 @@ jobs:
       arch: "X86"
 
   build_wamrc:
-    needs: [build_llvm_libraries_on_ubuntu_2204]
+    needs: [build_llvm_libraries_on_ubuntu_2204, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -101,6 +108,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       # since jobs.id can't contain the dot character
       # it is hard to use `format` to assemble the cache key
@@ -128,7 +137,7 @@ jobs:
         working-directory: wamr-compiler
 
   build_iwasm:
-    needs: [build_llvm_libraries_on_ubuntu_2204]
+    needs: [build_llvm_libraries_on_ubuntu_2204, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -272,6 +281,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       # only download llvm cache when needed
       - name: Get LLVM libraries
@@ -309,7 +320,7 @@ jobs:
         working-directory: product-mini/platforms/${{ matrix.platform }}
 
   build_unit_tests:
-    needs: [build_llvm_libraries_on_ubuntu_2204, build_wamrc]
+    needs: [build_llvm_libraries_on_ubuntu_2204, build_wamrc, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -324,6 +335,7 @@ jobs:
       - name: checkout
         uses: actions/checkout@v6.0.2
         with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
           submodules: recursive
 
       - name: Get LLVM libraries
@@ -370,7 +382,7 @@ jobs:
         working-directory: tests/unit
 
   build_regression_tests:
-    needs: [build_llvm_libraries_on_ubuntu_2204]
+    needs: [build_llvm_libraries_on_ubuntu_2204, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -382,6 +394,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -410,7 +424,7 @@ jobs:
         working-directory: tests/regression/ba-issues
 
   build_samples_wasm_c_api:
-    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]
+    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -447,6 +461,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -492,7 +508,7 @@ jobs:
         working-directory: samples/printversion
 
   build_samples_others:
-    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]
+    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -504,6 +520,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       - name: Get LLVM libraries
         id: retrieve_llvm_libs
@@ -638,8 +656,62 @@ jobs:
           ./build.sh --aot
           ./run.sh --aot
 
+  build_samples_debug_tools_optimized:
+    needs: [build_iwasm, try_merge]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
+
+      - name: install-wasi-sdk-wabt
+        uses: ./.github/actions/install-wasi-sdk-wabt
+        with:
+          os: ${{ matrix.os }}
+
+      - name: Install binaryen
+        run: |
+          sudo mkdir -p /opt/binaryen
+          curl -L https://github.com/WebAssembly/binaryen/releases/download/version_117/binaryen-version_117-x86_64-linux.tar.gz \
+            | sudo tar xz -C /opt/binaryen --strip-components=1
+          /opt/binaryen/bin/wasm-opt --version
+
+      - name: Build Sample [debug-tools-optimized]
+        working-directory: samples/debug-tools-optimized
+        run: |
+          mkdir -p build && cd build
+          cmake ..
+          make -j$(nproc)
+
+      - name: Verify oob symbolication
+        working-directory: samples/debug-tools-optimized
+        run: |
+          ./symbolicate.sh oob 2>&1 | tee /tmp/oob_output.txt
+          # Assert the runtime reported the OOB exception
+          grep -q "out of bounds memory access" /tmp/oob_output.txt
+          # Assert addr2line resolved app_main with the expected source file
+          grep -q "app_main" /tmp/oob_output.txt
+          grep -q "oob_main.c" /tmp/oob_output.txt
+          echo "OOB symbolication: PASS"
+
+      - name: Verify stackoverflow symbolication
+        working-directory: samples/debug-tools-optimized
+        run: |
+          ./symbolicate.sh stackoverflow 2>&1 | tee /tmp/so_output.txt
+          # Assert addr2line resolved file:line refs. Function names may show
+          # as "free" due to wasi-libc DWARF aliasing, so file refs are the
+          # reliable signal.
+          grep -q "stackoverflow_recurse.c" /tmp/so_output.txt
+          grep -q "stackoverflow_main.c" /tmp/so_output.txt
+          echo "Stackoverflow symbolication: PASS"
+
   test:
-    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc]
+    needs: [build_iwasm, build_llvm_libraries_on_ubuntu_2204, build_wamrc, try_merge]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -678,6 +750,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.try_merge.outputs.checkout_ref || '' }}
 
       - name: Set-up OCaml
         uses: ocaml/setup-ocaml@v3
