@@ -10,7 +10,7 @@ Three debugging layers work together:
 
 - **WAMR call stack dump** — reports function index + bytecode offset at
   the point of the WASM trap (no function names in the stripped binary).
-- **Offline inline decode** — `decode_callstack.py` uses `llvm-addr2line -i`
+- **Offline inline decode** — `addr2line.py` uses `llvm-addr2line -i`
   against the debug companion to reconstruct the full inlined call chain
   with source file, line, and column.
 - **Zephyr native coredump** — dumps system-level state (registers, memory)
@@ -62,7 +62,7 @@ output shows function indices and bytecode offsets only:
 
 ### Offline inline decode
 
-The `decode_callstack.py` tool converts these raw offsets into full
+The `addr2line.py` tool converts these raw offsets into full
 inlined call stacks using the debug companion:
 
 ```
@@ -165,10 +165,10 @@ To decode a call stack captured from real hardware (e.g., via UART):
 echo '#00: 0x0039 - $f0' > callstack.txt
 
 # Decode using the debug companion
-python3 ../../../../test-tools/decode-callstack/decode_callstack.py \
+python3 ../../../../test-tools/addr2line/addr2line.py \
     --wasi-sdk /opt/wasi-sdk \
     --wabt /opt/wabt \
-    --debug-wasm build/wasm-apps/wasm/oob.debug.wasm \
+    --wasm-file build/wasm-apps/wasm/oob.debug.wasm \
     callstack.txt
 ```
 
@@ -215,7 +215,7 @@ ${ZEPHYR_SDK_INSTALL_DIR}/gnu/x86_64-zephyr-elf/bin/x86_64-zephyr-elf-gdb \
 | Layer | Answers | Requires |
 |-------|---------|----------|
 | WAMR call stack | Which WASM function trapped? What bytecode offset? | `WAMR_BUILD_DUMP_CALL_STACK=1` |
-| Offline inline decode | Which source functions were inlined? File + line? | Debug companion + decode_callstack.py |
+| Offline inline decode | Which source functions were inlined? File + line? | Debug companion + addr2line.py |
 | GDB coredump | What was the native runtime state at the crash? | Zephyr coredump + zephyr.elf |
 
 ## Technical notes
@@ -292,4 +292,4 @@ call pushes a new frame until the WASM operand stack overflows.
 
 - [Zephyr Coredump Documentation](https://docs.zephyrproject.org/latest/services/debugging/coredump.html)
 - [WAMR Dump Call Stack Feature](../../../../doc/build_wamr.md#dump-call-stack-feature)
-- [decode_callstack.py](../../../../test-tools/decode-callstack/decode_callstack.py)
+- [addr2line.py](../../../../test-tools/addr2line/addr2line.py)

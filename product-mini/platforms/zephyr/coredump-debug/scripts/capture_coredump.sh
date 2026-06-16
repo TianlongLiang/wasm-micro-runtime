@@ -5,7 +5,7 @@
 
 # Runs QEMU, captures console output, extracts WAMR call stack and
 # Zephyr coredump hex for offline analysis, and decodes the
-# WASM call stack using decode_callstack.py.
+# WASM call stack using addr2line.py.
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_DIR="${SCRIPT_DIR}/.."
@@ -66,9 +66,9 @@ grep "WASM exception:" "${LOG_FILE}" || echo "(no exception found)"
 echo ""
 echo "=== WASM Decoded Call Stack (inline resolution) ==="
 
-DECODE_SCRIPT="${WAMR_ROOT}/test-tools/decode-callstack/decode_callstack.py"
+DECODE_SCRIPT="${WAMR_ROOT}/test-tools/addr2line/addr2line.py"
 
-# Extract call stack lines for decode_callstack
+# Extract call stack lines for addr2line
 grep -E "#[0-9]+:.*0x[0-9a-f]+" "${LOG_FILE}" > "${WASM_CALL_STACK}" 2>/dev/null
 
 # Determine which crash app was built from CMakeCache
@@ -84,7 +84,7 @@ if [ ! -s "${WASM_CALL_STACK}" ]; then
 else
     CAN_DECODE=true
     if [ ! -f "${DECODE_SCRIPT}" ]; then
-        echo "decode_callstack.py not found at ${DECODE_SCRIPT}"
+        echo "addr2line.py not found at ${DECODE_SCRIPT}"
         CAN_DECODE=false
     fi
     if [ ! -f "${DEBUG_WASM}" ]; then
@@ -107,7 +107,7 @@ else
         python3 "${DECODE_SCRIPT}" \
             --wasi-sdk "${WASI_SDK_PATH}" \
             --wabt "${WABT_PATH}" \
-            --debug-wasm "${DEBUG_WASM}" \
+            --wasm-file "${DEBUG_WASM}" \
             "${WASM_CALL_STACK}"
     else
         echo ""
@@ -115,7 +115,7 @@ else
         echo "  python3 ${DECODE_SCRIPT} \\"
         echo "      --wasi-sdk \${WASI_SDK_PATH} \\"
         echo "      --wabt \${WABT_PATH} \\"
-        echo "      --debug-wasm ${DEBUG_WASM} \\"
+        echo "      --wasm-file ${DEBUG_WASM} \\"
         echo "      ${WASM_CALL_STACK}"
     fi
 fi
