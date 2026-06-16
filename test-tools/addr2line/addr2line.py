@@ -389,9 +389,32 @@ def main():
 
             # Address-based lookup
             offset_int = int(offset, 16)
-            assert offset_int > code_section_start, (
-                f"offset 0x{offset_int:x} <= code_section_start 0x{code_section_start:x}"
-            )
+
+            # WAMR reports offset 0 when frame_ip wasn't captured (e.g., trap
+            # at function entry, or top frame of an iwasm -f invocation where
+            # ip wasn't sync'd before the trap). Fall back to function-name
+            # lookup for the function header instead of asserting.
+            if offset_int == 0 or offset_int <= code_section_start:
+                if not emcc_production:
+                    # Resolve function name from index ($fN) or use the name directly
+                    if index.startswith("$f"):
+                        func_idx = index[2:]
+                        func_name = function_index_to_name.get(func_idx, index)
+                    else:
+                        func_name = index
+                    _, function_file, function_line = (
+                        get_line_info_from_function_name_dwarf(
+                            llvm_dwarf_dump, args.wasm_file, func_name
+                        )
+                    )
+                    print(f"{index_str}: {demangle(llvm_cxxfilt, func_name)}")
+                    print(f"\tat {function_file}:{function_line}  "
+                          f"(offset=0 — function entry, no inline info)")
+                    continue
+                # emcc path: just print raw
+                print(f"{index_str}: {index}")
+                print(f"\tat unknown:?:?  (offset=0 — frame_ip not captured)")
+                continue
 
             # Apply -1: WAMR's frame_ip has always advanced past the trapping opcode
             # before the trap handler runs (FETCH_OPCODE_AND_DISPATCH increments ip
