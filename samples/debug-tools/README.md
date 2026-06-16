@@ -55,39 +55,41 @@ $ python3 ../../../test-tools/addr2line/addr2line.py \
 The output should be something like:
 
 ```text
-0: c
-	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:15
-1: _start
-	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:22
+0: trap_helper
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:9
+   c
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:16
+1: b
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:23
 2: _start
-	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:28
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:29
 3: b
-	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:35
+	at /path/to/wasm-micro-runtime/samples/debug-tools/wasm-apps/trap.c:36
 4: calloc
 	at ??:0
 5: _start
 	at wasisdk://v25.0/build/sysroot/wasi-libc-wasm32-wasi/libc-bottom-half/crt/crt1-command.c:43
 ```
 
+Frame `0` shows **inline expansion** in action — `trap_helper` (the actual trap site)
+and `c` (its caller) appear together under index `0` because `trap_helper` was inlined
+into `c` by `__attribute__((always_inline))`. The runtime only sees one WASM frame for
+`c`, but addr2line.py reconstructs the full source-level call chain from DWARF
+`DW_TAG_inlined_subroutine` entries.
+
 ### Inline expansion
 
-When the wasm code is compiled with optimizations (e.g. `-O2` or `-Oz`), or when functions
-are marked with `__attribute__((always_inline))`, addr2line.py automatically expands the
-inline call chain. The included `trap.c` has a `trap_helper` helper marked as always_inline,
-which demonstrates this behavior.
+addr2line.py automatically expands inline call chains when the binary's DWARF contains
+`DW_TAG_inlined_subroutine` entries. This happens when functions are inlined either by
+optimization (e.g. `-O2`, `-Oz`) or by `__attribute__((always_inline))`.
 
-If the trap address falls within an inlined region, addr2line.py prints all inline frames
-under a single index, with subsequent frames indented to align with the first:
+The included `trap.c` marks `trap_helper` as always_inline and places `__builtin_trap()`
+inside it. The trap address therefore falls within the inlined region, producing the
+multi-line frame `0` shown above. Each inlined frame's source location is reported
+independently, so you can see exactly which inlined call chain led to the trap.
 
-```text
-0: trap_helper
-        at trap.c:4:5
-   c
-        at trap.c:13:13
-```
-
-Inline expansion is automatic and requires no flags — it uses DWARF
-`DW_TAG_inlined_subroutine` entries when present.
+Inline expansion requires no flags — it's automatic whenever the DWARF carries the
+relevant inline metadata.
 
 If WAMR is run in fast interpreter mode (`WAMR_BUILD_FAST_INTERP=1`), addresses in the stack trace cannot be tracked back to location info.
 If WAMR <= `1.3.2` is used, the stack trace does not contain addresses.
