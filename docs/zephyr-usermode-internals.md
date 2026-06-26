@@ -240,7 +240,7 @@ endif()
 
 ## Result
 
-The user-mode sample (`samples/zephyr/user-mode/`) demonstrates the full architecture:
+The user-mode sample (`product-mini/platforms/zephyr/user-mode/`) demonstrates the full architecture:
 
 ```
 kernel main()                          (supervisor mode)
