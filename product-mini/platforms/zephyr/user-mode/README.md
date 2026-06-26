@@ -4,6 +4,21 @@ This example demonstrates how to build and run a WebAssembly application in user
 
 > Note: The user mode is not supported on all Zephyr boards. Please refer to the Zephyr documentation for more information.
 
+## Build matrix
+
+This sample supports multiple build configurations via two flags:
+
+| `WAMR_BUILD_ZEPHYR_USERMODE_MT` | `USER_MODE_MULTITHREAD` | Outcome |
+|---|---|---|
+| 1 (default) | ON (default) | Worker-pool + bh_queue demo |
+| 1 | OFF | Single user-mode thread + bh_queue round trip |
+| 0 | OFF | ST demo starts, faults at `k_mutex_init` inside `bh_queue_create` |
+| 0 | ON | Rejected by CMake |
+
+See `docs/zephyr-usermode-internals.md` for why the `WAMR_BUILD_ZEPHYR_USERMODE_MT` flag is needed.
+
+**Note:** There is no separate `user-mode-app/` sample in this tree. During development, an attempt was made to create a "pure Zephyr-app shape" sample (WAMR sources compiled directly into the app target, like `simple/`). However, under `CONFIG_USERSPACE`, any global that a user-mode thread accesses must live inside a memory partition the thread has access to. Achieving this requires `zephyr_library_app_memory(wamr_partition)`, which means WAMR must be built as a `zephyr_library` — the same structure this sample already has. See `docs/zephyr-usermode-internals.md` section "Why a Pure Zephyr-App User-Mode Sample Was Not Added" for the full technical explanation.
+
 ## Setup
 
 Please refer to the [previous WAMR Zephyr README.md](../simple/README.md) for general Zephyr setup instructions.
@@ -166,11 +181,13 @@ code is in `main.c`: memory domain setup and one-time stack access grants.
 
 The following changes to `core/shared/platform/zephyr/` enable WAMR's thread
 primitives to work from user-mode threads. These are platform-wide changes, not
-sample-specific.
+sample-specific. They are activated when `WAMR_BUILD_ZEPHYR_USERMODE_MT=1` is set
+(the default for this sample).
 
 #### Kernel object allocation (`platform_internal.h`)
 
-Under `CONFIG_USERSPACE + CONFIG_DYNAMIC_OBJECTS`, kernel objects (mutexes,
+When `WAMR_BUILD_ZEPHYR_USERMODE_MT=1` is set (required for user-mode multi-threaded
+or user-mode bh_queue use under `CONFIG_USERSPACE`), kernel objects (mutexes,
 semaphores, condvars) must be registered in the kernel object table for syscall
 validation. Statically allocated objects inside WAMR's heap are not registered
 and will fail with `-EINVAL`.
@@ -247,6 +264,11 @@ waiters, but does not destroy `thread_data`. `os_thread_join()` checks the flag:
 
 ### Linker configuration (`lib-wamr-zephyr/CMakeLists.txt`)
 
+When `WAMR_BUILD_ZEPHYR_USERMODE_MT=1` is set, WAMR uses Zephyr's native
+`k_condvar` instead of the original semaphore-based condvar implementation.
+This requires linker hints to ensure condvar symbols are extracted from
+`libkernel.a`.
+
 Zephyr links libraries in two sections:
 
 ```
@@ -298,7 +320,7 @@ west build -t run
 
 > Press `CTRL+a, x` to exit QEMU.
 
-Expected output:
+Expected output (multi-thread, flag=1, default):
 
 ```
 Hello world!
@@ -322,6 +344,52 @@ Starting 2 workers (WASM + bh_queue, 5 msgs each):
 Total: sent 10, received 10
 === Demo complete ===
 ```
+
+#### Single-thread mode (flag=1, USER_MODE_MULTITHREAD=OFF)
+
+To run the single-thread variant (one user-mode thread + bh_queue round trip):
+
+```shell
+west build -b qemu_x86 . -p always -- -DUSER_MODE_MULTITHREAD=OFF
+west build -t run
+```
+
+Expected output:
+
+```
+*** Booting Zephyr OS build v4.4.0-rc2 ***
+=== WAMR User-Mode Demo (single-thread) ===
+bh_queue created (user mode)
+  [recv] worker 0 seq 0 "app-st-msg"
+=== Demo complete ===
+```
+
+#### Demonstrating the failure mode (flag=0, USER_MODE_MULTITHREAD=OFF)
+
+To see what happens when `WAMR_BUILD_ZEPHYR_USERMODE_MT=0` (flag off) with
+single-thread mode:
+
+```shell
+west build -b qemu_x86 . -p always -- -DWAMR_BUILD_ZEPHYR_USERMODE_MT=0 -DUSER_MODE_MULTITHREAD=OFF
+west build -t run
+```
+
+Expected output (fault at `k_mutex_init` inside `bh_queue_create`):
+
+```
+*** Booting Zephyr OS build v4.4.0-rc2 ***
+=== WAMR User-Mode Demo (single-thread) ===
+[00:00:00.020,000] <err> os: 0x... is not a valid k_mutex
+[00:00:00.020,000] <err> os: address is not a known kernel object
+[00:00:00.020,000] <err> os: syscall z_vrfy_k_mutex_init failed check: access denied
+```
+
+The demo starts but faults when attempting to create the bh_queue because the
+mutex is not registered in the kernel object table. This demonstrates why
+`WAMR_BUILD_ZEPHYR_USERMODE_MT=1` is required for user-mode bh_queue use.
+
+Attempting to build with `WAMR_BUILD_ZEPHYR_USERMODE_MT=0` and
+`USER_MODE_MULTITHREAD=ON` will be rejected by CMake with an error message.
 
 #### qemu_arc (ARC HS)
 
