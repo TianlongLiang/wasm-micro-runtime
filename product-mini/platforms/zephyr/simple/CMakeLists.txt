@@ -32,9 +32,13 @@ if (NOT DEFINED WAMR_BUILD_LIBC_BUILTIN)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_LIBC_WASI)
-  # Disable libc wasi support by default, in the future, 
+  # Disable libc wasi support by default, in the future,
   # it can be enabled if libc wasi file/socket/lock support is ready on Zephyr platform
   set (WAMR_BUILD_LIBC_WASI 0)
+endif ()
+
+if (NOT DEFINED WAMR_BUILD_THREAD_MGR)
+  set (WAMR_BUILD_THREAD_MGR 1)
 endif ()
 
 if (WAMR_BUILD_TARGET STREQUAL "RISCV64_LP64" OR WAMR_BUILD_TARGET STREQUAL "RISCV32_ILP32")
