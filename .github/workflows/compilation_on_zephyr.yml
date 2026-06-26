@@ -71,19 +71,28 @@ jobs:
             target: X86_32
             toolchains: x86_64-zephyr-elf
         # -- Sample variant --
+        #
+        # `verify` is a space-separated list of stdout strings the runner
+        # asserts (logical AND). Each variant asserts banner + a key
+        # mid-demo event + completion banner — three points is enough to
+        # catch silent corruption without being fragile to interleave order.
         sample:
-          - name: simple
+          - name: simple (kernel-MT)
             path: simple
             extra_cmake: ""
-            verify: '"Hello world!" "elapsed"'
-          - name: user-mode
+            verify: '"=== simple kernel-mode MT demo:" "[recv] worker" "=== simple demo complete: received 4 msgs ==="'
+          - name: user-mode (MT default)
             path: user-mode
             extra_cmake: ""
-            verify: '"Hello world!" "elapsed"'
-          - name: user-mode prebuilt
+            verify: '"=== WAMR User-Mode MT + bh_queue Demo ===" "bh_queue created (user mode)" "=== MT Demo complete ==="'
+          - name: user-mode (ST)
+            path: user-mode
+            extra_cmake: "-DUSER_MODE_MULTITHREAD=OFF"
+            verify: '"=== WAMR User-Mode ST + bh_queue Demo ===" "bh_queue created (user mode)" "=== ST Demo complete ==="'
+          - name: user-mode (MT prebuilt)
             path: user-mode
             extra_cmake: "-DWAMR_USE_PREBUILT_LIB=1"
-            verify: '"Hello world!" "elapsed"'
+            verify: '"=== WAMR User-Mode MT + bh_queue Demo ===" "bh_queue created (user mode)" "=== MT Demo complete ==="'
     name: ${{ matrix.sample.name }} (${{ matrix.arch.name }})
     container:
       # For Zephyr 3.7 LTS, use the v0.26-branch or the latest v0.26.x release Docker image.
@@ -132,6 +141,9 @@ jobs:
             -DWAMR_BUILD_TARGET=${{ matrix.arch.target }} ${{ matrix.sample.extra_cmake }}
           popd
 
+          # 30s timeout: ARC's QEMU is slower than x86, and the MT
+          # variants do 2 workers × 5 messages = 10 round trips plus
+          # WASM module execution per worker.
           .github/scripts/run_qemu_and_verify.sh \
-            product-mini/platforms/zephyr/${{ matrix.sample.path }}/build 10 ${{ matrix.sample.verify }}
+            product-mini/platforms/zephyr/${{ matrix.sample.path }}/build 30 ${{ matrix.sample.verify }}
         working-directory: modules/wasm-micro-runtime
