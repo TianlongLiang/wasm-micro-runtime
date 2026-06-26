@@ -85,6 +85,12 @@ iwasm_main_st(void)
 
     wasm_application_execute_main(inst, 0, NULL);
 
+    /* Under CONFIG_USERSPACE, bh_queue_create internally calls k_mutex_init
+     * on a BH_MALLOC'd mutex. With flag=0, the mutex is unregistered in the
+     * kernel object table, causing z_vrfy_k_mutex_init to fail with
+     * "not a valid k_mutex / address is not a known kernel object".
+     * With flag=1, the mutex is allocated via k_object_alloc(K_OBJ_MUTEX),
+     * which registers it, so validation succeeds. */
     queue = bh_queue_create();
     if (!queue) {
         printk("queue create failed\n");
@@ -107,11 +113,6 @@ iwasm_main_st(void)
     /* bh_post_msg takes ownership on success */
     msg = NULL;
 
-    /* This is where flag=0 faults: bh_get_msg's condvar wait calls
-     * k_condvar_wait, which validates the (unregistered, in WAMR heap)
-     * condvar against the kernel object table and fails. With flag=1,
-     * the condvar was allocated via k_object_alloc and validation
-     * succeeds. */
     bmsg = bh_get_msg(queue, BHT_WAIT_FOREVER);
     if (bmsg) {
         struct test_msg *got = (struct test_msg *)bh_message_payload(bmsg);
