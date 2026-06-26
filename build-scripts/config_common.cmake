@@ -783,6 +783,14 @@ if (WAMR_BUILD_BRANCH_HINTS EQUAL 1)
   message ("     Branch hints enabled")
   add_definitions(-DWASM_ENABLE_BRANCH_HINTS=1)
 endif ()
+if (WAMR_BUILD_ZEPHYR_USERMODE_MT EQUAL 1)
+  if (NOT WAMR_BUILD_PLATFORM STREQUAL "zephyr")
+    message (FATAL_ERROR
+      "WAMR_BUILD_ZEPHYR_USERMODE_MT is only valid on the zephyr platform")
+  endif ()
+  add_definitions (-DWAMR_BUILD_ZEPHYR_USERMODE_MT=1)
+  message ("     Zephyr user-mode multi-thread enabled (dynamic kobject allocation)")
+endif ()
 
 ########################################
 # Show Phase4 Wasm proposals status.
