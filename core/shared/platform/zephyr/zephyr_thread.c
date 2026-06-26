@@ -6,6 +6,7 @@
 
 #include "platform_api_vmcore.h"
 #include "platform_api_extension.h"
+#include "zephyr_thread_internal.h"
 
 /* clang-format off */
 #define bh_assert(v) do {                                   \
@@ -65,6 +66,18 @@ mpu_stack_free(char *stack)
     }
     zmutex_unlock(&mpu_stack_lock);
 }
+
+/*
+ * Helper consumed by zephyr_thread_usermode.c: exposes addresses of the
+ * static MPU stack array without making the array itself externally visible.
+ */
+void *
+mpu_stack_addr(int i)
+{
+    if (i < 0 || i >= BH_ZEPHYR_MPU_STACK_COUNT)
+        return NULL;
+    return (void *)mpu_stacks[i];
+}
 #endif
 
 typedef struct os_thread_wait_node {
@@ -95,13 +108,30 @@ typedef struct os_thread_data {
 #endif
 } os_thread_data;
 
-typedef struct os_thread_obj {
-    struct k_thread thread;
-    /* Whether the thread is terminated and this thread object is to
-     be freed in the future. */
+/*
+ * Unified thread-tracking node.
+ *
+ * Kernel-mode path: this node *is* the k_thread storage. The union puts
+ * struct k_thread at offset 0 so (korp_tid)&node->thread round-trips
+ * back to the node pointer.
+ *
+ * User-mode path (WAMR_BUILD_ZEPHYR_USERMODE_MT): the k_thread is
+ * allocated separately via k_object_alloc and referenced via dyn_tid.
+ * is_dyn discriminates the two branches.
+ */
+typedef struct thread_obj_node {
+    union {
+        struct k_thread thread; /* used when is_dyn == false */
+        korp_tid dyn_tid;       /* used when is_dyn == true  */
+    };
+    /* Whether the thread is terminated and this node is to be freed
+     * in the future. */
     bool to_be_freed;
-    struct os_thread_obj *next;
-} os_thread_obj;
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
+    bool is_dyn;
+#endif
+    struct thread_obj_node *next;
+} thread_obj_node;
 
 static bool is_thread_sys_inited = false;
 
@@ -117,8 +147,8 @@ static os_thread_data *thread_data_list = NULL;
 /* Lock for thread object list */
 static zmutex_t thread_obj_lock;
 
-/* Thread object list */
-static os_thread_obj *thread_obj_list = NULL;
+/* Thread object list (unified for kernel-mode and user-mode threads) */
+static thread_obj_node *thread_obj_list = NULL;
 
 static void
 thread_data_list_add(os_thread_data *thread_data)
@@ -163,9 +193,7 @@ thread_data_list_remove(os_thread_data *thread_data)
     zmutex_unlock(&thread_data_lock);
 }
 
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-static void dyn_thread_mark_freed(korp_tid tid);
-#endif
+static void thread_obj_list_mark_freed(korp_tid tid);
 
 /* Release all resources associated with exited thread data.
  * Called by os_thread_join after the join is complete, or during
@@ -174,12 +202,10 @@ static void
 thread_data_destroy(os_thread_data *thread_data)
 {
     thread_data_list_remove(thread_data);
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-    if (k_is_user_context())
-        dyn_thread_mark_freed(thread_data->tid);
-    else
-#endif
-        ((os_thread_obj *)thread_data->tid)->to_be_freed = true;
+    /* Mark the matching node for deferred reclaim. Works for both
+     * kernel-mode (tid is &node->thread) and user-mode (we look up
+     * the node by its dyn_tid). */
+    thread_obj_list_mark_freed(thread_data->tid);
 #if BH_ENABLE_ZEPHYR_MPU_STACK != 0
     mpu_stack_free(thread_data->stack);
 #endif
@@ -206,83 +232,33 @@ thread_data_list_lookup(k_tid_t tid)
 }
 
 static void
-thread_obj_list_add(os_thread_obj *thread_obj)
+thread_obj_list_add_node(thread_obj_node *node)
 {
     zmutex_lock(&thread_obj_lock, K_FOREVER);
     if (!thread_obj_list)
-        thread_obj_list = thread_obj;
+        thread_obj_list = node;
     else {
         /* Set as head of list */
-        thread_obj->next = thread_obj_list;
-        thread_obj_list = thread_obj;
+        node->next = thread_obj_list;
+        thread_obj_list = node;
     }
     zmutex_unlock(&thread_obj_lock);
 }
 
 static void
-thread_obj_list_reclaim()
+thread_obj_list_mark_freed(korp_tid tid)
 {
-    os_thread_obj *p, *p_prev;
+    thread_obj_node *p;
     zmutex_lock(&thread_obj_lock, K_FOREVER);
-    p_prev = NULL;
     p = thread_obj_list;
     while (p) {
-        if (p->to_be_freed) {
-            if (p_prev == NULL) { /* p is the head of list */
-                thread_obj_list = p->next;
-                BH_FREE(p);
-                p = thread_obj_list;
-            }
-            else { /* p is not the head of list */
-                p_prev->next = p->next;
-                BH_FREE(p);
-                p = p_prev->next;
-            }
-        }
-        else {
-            p_prev = p;
-            p = p->next;
-        }
-    }
-    zmutex_unlock(&thread_obj_lock);
-}
-
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-/*
- * Under user mode, k_thread objects must be allocated via k_object_alloc
- * rather than BH_MALLOC, so they aren't wrapped in os_thread_obj. Track
- * them separately for deferred cleanup (k_object_release).
- */
-struct dyn_thread_node {
-    korp_tid tid;
-    bool to_be_freed;
-    struct dyn_thread_node *next;
-};
-
-static struct dyn_thread_node *dyn_thread_list = NULL;
-
-static void
-dyn_thread_list_add(korp_tid tid)
-{
-    struct dyn_thread_node *node = BH_MALLOC(sizeof(struct dyn_thread_node));
-    if (node) {
-        node->tid = tid;
-        node->to_be_freed = false;
-        zmutex_lock(&thread_obj_lock, K_FOREVER);
-        node->next = dyn_thread_list;
-        dyn_thread_list = node;
-        zmutex_unlock(&thread_obj_lock);
-    }
-}
-
-static void
-dyn_thread_mark_freed(korp_tid tid)
-{
-    struct dyn_thread_node *p;
-    zmutex_lock(&thread_obj_lock, K_FOREVER);
-    p = dyn_thread_list;
-    while (p) {
-        if (p->tid == tid) {
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
+        bool match = p->is_dyn ? (p->dyn_tid == tid)
+                               : ((korp_tid)&p->thread == tid);
+#else
+        bool match = ((korp_tid)&p->thread == tid);
+#endif
+        if (match) {
             p->to_be_freed = true;
             break;
         }
@@ -292,31 +268,33 @@ dyn_thread_mark_freed(korp_tid tid)
 }
 
 static void
-dyn_thread_list_reclaim(void)
+thread_obj_list_reclaim(void)
 {
-    struct dyn_thread_node *p, *prev;
+    thread_obj_node *p, *p_prev;
     zmutex_lock(&thread_obj_lock, K_FOREVER);
-    prev = NULL;
-    p = dyn_thread_list;
+    p_prev = NULL;
+    p = thread_obj_list;
     while (p) {
         if (p->to_be_freed) {
-            struct dyn_thread_node *next = p->next;
-            k_object_release(p->tid);
+            thread_obj_node *next = p->next;
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
+            if (p->is_dyn)
+                dyn_thread_release(p->dyn_tid);
+#endif
             BH_FREE(p);
-            if (prev)
-                prev->next = next;
+            if (p_prev == NULL)
+                thread_obj_list = next;
             else
-                dyn_thread_list = next;
+                p_prev->next = next;
             p = next;
         }
         else {
-            prev = p;
+            p_prev = p;
             p = p->next;
         }
     }
     zmutex_unlock(&thread_obj_lock);
 }
-#endif /* CONFIG_USERSPACE && CONFIG_DYNAMIC_OBJECTS */
 
 int
 os_thread_sys_init()
@@ -347,37 +325,6 @@ os_thread_sys_destroy(void)
         is_thread_sys_inited = false;
     }
 }
-
-#if defined(CONFIG_USERSPACE)
-/*
- * Prepare a user-mode thread to call os_thread_create().
- *
- * os_thread_create uses static MPU-aligned stacks (mpu_stacks[]) defined
- * via K_THREAD_STACK_ARRAY_DEFINE. These are Zephyr kernel objects.
- * When a user-mode thread calls k_thread_create(), Zephyr's syscall
- * validation checks that the *calling* thread has permission to use the
- * stack object being passed — not just the child thread.
- *
- * This is a chicken-and-egg problem: the user-mode thread needs stack
- * access to create child threads, but can't grant it to itself because
- * it doesn't have access yet. So this must be called from supervisor
- * (kernel) mode before the target thread starts.
- *
- * Note: mpu_stack_alloc() inside os_thread_create picks which stack
- * slot to use — that works fine from user mode since it's just array
- * indexing. The permission check happens later in k_thread_create().
- */
-void
-os_thread_env_init_for_usermode(k_tid_t tid)
-{
-#if BH_ENABLE_ZEPHYR_MPU_STACK != 0
-    int i;
-    for (i = 0; i < BH_ZEPHYR_MPU_STACK_COUNT; i++) {
-        k_object_access_grant(mpu_stacks[i], tid);
-    }
-#endif
-}
-#endif /* CONFIG_USERSPACE */
 
 static os_thread_data *
 thread_data_current()
@@ -437,10 +384,11 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
                            void *arg, unsigned int stack_size, int prio)
 {
     korp_tid tid;
+    thread_obj_node *node;
     os_thread_data *thread_data;
     unsigned thread_data_size;
     int options = 0;
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     bool is_user_mode = k_is_user_context();
 #endif
 
@@ -449,26 +397,29 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
 
     /* Free the thread objects of terminated threads */
     thread_obj_list_reclaim();
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-    dyn_thread_list_reclaim();
-#endif
 
-    /* Create and initialize thread object.
-     * Under user mode, k_thread must be allocated via k_object_alloc so
-     * the kernel object table registers it for syscall validation. */
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+    /* Allocate the unified tracking node. */
+    if (!(node = BH_MALLOC(sizeof(thread_obj_node))))
+        return BHT_ERROR;
+    memset(node, 0, sizeof(*node));
+
+    /* Decide which arm of the union backs the k_thread:
+     *   kernel-mode: the embedded struct k_thread at offset 0 of node.
+     *   user-mode  : a k_object_alloc'd k_thread referenced via dyn_tid. */
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     if (is_user_mode) {
-        tid = k_object_alloc(K_OBJ_THREAD);
-        if (!tid)
+        node->is_dyn = true;
+        if (!(node->dyn_tid = dyn_thread_alloc())) {
+            BH_FREE(node);
             return BHT_ERROR;
+        }
+        tid = node->dyn_tid;
         options = K_USER | K_INHERIT_PERMS;
     }
     else
 #endif
     {
-        if (!(tid = BH_MALLOC(sizeof(os_thread_obj))))
-            return BHT_ERROR;
-        memset(tid, 0, sizeof(os_thread_obj));
+        tid = (korp_tid)&node->thread;
     }
 
     /* Create and initialize thread data */
@@ -508,12 +459,7 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
 
     /* Set thread custom data */
     thread_data_list_add(thread_data);
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-    if (is_user_mode)
-        dyn_thread_list_add(tid);
-    else
-#endif
-        thread_obj_list_add((os_thread_obj *)tid);
+    thread_obj_list_add_node(node);
     *p_tid = tid;
     return BHT_OK;
 
@@ -524,12 +470,11 @@ fail2:
 #endif
     BH_FREE(thread_data);
 fail1:
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
-    if (is_user_mode)
-        k_object_release(tid);
-    else
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
+    if (node->is_dyn)
+        dyn_thread_release(node->dyn_tid);
 #endif
-        BH_FREE(tid);
+    BH_FREE(node);
     return BHT_ERROR;
 }
 
@@ -569,7 +514,7 @@ os_thread_join(korp_tid thread, void **value_ptr)
         return BHT_ERROR;
 
     zsem_init(&node->sem, 0, 1);
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     if (!node->sem) {
         BH_FREE(node);
         return BHT_ERROR;
@@ -616,7 +561,7 @@ int
 os_mutex_init(korp_mutex *mutex)
 {
     zmutex_init(mutex);
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     if (!*mutex)
         return BHT_ERROR;
 #endif
@@ -627,7 +572,7 @@ int
 os_recursive_mutex_init(korp_mutex *mutex)
 {
     zmutex_init(mutex);
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     if (!*mutex)
         return BHT_ERROR;
 #endif
@@ -661,7 +606,7 @@ os_mutex_unlock(korp_mutex *mutex)
 int
 os_cond_init(korp_cond *cond)
 {
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     cond->condvar = k_object_alloc(K_OBJ_CONDVAR);
     if (!cond->condvar)
         return BHT_ERROR;
@@ -676,7 +621,7 @@ os_cond_init(korp_cond *cond)
 int
 os_cond_destroy(korp_cond *cond)
 {
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     if (cond->condvar) {
         k_object_release(cond->condvar);
         cond->condvar = NULL;
@@ -688,7 +633,7 @@ os_cond_destroy(korp_cond *cond)
 static int
 os_cond_wait_internal(korp_cond *cond, korp_mutex *mutex, bool timed, int mills)
 {
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     /* k_condvar_wait atomically unlocks mutex, blocks, re-locks on wake.
      * mutex is korp_mutex* = struct k_mutex**, so *mutex = struct k_mutex*. */
     k_timeout_t timeout = timed ? Z_TIMEOUT_MS(mills) : K_FOREVER;
@@ -736,7 +681,7 @@ os_cond_wait_internal(korp_cond *cond, korp_mutex *mutex, bool timed, int mills)
     zmutex_unlock(&cond->wait_list_lock);
 
     return BHT_OK;
-#endif /* CONFIG_USERSPACE && CONFIG_DYNAMIC_OBJECTS */
+#endif /* WAMR_BUILD_ZEPHYR_USERMODE_MT */
 }
 
 int
@@ -771,7 +716,7 @@ os_cond_reltimedwait(korp_cond *cond, korp_mutex *mutex, uint64 useconds)
 int
 os_cond_signal(korp_cond *cond)
 {
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     k_condvar_signal(cond->condvar);
 #else
     /* Signal the head wait node of wait list */
@@ -877,7 +822,7 @@ os_thread_exit(void *retval)
 int
 os_cond_broadcast(korp_cond *cond)
 {
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
     k_condvar_broadcast(cond->condvar);
 #else
     os_thread_wait_node *node;
