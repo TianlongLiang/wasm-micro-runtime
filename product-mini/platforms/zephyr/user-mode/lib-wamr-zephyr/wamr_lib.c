@@ -37,12 +37,112 @@ struct worker_ctx {
 };
 
 /*
+ * Single-thread variant: init runtime, instantiate one module,
+ * run main, then one bh_queue round trip to exercise the
+ * condvar code path under user mode.
+ *
+ * bh_queue ownership: bh_post_msg stores the body pointer directly;
+ * on success, the queue owns it. bh_free_msg frees both node and body.
+ * Producer frees payload only if post fails.
+ */
+static void
+iwasm_main_st(void)
+{
+    RuntimeInitArgs init_args;
+    wasm_module_t module = NULL;
+    wasm_module_inst_t inst = NULL;
+    bh_queue *queue = NULL;
+    char error_buf[128];
+    struct test_msg *msg = NULL;
+    bh_message_t bmsg;
+
+    printk("=== WAMR User-Mode ST + bh_queue Demo ===\n");
+
+    memset(&init_args, 0, sizeof(init_args));
+    init_args.mem_alloc_type = Alloc_With_Pool;
+    init_args.mem_alloc_option.pool.heap_buf = global_heap_buf;
+    init_args.mem_alloc_option.pool.heap_size = sizeof(global_heap_buf);
+
+    if (!wasm_runtime_full_init(&init_args)) {
+        printk("WAMR init failed\n");
+        return;
+    }
+
+    module = wasm_runtime_load((uint8_t *)wasm_test_file,
+                               sizeof(wasm_test_file), error_buf,
+                               sizeof(error_buf));
+    if (!module) {
+        printk("load failed: %s\n", error_buf);
+        goto cleanup;
+    }
+
+    inst = wasm_runtime_instantiate(module, APP_STACK_SIZE, APP_HEAP_SIZE,
+                                    error_buf, sizeof(error_buf));
+    if (!inst) {
+        printk("instantiate failed: %s\n", error_buf);
+        goto cleanup;
+    }
+
+    wasm_application_execute_main(inst, 0, NULL);
+
+    queue = bh_queue_create();
+    if (!queue) {
+        printk("queue create failed\n");
+        goto cleanup;
+    }
+    printk("bh_queue created (user mode)\n");
+
+    msg = wasm_runtime_malloc(sizeof(struct test_msg));
+    if (!msg)
+        goto cleanup;
+    msg->worker_id = 0;
+    msg->seq = 0;
+    snprintf(msg->payload, sizeof(msg->payload), "st-msg");
+    if (!bh_post_msg(queue, 0, msg, sizeof(struct test_msg))) {
+        wasm_runtime_free(msg);
+        msg = NULL;
+        printk("post failed\n");
+        goto cleanup;
+    }
+    /* bh_post_msg takes ownership on success */
+    msg = NULL;
+
+    /* This is where flag=0 faults: bh_get_msg's condvar wait calls
+     * k_condvar_wait, which validates the (unregistered, in WAMR heap)
+     * condvar against the kernel object table and fails. With flag=1,
+     * the condvar was allocated via k_object_alloc and validation
+     * succeeds. */
+    bmsg = bh_get_msg(queue, BHT_WAIT_FOREVER);
+    if (bmsg) {
+        struct test_msg *got = (struct test_msg *)bh_message_payload(bmsg);
+        printk("  [recv] worker %d seq %d \"%s\"\n",
+               got->worker_id, got->seq, got->payload);
+        bh_free_msg(bmsg);
+    }
+
+cleanup:
+    if (msg)
+        wasm_runtime_free(msg);
+    if (queue)
+        bh_queue_destroy(queue);
+    if (inst)
+        wasm_runtime_deinstantiate(inst);
+    if (module)
+        wasm_runtime_unload(module);
+    wasm_runtime_destroy();
+    printk("=== ST Demo complete ===\n");
+}
+
+/*
  * Worker thread: each worker instantiates the WASM module, runs its main
  * function, then sends messages to the shared bh_queue.
  *
  * Created via os_thread_create — under CONFIG_USERSPACE, this sets
  * K_USER | K_INHERIT_PERMS so the worker inherits access to bh_queue's
  * internal mutex/condvar and the WAMR heap lock.
+ *
+ * bh_queue ownership: same as ST — post takes ownership on success,
+ * producer frees only on failure.
  */
 static void *
 worker_entry(void *arg)
@@ -90,6 +190,7 @@ worker_entry(void *arg)
             wasm_runtime_free(msg);
             break;
         }
+        /* bh_post_msg took ownership; do not free msg here */
     }
 
     wasm_runtime_deinstantiate(inst);
@@ -97,17 +198,17 @@ worker_entry(void *arg)
 }
 
 /*
- * WAMR main entry point — runs in user mode.
- * arg1 = number of worker threads (cast from intptr_t).
+ * Multi-thread variant: spawns worker threads that each run the WASM app
+ * then send messages via bh_queue. Main thread dequeues messages using
+ * blocking condvar wait.
  *
- * Initializes WAMR runtime, loads the WASM module, spawns worker threads
- * that each run the WASM app then send messages via bh_queue, and
- * dequeues messages using blocking condvar wait.
+ * Consumer ownership: bh_get_msg returns a message; the payload is accessed
+ * via bh_message_payload. bh_free_msg frees both the node and the body —
+ * consumer must NOT separately free the payload.
  */
-void
-iwasm_main(void *arg1, void *arg2, void *arg3)
+static void
+iwasm_main_mt(int num_workers)
 {
-    int num_workers = (int)(intptr_t)arg1;
     RuntimeInitArgs init_args;
     wasm_module_t module = NULL;
     bh_queue *queue = NULL;
@@ -117,14 +218,11 @@ iwasm_main(void *arg1, void *arg2, void *arg3)
     int i, total_dequeued = 0;
     int expected;
 
-    (void)arg2;
-    (void)arg3;
-
     if (num_workers <= 0)
         num_workers = 2;
     expected = num_workers * MSGS_PER_WORKER;
 
-    printk("=== WAMR User-Mode Demo ===\n");
+    printk("=== WAMR User-Mode MT + bh_queue Demo ===\n");
 
     /* Initialize WAMR runtime */
     memset(&init_args, 0, sizeof(RuntimeInitArgs));
@@ -216,5 +314,22 @@ cleanup:
     if (module)
         wasm_runtime_unload(module);
     wasm_runtime_destroy();
-    printk("=== Demo complete ===\n");
+    printk("=== MT Demo complete ===\n");
+}
+
+/*
+ * Dispatcher — what kernel main() spawns.
+ * Picks between ST and MT variants based on USER_MODE_MULTITHREAD define.
+ */
+void
+iwasm_main(void *arg1, void *arg2, void *arg3)
+{
+    (void)arg2;
+    (void)arg3;
+#ifdef USER_MODE_MULTITHREAD
+    iwasm_main_mt((int)(intptr_t)arg1);
+#else
+    (void)arg1;
+    iwasm_main_st();
+#endif
 }

@@ -83,27 +83,3 @@ endif()
 if (NOT WAMR_USE_PREBUILT_LIB)
   zephyr_library_app_memory (wamr_partition)
 endif ()
-
-# Under CONFIG_USERSPACE + CONFIG_DYNAMIC_OBJECTS, WAMR uses k_condvar
-# (via k_object_alloc + k_condvar_init/signal/wait/broadcast).
-#
-# Zephyr links libraries in two sections:
-#   --whole-archive   : app, libzephyr.a, drivers, libc  (all symbols kept)
-#   --no-whole-archive: libkernel.a, then wamr_lib.a     (on-demand extraction)
-#
-# k_mutex and k_sem survive because Zephyr's own --whole-archive code
-# (picolibc locks.c, mpsc_pbuf.c) already references them, so the linker
-# extracts those .o files from libkernel.a during its single pass.
-#
-# k_condvar has no such reference — nothing in Zephyr's core uses it.
-# By the time the linker reaches wamr_lib.a, the condvar .o in libkernel.a
-# has already been skipped. --undefined pre-marks these symbols as needed
-# so the linker extracts them when it scans libkernel.a.
-if (CONFIG_USERSPACE AND CONFIG_DYNAMIC_OBJECTS)
-  zephyr_link_libraries(
-    -Wl,--undefined=z_impl_k_condvar_init
-    -Wl,--undefined=z_impl_k_condvar_signal
-    -Wl,--undefined=z_impl_k_condvar_wait
-    -Wl,--undefined=z_impl_k_condvar_broadcast
-  )
-endif ()

@@ -28,8 +28,9 @@ iwasm_main(void *arg1, void *arg2, void *arg3);
  * because k_thread_create validates that the *calling* thread has
  * permission to the stack object being passed. Must be called from
  * kernel mode before the thread starts.
- * Defined in core/shared/platform/zephyr/zephyr_thread.c. */
-#if defined(CONFIG_USERSPACE)
+ * Defined in core/shared/platform/zephyr/zephyr_thread_usermode.c,
+ * only compiled when WAMR_BUILD_ZEPHYR_USERMODE_MT=1. */
+#if WAMR_BUILD_ZEPHYR_USERMODE_MT
 extern void
 os_thread_env_init_for_usermode(k_tid_t tid);
 #endif
@@ -54,7 +55,9 @@ main(void)
 
     k_mem_domain_add_thread(&wamr_domain, tid);
 
+#if WAMR_BUILD_ZEPHYR_USERMODE_MT
     os_thread_env_init_for_usermode(tid);
+#endif
 
 #if KERNEL_VERSION_NUMBER >= 0x040000
     k_wakeup(tid);
