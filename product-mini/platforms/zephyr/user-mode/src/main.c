@@ -29,8 +29,14 @@ iwasm_main(void *arg1, void *arg2, void *arg3);
  * permission to the stack object being passed. Must be called from
  * kernel mode before the thread starts.
  * Defined in core/shared/platform/zephyr/zephyr_thread_usermode.c,
- * only compiled when WAMR_BUILD_ZEPHYR_USERMODE_MT=1. */
-#if WAMR_BUILD_ZEPHYR_USERMODE_MT
+ * only compiled when WAMR_BUILD_ZEPHYR_USERMODE_MT=1.
+ *
+ * Gating note: WAMR_BUILD_ZEPHYR_USERMODE_MT is added to the WAMR-library
+ * scope by config_common.cmake but is NOT propagated to the app target
+ * compiling this file. USER_MODE_MULTITHREAD is the app-scope macro and
+ * the CMake consistency check guarantees USER_MODE_MULTITHREAD=ON implies
+ * the platform flag is on, so the two are equivalent here. */
+#ifdef USER_MODE_MULTITHREAD
 extern void
 os_thread_env_init_for_usermode(k_tid_t tid);
 #endif
@@ -55,7 +61,7 @@ main(void)
 
     k_mem_domain_add_thread(&wamr_domain, tid);
 
-#if WAMR_BUILD_ZEPHYR_USERMODE_MT
+#ifdef USER_MODE_MULTITHREAD
     os_thread_env_init_for_usermode(tid);
 #endif
 

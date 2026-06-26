@@ -216,7 +216,7 @@ Hello world!
 buf ptr: 0x1458
 buf: 1234
 *** Booting Zephyr OS build v4.4.0-rc2 ***
-=== WAMR User-Mode Demo ===
+=== WAMR User-Mode MT + bh_queue Demo ===
 bh_queue created (user mode)
 
 Starting 2 workers (WASM + bh_queue, 5 msgs each):
@@ -228,7 +228,7 @@ Starting 2 workers (WASM + bh_queue, 5 msgs each):
   [recv] #1 from worker 1 seq 0 "w1-msg0"
   ...
 Total: sent 10, received 10
-=== Demo complete ===
+=== MT Demo complete ===
 ```
 
 #### Single-thread mode (flag=1, USER_MODE_MULTITHREAD=OFF)
@@ -244,10 +244,10 @@ Expected output:
 
 ```
 *** Booting Zephyr OS build v4.4.0-rc2 ***
-=== WAMR User-Mode Demo (single-thread) ===
+=== WAMR User-Mode ST + bh_queue Demo ===
 bh_queue created (user mode)
-  [recv] worker 0 seq 0 "app-st-msg"
-=== Demo complete ===
+  [recv] worker 0 seq 0 "st-msg"
+=== ST Demo complete ===
 ```
 
 #### Demonstrating the failure mode (flag=0, USER_MODE_MULTITHREAD=OFF)
@@ -264,7 +264,7 @@ Expected output (fault at `k_mutex_init` inside `bh_queue_create`):
 
 ```
 *** Booting Zephyr OS build v4.4.0-rc2 ***
-=== WAMR User-Mode Demo (single-thread) ===
+=== WAMR User-Mode ST + bh_queue Demo ===
 [00:00:00.020,000] <err> os: 0x... is not a valid k_mutex
 [00:00:00.020,000] <err> os: address is not a known kernel object
 [00:00:00.020,000] <err> os: syscall z_vrfy_k_mutex_init failed check: access denied
