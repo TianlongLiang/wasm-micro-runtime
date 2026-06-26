@@ -131,7 +131,7 @@
  * threads can be granted access via k_thread_access_grant().
  */
 
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
 /*
  * Under CONFIG_USERSPACE, kernel objects must be registered in the kernel
  * object table for syscall validation. Use k_object_alloc to dynamically
@@ -178,7 +178,7 @@
         }                             \
     } while (0)
 
-#else /* !CONFIG_USERSPACE || !CONFIG_DYNAMIC_OBJECTS */
+#else /* !WAMR_BUILD_ZEPHYR_USERMODE_MT */
 
 #define zmutex_t struct k_mutex
 #define zmutex_init(mtx) k_mutex_init(mtx)
@@ -193,7 +193,7 @@
 #define zsem_count_get(sem) k_sem_count_get(sem)
 #define zsem_destroy(sem) ((void)0)
 
-#endif /* CONFIG_USERSPACE && CONFIG_DYNAMIC_OBJECTS */
+#endif /* WAMR_BUILD_ZEPHYR_USERMODE_MT */
 
 #define BH_APPLET_PRESERVED_STACK_SIZE (2 * BH_KB)
 
@@ -210,7 +210,7 @@ typedef unsigned int korp_sem;
 struct os_thread_wait_node;
 typedef struct os_thread_wait_node *os_thread_wait_list;
 
-#if defined(CONFIG_USERSPACE) && defined(CONFIG_DYNAMIC_OBJECTS)
+#ifdef WAMR_BUILD_ZEPHYR_USERMODE_MT
 typedef struct korp_cond {
     struct k_condvar *condvar;
 } korp_cond;
