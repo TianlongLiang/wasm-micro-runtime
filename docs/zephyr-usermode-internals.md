@@ -73,10 +73,10 @@ Once kernel objects are properly registered, the next problem is: how do child t
 
 | | Kernel mode (original) | User mode (new) |
 |---|---|---|
-| Thread object | `BH_MALLOC(sizeof(os_thread_obj))` | `k_object_alloc(K_OBJ_THREAD)` |
+| Thread object | `BH_MALLOC(sizeof(thread_obj_node))` with embedded `struct k_thread` | `k_object_alloc(K_OBJ_THREAD)`, pointer stored in `thread_obj_node.dyn_tid` |
 | Thread flags | `0` | `K_USER \| K_INHERIT_PERMS` |
-| Object tracking | `os_thread_obj` list | Separate `dyn_thread_node` list |
-| Cleanup | `BH_FREE` | `k_object_release` |
+| Object tracking | Single unified `thread_obj_node` list with `is_dyn` discriminator (both modes share one list and one reclaim function) | Same list, `is_dyn = true` selects the release path |
+| Cleanup | `BH_FREE(node)` | `k_object_release(dyn_tid); BH_FREE(node)` |
 
 ### MPU Stack Chicken-and-Egg
 
@@ -183,6 +183,20 @@ The minimum that must remain in `main.c` is a single `K_APPMEM_PARTITION_DEFINE`
 | Failure mode if a config is missing | n/a | `iwasm_user_mode()` returns false with a clear `printk` |
 
 The dynamic path is the same path the multi-threaded user-mode work already takes for WAMR-internal kernel objects, so it doesn't add a new dependency category — just extends the existing one to the entry-point thread itself.
+
+### Why a "Pure Zephyr-App" User-Mode Sample Was Not Added
+
+During this work an attempt was made to add a separate sample (`product-mini/platforms/zephyr/user-mode-app/`) shaped like `simple/`: `target_sources(app PRIVATE ${WAMR_RUNTIME_LIB_SOURCE} src/main.c)`, with no `zephyr_library` and no `zephyr_library_app_memory(wamr_partition)`. The goal was to exercise the same flag-toggle demo (`WAMR_BUILD_ZEPHYR_USERMODE_MT=1` vs. `=0`) but in the simplest possible Zephyr-app layout.
+
+It does not work, and the obstacle is structural rather than fixable in a sample alone:
+
+- WAMR has many static globals (the heap pool, mutex pool, thread tracking lists, the `mpu_stacks` array, internal lookup tables, etc.). Under `CONFIG_USERSPACE`, any global that a user-mode thread reads or writes must live inside a memory partition the thread has access to. The Zephyr-native way to put a global into a partition is the `K_APP_DMEM(partition)` / `K_APP_BMEM(partition)` macros placed on the definition itself.
+- When WAMR is compiled directly into `app` via `target_sources(app ...)`, its `.data` and `.bss` sections land in the kernel's default sections, not in `wamr_partition`. Every WAMR-internal access from a user-mode thread then triggers an MPU fault.
+- Fixing this in the sample would require either (a) adding `K_APP_DMEM(wamr_partition)` to every WAMR-internal global definition — a core-WAMR change that couples the platform-agnostic runtime to Zephyr macros, or (b) post-hoc relocating WAMR's sections at link time, which is what `zephyr_library_app_memory(wamr_partition)` already does for a `zephyr_library`. Option (b) is the only sane choice — and once you take it, you are no longer in pure Zephyr-app shape; the WAMR runtime *is* a Zephyr library again, with only the application's `main.c` left on the `app` target.
+
+The end state — `wamr_lib` as a `zephyr_library` with `zephyr_library_app_memory(wamr_partition)`, application code on the `app` target — is what `product-mini/platforms/zephyr/user-mode/` already provides. A second sample with the same shape adds maintenance without adding coverage, so the sample was dropped. The flag-toggle demo (turning `WAMR_BUILD_ZEPHYR_USERMODE_MT` on and off) is exercised by `user-mode/` instead, which already builds in three of the four (flag × ST/MT) cells and rejects the fourth at CMake time.
+
+The takeaway for users targeting Zephyr: if WAMR sources are anywhere on the user-mode access path, they must be in a TU that goes through `zephyr_library_app_memory(...)`. Pulling WAMR into the `app` target directly works only for kernel-mode builds.
 
 ## Configuration Cheat Sheet
 
