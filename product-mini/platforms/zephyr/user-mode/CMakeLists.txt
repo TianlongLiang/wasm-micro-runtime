@@ -11,11 +11,6 @@ if (NOT DEFINED WAMR_BUILD_ZEPHYR_USERMODE_MT)
   set (WAMR_BUILD_ZEPHYR_USERMODE_MT 1 CACHE STRING "")
 endif ()
 
-# Propagate to main.c so it can guard os_thread_env_init_for_usermode call
-if (WAMR_BUILD_ZEPHYR_USERMODE_MT EQUAL 1)
-  add_definitions(-DWAMR_BUILD_ZEPHYR_USERMODE_MT=1)
-endif ()
-
 # Option: use pre-built library integration path.
 # The library is still compiled from source under lib-wamr-zephyr/, but instead
 # of relying on zephyr_library_app_memory() to register the partition, the

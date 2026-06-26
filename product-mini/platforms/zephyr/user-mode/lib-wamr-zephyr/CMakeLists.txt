@@ -44,7 +44,7 @@ if (NOT DEFINED WAMR_BUILD_GLOBAL_HEAP_SIZE)
   set (WAMR_BUILD_GLOBAL_HEAP_SIZE 65536) # 64 KB
 endif ()
 
-# Enable thread management for wasm_runtime_spawn_exec_env
+# Required by os_thread_create / os_thread_join used by the multi-thread demo
 if (NOT DEFINED WAMR_BUILD_THREAD_MGR)
   set (WAMR_BUILD_THREAD_MGR 1)
 endif ()

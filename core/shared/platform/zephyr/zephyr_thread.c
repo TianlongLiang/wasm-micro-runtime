@@ -356,8 +356,15 @@ os_thread_cleanup(void)
     zmutex_unlock(&thread_data->wait_list_lock);
 
     /* Don't remove thread_data here — os_thread_join may still need to
-     * find it via thread_data_list_lookup. The joiner will clean up, or
-     * it will be reclaimed by os_thread_cleanup_exited_data. */
+     * find it via thread_data_list_lookup. The joiner cleans it up via
+     * thread_data_destroy() after synchronization.
+     *
+     * Caveat: a thread that exits without ever being joined leaves its
+     * thread_data in the list. Both in-tree samples always join workers
+     * they spawn, so this is not exercised, but consumers that detach
+     * threads or fire-and-forget worker pools must arrange their own join
+     * eventually. os_thread_detach() is currently a no-op and does not
+     * solve this. */
 }
 
 static void
@@ -484,6 +491,8 @@ os_self_thread()
     return (korp_tid)k_current_get();
 }
 
+/* Note: not safe to call from multiple threads on the same korp_tid.
+ * Concurrent joins after the target exits will double-free thread_data. */
 int
 os_thread_join(korp_tid thread, void **value_ptr)
 {
@@ -807,6 +816,9 @@ os_rwlock_destroy(korp_rwlock *lock)
 int
 os_thread_detach(korp_tid thread)
 {
+    /* No-op: this platform does not implement detach semantics.
+     * thread_data is reclaimed only via os_thread_join. Avoid
+     * detaching if leak-free shutdown matters to the consumer. */
     (void)thread;
     return BHT_OK;
 }
