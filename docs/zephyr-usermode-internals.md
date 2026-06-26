@@ -198,6 +198,19 @@ The end state — `wamr_lib` as a `zephyr_library` with `zephyr_library_app_memo
 
 The takeaway for users targeting Zephyr: if WAMR sources are anywhere on the user-mode access path, they must be in a TU that goes through `zephyr_library_app_memory(...)`. Pulling WAMR into the `app` target directly works only for kernel-mode builds.
 
+### Why Not Split: Kernel-Mode WAMR Engine + User-Mode WASM Execution Thread
+
+A natural-looking third shape is to put the WAMR runtime (interpreter/AOT engine, heap, module loader) in kernel mode and run only the WASM execution itself in a user-mode thread, hoping to combine "no kobject-registration gymnastics for the engine" with "MPU isolation for the WASM sandbox". This does not work on Zephyr and is worth recording so the design isn't re-attempted:
+
+- **The interpreter and the WASM linear memory are not separable.** Every WASM opcode read, local-variable access, host-function dispatch, and heap allocation touches data structures that are intertwined with the WASM module instance. Splitting "engine code" from "module data" across modes would require a syscall on every opcode, which is performance-fatal even for trivial WASM programs.
+- **Zephyr has no cheap mode transition.** The only kernel→user transition is `k_thread_user_mode_enter()`, which is **terminal** — the calling thread becomes user mode permanently. The reverse direction is the syscall path, which targets kernel APIs registered at build time, not arbitrary WAMR functions. There is no `enter_user_mode_for_one_function()` primitive.
+- **Kernel-mode threads bypass the MPU.** A `wamr_partition` only restricts user-mode threads. If WAMR runs kernel-mode and the WASM linear memory lives in `wamr_partition`, the kernel-mode engine reads and writes the WASM heap unrestricted — which defeats the isolation goal the split was supposed to deliver.
+- **Cross-mode host-function calls would need custom syscalls.** Native imports, WAMR exception throw, GC barriers, and module lookup all live engine-side. A user-mode WASM thread calling back into the engine would need a hand-written `z_vrfy_*` validator per call site. Zephyr syscalls are not generic — they target specific kernel APIs.
+
+The Zephyr model offers two clean choices and no useful middle ground: **all kernel mode** (cheap, isolation rests on WAMR's bounds checking) or **all user mode** (more setup as documented above, isolation rests on both WAMR's bounds checking and the MPU partition). The hybrid path delivers strictly less isolation than the all-user shape at strictly higher complexity than the all-kernel shape. If you want stronger isolation than what an MPU partition can provide, you need a different OS (one with per-process MMU contexts), not a different WAMR layout.
+
+One narrower variant *can* be made to work but isn't documented as a sample yet: keep WAMR in kernel mode but place **only the WASM linear memory** (not the engine's data structures) into a `wamr_partition` and grant a user-mode "viewer" thread read access. The kernel-mode interpreter reads/writes the partition via plain pointers (kernel reads user memory freely), and a separate user-mode thread can inspect WASM memory without escalating. This protects host-side data from a hypothetically-compromised WASM module while keeping the engine fast — but requires modifying WAMR's heap allocator to place WASM-instance memory specifically in the partition, which is a core-WAMR change beyond what this branch is for.
+
 ## Configuration Cheat Sheet
 
 ### prj.conf for User-Mode Multi-Thread
