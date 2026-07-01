@@ -24,6 +24,18 @@
 
 static char global_heap_buf[CONFIG_GLOBAL_HEAP_BUF_SIZE] = { 0 };
 
+/* Probe: file-scope K_SEM_DEFINE inside a TU that goes through
+ * zephyr_library_app_memory(wamr_partition). Empirically confirmed
+ * that gperf DOES scan partitioned sections — this semaphore's
+ * address appears in the generated kobject_hash.gperf table and it
+ * works from user mode once access is granted from supervisor
+ * (see the k_object_access_grant call in src/main.c). This regression
+ * test catches any future change that would break gperf scanning of
+ * partitioned sections. See docs/zephyr-usermode-internals.md for the
+ * distinction between static K_*_DEFINE (works with grant) and
+ * heap-allocated kobjects (needs WAMR_BUILD_ZEPHYR_USERMODE_MT). */
+K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1);
+
 struct test_msg {
     int worker_id;
     int seq;
@@ -57,6 +69,19 @@ iwasm_main_st(void)
     bh_message_t bmsg;
 
     printk("=== WAMR User-Mode ST + bh_queue Demo ===\n");
+
+    /* Probe: exercise a file-scope K_SEM_DEFINE'd semaphore from user
+     * mode. src/main.c grants this thread access via
+     * k_object_access_grant before starting us. Both operations must
+     * succeed; a fault here would mean gperf stopped scanning
+     * partitioned sections and would break every downstream user of
+     * static K_SEM_DEFINE inside wamr_lib.c. */
+    k_sem_give(&wamr_partition_sem_probe);
+    if (k_sem_take(&wamr_partition_sem_probe, K_NO_WAIT) != 0) {
+        printk("[probe] FAIL: k_sem_take on granted, given-once sem returned non-zero\n");
+        return;
+    }
+    printk("[probe] OK: static K_SEM_DEFINE in partitioned TU works from user mode\n");
 
     memset(&init_args, 0, sizeof(init_args));
     init_args.mem_alloc_type = Alloc_With_Pool;

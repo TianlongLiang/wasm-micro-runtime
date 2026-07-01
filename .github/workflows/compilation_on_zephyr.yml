@@ -88,7 +88,10 @@ jobs:
           - name: user-mode (ST)
             path: user-mode
             extra_cmake: "-DUSER_MODE_MULTITHREAD=OFF"
-            verify: '"=== WAMR User-Mode ST + bh_queue Demo ===" "bh_queue created (user mode)" "=== ST Demo complete ==="'
+            # ST variant also asserts the K_SEM_DEFINE-in-partition probe
+            # runs successfully — regression guard for gperf scanning of
+            # zephyr_library_app_memory sections.
+            verify: '"=== WAMR User-Mode ST + bh_queue Demo ===" "[probe] OK: static K_SEM_DEFINE in partitioned TU works from user mode" "bh_queue created (user mode)" "=== ST Demo complete ==="'
           - name: user-mode (MT prebuilt)
             path: user-mode
             extra_cmake: "-DWAMR_USE_PREBUILT_LIB=1"

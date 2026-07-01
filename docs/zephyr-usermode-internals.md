@@ -11,20 +11,23 @@ Registration happens two ways:
 - **Static definitions** (`K_MUTEX_DEFINE`, `K_SEM_DEFINE`) are scanned at build time by a gperf-based tool that generates a perfect-hash table.
 - **Dynamic allocation** (`k_object_alloc`) registers at runtime into the same table.
 
-WAMR allocates all its internal kernel objects — the heap lock mutex, bh_queue's lock and condvar, thread join semaphores — **inside its own memory pool** via `BH_MALLOC`. These objects are invisible to Zephyr:
+WAMR allocates all its internal kernel objects — the heap lock mutex, bh_queue's lock and condvar, thread join semaphores — **inside its own memory pool** via `BH_MALLOC`. These objects are invisible to Zephyr because they don't exist as symbols at build time — they materialize at runtime inside a pool the kernel has no knowledge of. Neither gperf nor any other static registration mechanism can see them, and every syscall on them fails with `-EINVAL` or a protection fault.
 
-- They are not statically defined, so the gperf scanner never sees them.
-- They live inside `wamr_partition` app memory. Even if they were in `.bss`, the scanner doesn't scan partition sections.
-- Every syscall on these objects fails with `-EINVAL` or a protection fault.
+`zephyr_library_app_memory(wamr_partition)` in the platform CMake rewrites the linker rules so that **all globals** in `wamr_lib.a` go into the partition's `.data` / `.bss` sections. This is a section-remapping operation, not a visibility filter — the gperf scanner walks the whole ELF at build time regardless of section, so **file-scope `K_SEM_DEFINE` / `K_MUTEX_DEFINE` / `K_CONDVAR_DEFINE` inside `wamr_lib.c` are still gperf-visible and end up in the kernel object table**. They work from user mode as long as the calling thread is granted access via `k_object_access_grant(&obj, tid)` from supervisor mode — the standard Zephyr pattern.
 
-`zephyr_library_app_memory(wamr_partition)` in the platform CMake rewrites the linker rules so that **all globals** in `wamr_lib.a` go into the partition's `.data` / `.bss` sections. The gperf scanner scans only the kernel's standard data sections, not partition sections. Anything statically defined in a partitioned translation unit is invisible.
+An empirical probe confirms this: `wamr_lib.c` includes `K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1)` at file scope, and the ST demo grants access to it from `src/main.c` (kernel `main`) and successfully calls `k_sem_give` / `k_sem_take` from the user-mode entry thread. See the "probe" section of `iwasm_main_st` in `product-mini/platforms/zephyr/user-mode/lib-wamr-zephyr/wamr_lib.c` and the matching grant in `src/main.c`.
 
-| Global in wamr_lib.c (partitioned) | Registered? |
+The real gap is not partition visibility; it's **heap allocation**. The kobjects that need the dynamic-alloc treatment are the ones that don't exist until runtime:
+
+| Global in wamr_lib.c | Registered? |
 |---|---|
-| `static struct k_thread iwasm_user_mode_thread;` | NO |
-| `K_THREAD_STACK_DEFINE(stack, ...)` | NO (stack itself + its kobject metadata) |
-| `K_APPMEM_PARTITION_DEFINE(wamr_partition)` | n/a — needs to be visible to `gen_app_partitions.py` from a non-partitioned TU; placing it inside the partition it describes is also a chicken-and-egg |
-| `struct k_mem_domain wamr_domain;` | n/a — `k_mem_domain` is not a kobject type at all |
+| File-scope `K_SEM_DEFINE(...)`, `K_MUTEX_DEFINE(...)`, `K_CONDVAR_DEFINE(...)` | YES — gperf scans them. User-mode access requires an explicit `k_object_access_grant` from supervisor mode. |
+| `static struct k_sem foo;` (bare struct without the `_DEFINE` iterable-section macro) | NO — no gperf entry emitted. Same failure mode as heap-allocated kobjects: use `k_object_alloc(K_OBJ_SEM)` instead. |
+| Kobjects `BH_MALLOC`'d inside WAMR's heap (heap lock, bh_queue mutex+condvar, per-thread join sems) | NO — they don't exist as symbols at build time. This is what `WAMR_BUILD_ZEPHYR_USERMODE_MT` fixes by routing every allocation through `k_object_alloc`. |
+| `static struct k_thread iwasm_user_mode_thread;` (used as a k_thread arg to `k_thread_create` under `K_USER`) | NO — `struct k_thread` at file scope needs `K_THREAD_DEFINE` to be gperf-registered. A bare struct is `-EINVAL` under user mode. |
+| `K_THREAD_STACK_DEFINE(stack, ...)` inside `wamr_lib.c` | Verified working when used as the stack arg to a `k_thread_create` whose caller has been granted `k_object_access_grant(stack, tid)`. WAMR does this via `os_thread_env_init_for_usermode` for MPU stacks. |
+| `K_APPMEM_PARTITION_DEFINE(wamr_partition)` | n/a — needs to be visible to `gen_app_partitions.py` from a non-partitioned TU; placing it inside the partition it describes is also a chicken-and-egg. |
+| `struct k_mem_domain wamr_domain;` | n/a — `k_mem_domain` is not a kobject type at all. |
 
 Additionally:
 - WAMR's condvar was hand-rolled using semaphores (not Zephyr's native `k_condvar`), so it couldn't work through syscalls.

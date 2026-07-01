@@ -61,6 +61,15 @@ main(void)
 
     k_mem_domain_add_thread(&wamr_domain, tid);
 
+    /* Probe: grant the user-mode thread access to the K_SEM_DEFINE'd
+     * semaphore declared inside wamr_lib.c (partitioned TU). If the
+     * grant succeeds AND the user-mode thread can subsequently
+     * k_sem_give/k_sem_take, that proves K_SEM_DEFINE inside a
+     * zephyr_library_app_memory partition IS gperf-visible and works
+     * via the standard grant pattern. */
+    extern struct k_sem wamr_partition_sem_probe;
+    k_object_access_grant(&wamr_partition_sem_probe, tid);
+
 #ifdef USER_MODE_MULTITHREAD
     os_thread_env_init_for_usermode(tid);
 #endif
