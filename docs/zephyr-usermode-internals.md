@@ -214,6 +214,84 @@ The Zephyr model offers two clean choices and no useful middle ground: **all ker
 
 One narrower variant *can* be made to work but isn't documented as a sample yet: keep WAMR in kernel mode but place **only the WASM linear memory** (not the engine's data structures) into a `wamr_partition` and grant a user-mode "viewer" thread read access. The kernel-mode interpreter reads/writes the partition via plain pointers (kernel reads user memory freely), and a separate user-mode thread can inspect WASM memory without escalating. This protects host-side data from a hypothetically-compromised WASM module while keeping the engine fast — but requires modifying WAMR's heap allocator to place WASM-instance memory specifically in the partition, which is a core-WAMR change beyond what this branch is for.
 
+## Where Kobjects Live: Library-Declared vs. App-Declared
+
+When adding new synchronization primitives (`k_sem`, `k_mutex`, `k_condvar`, `k_msgq`, ...) to code that a user-mode thread will touch, there are two legitimate placement patterns. Both work — the choice is architectural, not correctness-driven.
+
+### Pattern A: Library-declared (kobject defined inside `wamr_lib.c`)
+
+```c
+/* wamr_lib.c */
+K_SEM_DEFINE(wamr_worker_done, 0, MAX_WORKERS);
+
+void wamr_lib_run(void) {
+    k_sem_take(&wamr_worker_done, K_FOREVER);
+}
+```
+
+```c
+/* app main.c */
+extern struct k_sem wamr_worker_done;
+
+int main(void) {
+    k_tid_t tid = k_thread_create(..., K_USER, K_FOREVER);
+    k_object_access_grant(&wamr_worker_done, tid);
+    k_wakeup(tid);
+}
+```
+
+Verified working on this branch: the `wamr_partition_sem_probe` in `wamr_lib.c` is granted from `src/main.c` and used from the user-mode entry thread. The `K_SEM_DEFINE` symbol survives `zephyr_library_app_memory(wamr_partition)` — gperf scans it, and the address ends up in `kobject_hash.gperf`.
+
+**Wins:** library author convenience. Every resource lives next to the code that uses it. Adding an internal kobject doesn't perturb any header.
+
+**Loses:** app author must know every internal kobject to grant, and there is no compile-time enforcement of the grant list. A missed grant is a runtime fault at first use. Rename an internal kobject → break every downstream app that `extern`ed it. Two libraries defining `K_MUTEX_DEFINE(shared_lock)` → link error.
+
+### Pattern B: App-declared, library-consumed via a handle
+
+```c
+/* wamr_lib.c */
+struct wamr_resources {
+    struct k_sem *worker_done;
+};
+
+void wamr_lib_run(struct wamr_resources *res) {
+    k_sem_take(res->worker_done, K_FOREVER);
+}
+```
+
+```c
+/* app main.c */
+K_SEM_DEFINE(worker_done, 0, MAX_WORKERS);
+
+int main(void) {
+    struct wamr_resources res = { .worker_done = &worker_done };
+    k_tid_t tid = k_thread_create(..., wamr_lib_run, &res, ..., K_USER, K_FOREVER);
+    k_object_access_grant(&worker_done, tid);
+    k_wakeup(tid);
+}
+```
+
+**Wins:** the app has one place listing every kobject the library needs; missing a grant is a compile-time signal (`-Wmissing-field-initializers` on the resource struct). Multiple library instances become natural — each gets its own struct. Adding/removing library internals doesn't touch the app's grant surface.
+
+**Loses:** heavier first-touch complexity for library users. Every kobject becomes part of a public API contract.
+
+### Recommendation for WAMR
+
+WAMR itself doesn't need to expose kobjects to the app — its public API operates on WAMR types (`wasm_module_inst_t`, `wasm_exec_env_t`, etc.), and its Zephyr-facing synchronization primitives are implementation details. So today:
+
+- **Library-internal kobjects** (heap lock, bh_queue mutex/condvar, per-thread join semaphores) are heap-allocated and dynamically registered via `k_object_alloc` when `WAMR_BUILD_ZEPHYR_USERMODE_MT=1`. User-mode child threads inherit access via `K_INHERIT_PERMS`. The app never sees or grants these — the grant list is empty. This is Pattern A but fully automated, which is the right default for library-internal machinery.
+- **If a future feature exposes a kobject to the app** (e.g., a shutdown-signal semaphore the app raises to ask WAMR to stop, or a result queue the app drains), prefer Pattern B. Publish a small `wamr_zephyr_config` struct of pointers the app fills in. This scales; ad-hoc `extern` declarations don't.
+
+The `wamr_partition_sem_probe` in `wamr_lib.c` is Pattern A used purely as a regression test for gperf scanning of partitioned sections. It has no functional role. If WAMR ever gains real app-visible kobjects, they should switch to Pattern B.
+
+### When to use Pattern A anyway
+
+- A library not intended to have multiple instances *and* not intended to compose with other libraries *and* whose kobject list is stable.
+- Prototype code where API stability doesn't matter yet.
+- Internal machinery the app must not touch (WAMR's current internal locks fit here — the app never grants them because `k_object_alloc` handles registration and `K_INHERIT_PERMS` handles distribution).
+
+Anywhere else, Pattern B is more maintainable.
+
 ## Configuration Cheat Sheet
 
 ### prj.conf for User-Mode Multi-Thread
