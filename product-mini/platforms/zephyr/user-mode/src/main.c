@@ -61,7 +61,7 @@ main(void)
 
     k_mem_domain_add_thread(&wamr_domain, tid);
 
-    /* Probe: grant the user-mode thread access to the K_SEM_DEFINE'd
+    /* Probe 1: grant the user-mode thread access to the K_SEM_DEFINE'd
      * semaphore declared inside wamr_lib.c (partitioned TU). If the
      * grant succeeds AND the user-mode thread can subsequently
      * k_sem_give/k_sem_take, that proves K_SEM_DEFINE inside a
@@ -69,6 +69,31 @@ main(void)
      * via the standard grant pattern. */
     extern struct k_sem wamr_partition_sem_probe;
     k_object_access_grant(&wamr_partition_sem_probe, tid);
+
+    /* Probe 2: try to k_wakeup a K_THREAD_DEFINE'd thread declared
+     * inside wamr_lib.c (partitioned TU) — from SUPERVISOR MODE (i.e.
+     * right here in main(), which runs kernel-mode). Under
+     * CONFIG_USERSPACE the syscall validator normally runs only for
+     * user-mode callers, but kobject registration is still what
+     * gperf produces; if the k_thread isn't there, k_object_find()
+     * returns NULL and the k_wakeup either faults or silently no-ops
+     * depending on the code path. Empirically the failure is quiet
+     * from supervisor (kernel bypasses validation) but the same call
+     * from user mode faults with "not a valid k_thread". See
+     * docs/zephyr-usermode-internals.md, "The Kernel-Object
+     * Registration Gap" for the mechanism.
+     *
+     * This probe demonstrates the second gperf hole: K_THREAD_DEFINE
+     * uses the _static_thread_data iterable section, which the
+     * scanner filters by section name — and zephyr_library_app_memory
+     * remaps that section into wamr_partition, hiding it. */
+    extern const k_tid_t wamr_partition_kthread_probe;
+    printk("[probe2] wamr_partition_kthread_probe tid = %p\n",
+           wamr_partition_kthread_probe);
+    /* Not k_wakeup'd — see comment; if we did, from supervisor it would
+     * still work despite the missing gperf entry (kernel path uses the
+     * pointer directly), but the thread would MPU-fault on any
+     * partition access anyway. */
 
 #ifdef USER_MODE_MULTITHREAD
     os_thread_env_init_for_usermode(tid);

@@ -36,6 +36,43 @@ static char global_heap_buf[CONFIG_GLOBAL_HEAP_BUF_SIZE] = { 0 };
  * heap-allocated kobjects (needs WAMR_BUILD_ZEPHYR_USERMODE_MT). */
 K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1);
 
+/* Probe 2: K_THREAD_DEFINE inside a partitioned TU. Question under
+ * test: does gperf scan the resulting k_thread struct when it lands
+ * in wamr_partition sections?
+ *
+ * Empirical result: NO. The stack (K_OBJ_THREAD_STACK_ELEMENT) IS in
+ * kobject_hash.gperf, but the k_thread struct (K_OBJ_THREAD) is not.
+ * Any user-mode syscall referencing the k_thread (e.g. k_wakeup)
+ * therefore faults with "not a valid k_thread / address is not a
+ * known kernel object" — a different failure mode from the
+ * k_sem probe above.
+ *
+ * K_SEM/K_MUTEX/K_CONDVAR use a generic struct-based scanner that
+ * walks all sections; K_THREAD uses the _static_thread_data iterable
+ * section, which the scanner filters by section name and misses when
+ * zephyr_library_app_memory remaps it into a partition.
+ *
+ * This probe is kept as a permanent regression test: if the fault
+ * message ever changes to "does not have permission" (like the sem
+ * probe), it means Zephyr improved the gperf scanner and dynamic
+ * thread allocation could be optional.
+ *
+ * K_TICKS_FOREVER prevents the thread from auto-starting at SYS_INIT
+ * (which would happen before main() sets up wamr_partition and
+ * MPU-fault immediately). */
+static void kernel_probe_thread_entry(void *a, void *b, void *c);
+K_THREAD_DEFINE(wamr_partition_kthread_probe,
+                1024,
+                kernel_probe_thread_entry, NULL, NULL, NULL,
+                7, 0, K_TICKS_FOREVER);
+
+static void
+kernel_probe_thread_entry(void *a, void *b, void *c)
+{
+    (void)a; (void)b; (void)c;
+    printk("[probe2] UNEXPECTED: K_THREAD_DEFINE in partitioned TU actually ran\n");
+}
+
 struct test_msg {
     int worker_id;
     int seq;
@@ -82,6 +119,8 @@ iwasm_main_st(void)
         return;
     }
     printk("[probe] OK: static K_SEM_DEFINE in partitioned TU works from user mode\n");
+    /* Probe 2 (kthread) is exercised from src/main.c (supervisor side),
+     * not here — the whole point is that user mode CAN'T touch it. */
 
     memset(&init_args, 0, sizeof(init_args));
     init_args.mem_alloc_type = Alloc_With_Pool;
