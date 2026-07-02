@@ -243,12 +243,23 @@ west build -t run
 Expected output:
 
 ```
+[probe2] wamr_partition_kthread_probe tid = 0x137b40
 *** Booting Zephyr OS build v4.4.0-rc2 ***
 === WAMR User-Mode ST + bh_queue Demo ===
+[probe] OK: static K_SEM_DEFINE in partitioned TU works from user mode
 bh_queue created (user mode)
   [recv] worker 0 seq 0 "st-msg"
 === ST Demo complete ===
 ```
+
+The two `[probe*]` lines exercise regression tests for how Zephyr's
+gperf scanner treats file-scope `K_SEM_DEFINE` and `K_THREAD_DEFINE`
+inside a `zephyr_library_app_memory` partitioned TU. See
+`docs/zephyr-usermode-internals.md` for the mechanism; the short
+version is that k_sem lands in a kernel-owned section (works from
+user mode after grant) while k_thread lands in the partition and is
+filtered out by an intentional security check (must use
+`k_object_alloc` instead).
 
 #### Demonstrating the failure mode (flag=0, USER_MODE_MULTITHREAD=OFF)
 
