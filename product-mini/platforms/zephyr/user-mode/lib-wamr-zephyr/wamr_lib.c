@@ -40,26 +40,29 @@ K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1);
  * test: does gperf scan the resulting k_thread struct when it lands
  * in wamr_partition sections?
  *
- * Empirical result: NO. The stack (K_OBJ_THREAD_STACK_ELEMENT) IS in
- * kobject_hash.gperf, but the k_thread struct (K_OBJ_THREAD) is not.
- * Any user-mode syscall referencing the k_thread (e.g. k_wakeup)
- * therefore faults with "not a valid k_thread / address is not a
- * known kernel object" — a different failure mode from the
- * k_sem probe above.
+ * Empirical result: NO — and this is INTENTIONAL, not a scanner bug.
+ * K_THREAD_DEFINE puts the k_thread control block in the TU's .data
+ * section, which zephyr_library_app_memory remaps to app_smem. The
+ * gperf scanner (gen_kobject_list.py) then applies its
+ * user_ram_allowed=False filter to k_thread: kobjects of types where
+ * user code could escalate by rewriting the struct MUST NOT live in
+ * user-writable memory, so those addresses are dropped from the
+ * table with the debug line "object 'k_thread' found in invalid
+ * location <addr>". A k_thread rewritable from user mode could forge
+ * scheduler state — this is a security policy dating to the
+ * userspace introduction, not a bug that a Zephyr update will fix.
  *
- * K_SEM/K_MUTEX/K_CONDVAR use a generic struct-based scanner that
- * walks all sections; K_THREAD uses the _static_thread_data iterable
- * section, which the scanner filters by section name and misses when
- * zephyr_library_app_memory remaps it into a partition.
+ * K_SEM/K_MUTEX/K_CONDVAR carry the same policy flag but their
+ * sections (k_sem_area / k_mutex_area / ...) are kernel-owned and
+ * don't get remapped into app_smem, so they pass the address check.
  *
- * This probe is kept as a permanent regression test: if the fault
- * message ever changes to "does not have permission" (like the sem
- * probe), it means Zephyr improved the gperf scanner and dynamic
- * thread allocation could be optional.
+ * Correct workaround (what WAMR uses): k_object_alloc(K_OBJ_THREAD).
+ * That draws from the kernel heap, outside app_smem, and registers
+ * at runtime — satisfies both the security policy and the visibility
+ * requirement.
  *
  * K_TICKS_FOREVER prevents the thread from auto-starting at SYS_INIT
- * (which would happen before main() sets up wamr_partition and
- * MPU-fault immediately). */
+ * (which would happen before main() sets up wamr_partition). */
 static void kernel_probe_thread_entry(void *a, void *b, void *c);
 K_THREAD_DEFINE(wamr_partition_kthread_probe,
                 1024,

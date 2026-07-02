@@ -15,20 +15,25 @@ WAMR allocates all its internal kernel objects — the heap lock mutex, bh_queue
 
 `zephyr_library_app_memory(wamr_partition)` in the platform CMake rewrites the linker rules so that **all globals** in `wamr_lib.a` go into the partition's `.data` / `.bss` sections. The consequence for gperf scanning is **per-kobject-type-specific**, and this is where the initial "gperf can't see partitioned sections" folk theorem was too coarse:
 
-- **`K_SEM_DEFINE` / `K_MUTEX_DEFINE` / `K_CONDVAR_DEFINE`** land in generic object sections that the gperf scanner walks by symbol type, not by section name. They **are** registered even when remapped into a partition. Empirically confirmed: `wamr_lib.c` has `K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1)`, its address appears in the generated `kobject_hash.gperf`, and `k_sem_give`/`k_sem_take` from user mode succeed after a supervisor-side `k_object_access_grant`.
-- **`K_THREAD_DEFINE`** uses the `_static_thread_data` iterable section for its k_thread struct. The scanner filters that section by name, and `zephyr_library_app_memory` remaps it into a wamr-partition section that the filter misses. The k_thread struct's stack (`K_OBJ_THREAD_STACK_ELEMENT`) DOES get scanned (it uses the generic path), but the k_thread struct itself doesn't. Any user-mode syscall on the thread faults with `not a valid k_thread / address is not a known kernel object` — a different fault mode from missing-grant. Empirically confirmed by the second probe: `wamr_lib.c` has `K_THREAD_DEFINE(wamr_partition_kthread_probe, ...)` and a `k_wakeup` from user mode on it faults with that exact message.
+- **`K_SEM_DEFINE` / `K_MUTEX_DEFINE` / `K_CONDVAR_DEFINE`** place their object in a per-type iterable section (`k_sem_area`, `k_mutex_area`, ...). These sections are NOT remapped into `wamr_partition` by `zephyr_library_app_memory` — they collect kobjects globally, across all TUs, in the kernel's data segment. The scanner sees them, registers them, and user-mode access works after `k_object_access_grant`. Empirically confirmed: `wamr_lib.c` has `K_SEM_DEFINE(wamr_partition_sem_probe, 0, 1)`; the symbol lands in section `k_sem_area` at an address OUTSIDE the `_app_smem_start`..`_app_smem_end` range; its address appears in `kobject_hash.gperf`; `k_sem_give`/`k_sem_take` from user mode succeed after a grant.
+- **`K_THREAD_DEFINE`** puts the k_thread control block in the TU's own `.data` section. `zephyr_library_app_memory` DOES remap `.data` → `app_smem`, so the k_thread struct ends up inside the partition. The scanner then applies a **deliberate security filter** (`gen_kobject_list.py`, lookup table `kobjects`, tuple entry `("k_thread", (None, False, True))` — the `False` means `user_ram_allowed=False`): kobjects whose type is not `user_ram_allowed` and whose address falls inside `_app_smem_start.._app_smem_end` are dropped from the gperf table with the debug line `object 'k_thread' found in invalid location <addr>`. This is intentional — a k_thread control block in user-writable memory would let user code forge thread state and escalate privileges. Result: user-mode syscalls on this k_thread fault with `not a valid k_thread / address is not a known kernel object`.
 
-So there are two distinct kobject-visibility gaps in a partitioned TU:
+Note that the same `user_ram_allowed=False` policy is set for `k_sem`/`k_mutex`/`k_condvar` too. They avoid the filter not because they're exempt but because their sections (`k_sem_area` etc.) don't get remapped into `app_smem` in the first place. If you managed to place a bare `struct k_sem foo` in `app_smem`, the same filter would drop it.
 
-| Global in wamr_lib.c | Gperf sees it? | User-mode fault mode if reached |
-|---|---|---|
-| File-scope `K_SEM_DEFINE(...)`, `K_MUTEX_DEFINE(...)`, `K_CONDVAR_DEFINE(...)` | YES | `does not have permission` (grant fixes it) |
-| File-scope `K_THREAD_DEFINE(...)` | NO for the k_thread struct; YES for the stack | `not a valid k_thread / address is not a known kernel object` (grant does NOT fix it) |
-| File-scope `K_THREAD_STACK_DEFINE(stack, ...)` (stack only, not a whole thread) | YES | `does not have permission on k_thread_stack_element` (grant fixes it) — WAMR does this in `os_thread_env_init_for_usermode` for MPU stacks |
-| Bare `static struct k_sem foo;` (no `_DEFINE` macro) | NO | `not a valid k_sem` — a bare struct never gets a gperf entry regardless of section |
-| Kobjects `BH_MALLOC`'d inside WAMR's heap (heap lock, bh_queue mutex+condvar, per-thread join sems) | NO — they don't exist as symbols at build time | `not a valid k_*` — this is what `WAMR_BUILD_ZEPHYR_USERMODE_MT` fixes by routing every allocation through `k_object_alloc` |
-| `K_APPMEM_PARTITION_DEFINE(wamr_partition)` | n/a | Must live in a non-partitioned TU (`gen_app_partitions.py` needs to see it from outside the partition it describes) |
-| `struct k_mem_domain wamr_domain;` | n/a | Not a kobject type at all — plain static is fine |
+**This is Zephyr working as designed, not a bug.** Updating Zephyr will not "fix" it. The correct workaround is what WAMR already does: allocate the k_thread dynamically via `k_object_alloc(K_OBJ_THREAD)`. `k_object_alloc` draws from the kernel heap (outside `app_smem`) and registers the object at runtime, satisfying both the security policy and the visibility requirement.
+
+So there are two distinct kobject-visibility gaps in a partitioned TU, with the same policy root cause but different mechanics:
+
+| Global in wamr_lib.c | Section landed in | Inside app_smem? | Gperf sees it? | User-mode fault mode if reached |
+|---|---|---|---|---|
+| File-scope `K_SEM_DEFINE(...)`, `K_MUTEX_DEFINE(...)`, `K_CONDVAR_DEFINE(...)` | `k_sem_area` / `k_mutex_area` / ... (per-type iterable, kernel-owned) | NO | YES | `does not have permission` (grant fixes it) |
+| File-scope `K_THREAD_DEFINE(...)` — the k_thread struct | TU's `.data` → remapped to `app_smem` | YES | NO — filtered by `user_ram_allowed=False` policy | `not a valid k_thread / address is not a known kernel object` (grant does NOT fix it — need `k_object_alloc` instead) |
+| The stack half of `K_THREAD_DEFINE(...)` | `noinit` (kernel-owned) | NO | YES | `does not have permission on k_thread_stack_element` (grant fixes it) |
+| File-scope `K_THREAD_STACK_DEFINE(stack, ...)` (stack only, not a whole thread) | `noinit` (kernel-owned) | NO | YES | Same as above — WAMR does this in `os_thread_env_init_for_usermode` for MPU stacks |
+| Bare `static struct k_sem foo;` (no `_DEFINE` macro) | TU's `.data` → remapped to `app_smem` | YES | NO — bare structs never get a gperf entry regardless of section, and even if they did the same `user_ram_allowed=False` filter would apply | `not a valid k_sem` — use `k_object_alloc(K_OBJ_SEM)` |
+| Kobjects `BH_MALLOC`'d inside WAMR's heap (heap lock, bh_queue mutex+condvar, per-thread join sems) | WAMR heap in `app_smem` | YES | NO — they don't exist as symbols at build time, so gperf has nothing to see | `not a valid k_*` — this is what `WAMR_BUILD_ZEPHYR_USERMODE_MT` fixes by routing every allocation through `k_object_alloc` (kernel heap, not WAMR heap) |
+| `K_APPMEM_PARTITION_DEFINE(wamr_partition)` | n/a | n/a | n/a | Must live in a non-partitioned TU (`gen_app_partitions.py` needs to see it from outside the partition it describes) |
+| `struct k_mem_domain wamr_domain;` | n/a | n/a | n/a | Not a kobject type at all — plain static is fine |
 
 **Consequences for WAMR's design**:
 
@@ -36,7 +41,7 @@ So there are two distinct kobject-visibility gaps in a partitioned TU:
 - Threads *cannot* use `K_THREAD_DEFINE` inside `wamr_lib.c` — the k_thread struct isn't gperf-visible. This is why `os_thread_create` uses `k_object_alloc(K_OBJ_THREAD)` under user mode.
 - If a non-partitioned TU (e.g., the app's `src/main.c`) declares `K_THREAD_DEFINE`, that works fine — the standard sections aren't remapped. But WAMR is library-shaped, so its thread definitions have to live in the partitioned TU or use dynamic allocation. It chose the latter for both design reasons (runtime API) and technical reasons (the gperf hole).
 
-Both probes are compiled into the ST variant of the user-mode sample as permanent regression tests. If a future Zephyr release fixes the `K_THREAD_DEFINE` gperf hole, probe 2's fault message would change from `not a valid k_thread` to `does not have permission on k_thread`, at which point dynamic-thread allocation could become optional for WAMR.
+Both probes are compiled into the ST variant of the user-mode sample as permanent regression tests. The K_THREAD_DEFINE probe is **not expected to change** across Zephyr versions — the `user_ram_allowed=False` filter is a deliberate security policy dating back to when userspace was introduced, and lifting it would require either weakening isolation or moving the k_thread struct out of `app_smem` (which is what `k_object_alloc` already does). The probes exist to catch a regression in the opposite direction: if Zephyr ever changes `K_SEM_DEFINE`'s section placement to route through the TU's `.data` (and thus into `app_smem`), probe 1 would start faulting and we'd need to switch semaphore allocation to the dynamic path too.
 
 Additionally:
 - WAMR's condvar was hand-rolled using semaphores (not Zephyr's native `k_condvar`), so it couldn't work through syscalls.
