@@ -141,6 +141,111 @@ The fix separates "thread finished" from "someone joined it":
 
 This fix is **unconditional** in WAMR — it applies to both kernel-mode and user-mode multi-threading. It was discovered while testing user-mode multi-thread but benefits all threading scenarios.
 
+## Historical Note: Why We Don't Use `sys_mutex` / `sys_sem`
+
+Zephyr provides two families of synchronization primitives named
+`sys_mutex` and `sys_sem` (declared in `<zephyr/sys/mutex.h>` and
+`<zephyr/sys/sem.h>`). They are marketed as "userspace-safe wrappers":
+their public API mirrors `k_mutex`/`k_sem` but is designed to work from
+user mode. An earlier revision of the WAMR Zephyr platform layer used
+these types under `CONFIG_USERSPACE`:
+
+```c
+/* Earlier design — no longer in use */
+#ifdef CONFIG_USERSPACE
+#define zmutex_t struct sys_mutex
+#define zmutex_lock(mtx, timeout) sys_mutex_lock(mtx, timeout)
+#define zsem_t struct sys_sem
+#define zsem_take(sem, timeout) sys_sem_take(sem, timeout)
+#else
+#define zmutex_t struct k_mutex
+/* ... */
+#endif
+```
+
+This looks user-mode-correct at first read but has a structural gap
+that only manifests under contention.
+
+### The Fast-Path That Hides the Bug
+
+`sys_mutex_lock` implementation:
+1. Attempt an atomic compare-and-swap on the mutex's user-space state.
+2. On success: return immediately, never enter the kernel.
+3. On failure (contended): issue a syscall to `z_impl_sys_mutex_lock`, which validates the mutex against the kernel object table before enqueuing the waiter.
+
+Same shape for `sys_sem_take`. The kernel-object-table lookup only
+happens on step 3. Under no contention, step 1 succeeds and the syscall
+never runs.
+
+### The Registration Requirement
+
+The kernel object table has two registration paths:
+
+- Static: `SYS_MUTEX_DEFINE(name)` / `SYS_SEM_DEFINE(name)` at file
+  scope. `gen_kobject_list.py` scans for these macros and emits gperf
+  entries.
+- Dynamic: none. **Zephyr does not expose `k_object_alloc(K_OBJ_SYS_MUTEX)`
+  or an equivalent for the `sys_*` family.** These wrappers were
+  designed for statically-defined kobjects only.
+
+WAMR's synchronization primitives are allocated inside `BH_MALLOC`'d
+structures at runtime — the heap lock lives inside a runtime pool, per-
+queue mutexes live inside each `bh_queue` heap allocation, per-thread
+join semaphores live inside `os_thread_data`. None of these are visible
+to gperf. And because Zephyr provides no runtime registration for the
+`sys_*` family, there is no way to make them visible.
+
+Result: any `sys_mutex_lock` on a WAMR-allocated `struct sys_mutex` that
+takes the slow path fails with `-EINVAL` in `z_impl_sys_mutex_lock`
+after `k_object_find()` returns NULL. Same for `sys_sem_take`.
+
+### Why the Original Code Compiled and Ran
+
+The pre-branch user-mode sample spawned exactly one user-mode thread
+running a single-threaded WASM demo (`wasm_runtime_full_init`, load,
+instantiate, `wasm_application_execute_main`, unload, destroy). No
+worker threads, no `bh_queue`, no cross-thread synchronization. Every
+mutex/sem operation in that workload happens with zero contention, so
+step 1 of the fast path always succeeds and the syscall path is never
+exercised. The kobject-registration gap is invisible.
+
+The moment a second user-mode thread contends any WAMR-internal lock,
+the slow path fires and the build breaks. This is exactly the
+threshold that user-mode multi-thread crosses.
+
+### The Fix in the Current Design
+
+The current branch abandons `sys_mutex`/`sys_sem` entirely and uses
+plain `k_mutex`/`k_sem`/`k_condvar` allocated via `k_object_alloc(K_OBJ_MUTEX)`,
+`k_object_alloc(K_OBJ_SEM)`, `k_object_alloc(K_OBJ_CONDVAR)`. Unlike
+the `sys_*` family, these three types **do** have a dynamic-allocation
+path that atomically allocates from the kernel heap AND registers in
+the object table. Child threads then inherit access via
+`K_USER | K_INHERIT_PERMS` — no per-object grants needed.
+
+The relevant piece of `platform_internal.h` now carries an explanatory
+comment (paraphrased below) so that a future reader who wonders why we
+don't use the `sys_*` types has the full story inline:
+
+> `sys_mutex`/`sys_sem` (the userspace-safe wrappers) require their
+> addresses to be registered in the kernel object table via static
+> definitions (`SYS_MUTEX_DEFINE`/`SYS_SEM_DEFINE`). WAMR dynamically
+> allocates these structs inside its heap pool, so they are never
+> registered and `k_object_find()` returns NULL, causing
+> `sys_mutex_lock` and `sys_sem_take` to fail with `-EINVAL`. Use
+> `k_mutex`/`k_sem` directly instead — kernel threads bypass permission
+> checks, and user-mode threads can be granted access via
+> `k_object_access_grant()` or inherit via `K_INHERIT_PERMS`.
+
+### Takeaway
+
+`CONFIG_USERSPACE=y` alone does not make a library user-mode-correct.
+The type names in `sys/mutex.h` and `sys/sem.h` suggest they're the
+right choice, but they only work for statically-defined kobjects. Any
+library that allocates its own sync primitives at runtime needs the
+`k_object_alloc` + `K_INHERIT_PERMS` combination this branch
+implements, regardless of what the type names look like.
+
 ## When the Flag is Needed
 
 The flag `WAMR_BUILD_ZEPHYR_USERMODE_MT=1` is needed when **all** of the following are true:
