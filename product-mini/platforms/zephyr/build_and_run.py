@@ -13,6 +13,7 @@ which is what CI does inside the Zephyr container."""
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +48,9 @@ output:
   "ok (build only)" for a scenario that was built but not run.
 
   twister keeps its build trees and reports under build/twister-<root>-<sim>/.
+  Coverage runs instead use build/twister-<root>-<sim>-coverage/, with HTML at
+  coverage/index.html and machine-readable XML at coverage/coverage.xml. The
+  raw gcovr data is coverage.json.
   Everything under build/ is created by the container and therefore owned by
   root.
 """
@@ -131,23 +135,25 @@ def artifact_name(relative, simulator):
     return f"{'-'.join(relative.parts)}-{simulator}"
 
 
-def run_test_root(relative, simulator, use_docker):
-    """Run the twister scenarios of one test root on one simulator."""
+def twister_command(relative, simulator, use_docker, coverage=False):
+    """Build the Twister shell command for one test root and simulator."""
     platform = BOARDS[simulator]
     artifact = artifact_name(relative, simulator)
-    log_path = LOG_DIR / f"{artifact}.log"
-    log_path.unlink(missing_ok=True)
+    if coverage:
+        artifact += "-coverage"
 
     # paths as seen by the shell running twister: inside the container when
     # dockerized, in the checkout itself otherwise
     module_dir = MODULE_DIR if use_docker else str(WAMR_ROOT)
     platform_dir = f"{module_dir}/product-mini/platforms/zephyr"
     outdir = f"{platform_dir}/build/twister-{artifact}"
+    test_root = f"{platform_dir}/{relative}"
+    module_assignment = f"EXTRA_ZEPHYR_MODULES={module_dir}"
 
     command = (
-        f"west twister -T {platform_dir}/{relative} -p {platform}"
-        f" -x EXTRA_ZEPHYR_MODULES={module_dir}"
-        f" --outdir {outdir} --inline-logs --clobber-output"
+        f"west twister -T {shlex.quote(test_root)} -p {platform}"
+        f" -x {shlex.quote(module_assignment)}"
+        f" --outdir {shlex.quote(outdir)} --inline-logs --clobber-output"
         # twister compiles with -Werror by default; the runtime is not built
         # with that in any other configuration
         f" --disable-warnings-as-errors"
@@ -155,6 +161,26 @@ def run_test_root(relative, simulator, use_docker):
         # source tree, so parallel configurations of the same checkout race
         f" --jobs 1"
     )
+    if coverage:
+        command += (
+            f" --coverage --coverage-basedir {shlex.quote(module_dir)}"
+            " --coverage-tool gcovr --coverage-formats html,xml"
+        )
+
+    return command
+
+
+def run_test_root(relative, simulator, use_docker, coverage=False):
+    """Run the twister scenarios of one test root on one simulator."""
+    platform = BOARDS[simulator]
+    artifact = artifact_name(relative, simulator)
+    if coverage:
+        artifact += "-coverage"
+    log_path = LOG_DIR / f"{artifact}.log"
+    log_path.unlink(missing_ok=True)
+
+    command = twister_command(relative, simulator, use_docker, coverage)
+    platform_dir = ZEPHYR_PLATFORM_DIR if use_docker else str(HERE)
 
     if not use_docker:
         argv = ["bash", "-euo", "pipefail", "-c", command]
@@ -225,6 +251,11 @@ def main():
         help="run west in the current environment instead of in the container",
     )
     parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="measure informational Twister coverage with gcovr",
+    )
+    parser.add_argument(
         "--sim",
         choices=sorted(BOARDS),
         action="append",
@@ -248,7 +279,7 @@ def main():
         return 1
 
     for simulator in args.simulators or ["native_sim"]:
-        if not run_test_root(test_root, simulator, use_docker):
+        if not run_test_root(test_root, simulator, use_docker, args.coverage):
             return 1
 
     print("all done")
