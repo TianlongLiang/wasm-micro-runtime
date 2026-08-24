@@ -104,6 +104,9 @@ jobs:
           - name: user-mode (ARC)
             sample: user-mode
             sim: qemu_arc
+          - name: user-mode multi-thread (ARC)
+            sample: user-mode-multi-thread
+            sim: qemu_arc
           - name: platform API Ztest (native_sim)
             sample: tests/platform_api
             sim: native_sim

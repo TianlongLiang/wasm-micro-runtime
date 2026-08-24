@@ -21,6 +21,11 @@ option(WAMR_USE_PREBUILT_LIB
 # zephyr_library_app_memory() inside the subdirectory when using pre-built mode.
 add_subdirectory(lib-wamr-zephyr)
 
+get_property(WAMR_USER_INCLUDE_DIRS
+             DIRECTORY lib-wamr-zephyr
+             PROPERTY INCLUDE_DIRECTORIES)
+target_include_directories(app PRIVATE ${WAMR_USER_INCLUDE_DIRS})
+
 if(WAMR_USE_PREBUILT_LIB)
   # Manually replicate what zephyr_library_app_memory(wamr_partition) does:
   # tell gen_app_partitions.py to place this library's globals into wamr_partition.

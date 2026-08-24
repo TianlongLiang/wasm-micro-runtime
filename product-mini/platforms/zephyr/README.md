@@ -15,6 +15,7 @@ Kconfig options to get the runtime linked into its image.
 | [simple-file](./simple-file) | WASI file system API on top of Zephyr `fs_*`                  |
 | [simple-http](./simple-http) | WASI socket API on top of Zephyr `zsock_*`                    |
 | [user-mode](./user-mode)     | Running the runtime inside a Zephyr user-mode thread          |
+| [user-mode-multi-thread](./user-mode-multi-thread) | Running guest pthreads from static thread and sync pools in a Zephyr user-mode WAMR thread |
 
 ## Setup
 
@@ -386,9 +387,10 @@ Some named contracts are expected to skip while port work is outstanding:
   and repeated WAMR thread creation can block, and the CPU-time counter does
   not advance during the busy-work contract.
 - On QEMU ARC, the corresponding repeated/concurrent thread cases can block.
-  In userspace, Zephyr 3.7's `sys_mutex` initialization/locking limits the
-  positive synchronization cases, and `k_thread_runtime_stats_get()` reaches
-  privileged `arch_irq_lock()`, so the CPU-time contracts are skipped.
+  In userspace, `k_thread_runtime_stats_get()` reaches privileged
+  `arch_irq_lock()`, so the CPU-time contracts are skipped. Synchronization
+  APIs use the prepared native-object pool and their applicable behavioral
+  cases run in both kernel and user contexts.
 
 These are explicit, named skips that retain their test bodies; they are not
 passing demonstrations. A QEMU ARC user-mode fault suite remains active and
