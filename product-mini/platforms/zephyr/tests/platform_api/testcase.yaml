@@ -9,6 +9,11 @@ tests:
     platform_allow:
       - native_sim
       - qemu_arc/qemu_arc_hs
+  wamr.zephyr.platform_api.kernel_stack_info:
+    platform_allow:
+      - native_sim
+    extra_configs:
+      - CONFIG_THREAD_STACK_INFO=y
   wamr.zephyr.platform_api.userspace:
     platform_allow:
       - qemu_arc/qemu_arc_hs

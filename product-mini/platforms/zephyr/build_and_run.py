@@ -12,7 +12,9 @@ the local checkout; with --no-docker it runs in the current environment instead,
 which is what CI does inside the Zephyr container."""
 
 import argparse
+import hashlib
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -25,6 +27,7 @@ IMAGE = "wamr-zephyr"
 MODULE_DIR = "/root/zephyrproject/modules/wasm-micro-runtime"
 ZEPHYR_PLATFORM_DIR = f"{MODULE_DIR}/product-mini/platforms/zephyr"
 TIMEOUT_SECONDS = 30
+SCENARIO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # twister platform identifier per simulator
 BOARDS = {
@@ -131,14 +134,31 @@ def resolve_test_root(requested):
     return relative
 
 
-def artifact_name(relative, simulator):
-    return f"{'-'.join(relative.parts)}-{simulator}"
+def scenario_slug(name):
+    if not name or not SCENARIO_PATTERN.fullmatch(name):
+        raise ValueError(f"invalid Twister scenario: {name}")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
+    if not re.search(r"[A-Za-z0-9]", slug):
+        raise ValueError(f"invalid Twister scenario: {name}")
+    return slug
 
 
-def twister_command(relative, simulator, use_docker, coverage=False):
+def artifact_name(relative, simulator, scenario=None):
+    artifact = f"{'-'.join(relative.parts)}-{simulator}"
+    if scenario is not None:
+        slug = scenario_slug(scenario)
+        # Keep the readable slug and add a short digest that is collision-
+        # resistant for this small trusted scenario set without claiming a
+        # mathematically collision-free name.
+        digest = hashlib.sha256(scenario.encode("utf-8")).hexdigest()[:8]
+        artifact += f"-{slug}-{digest}"
+    return artifact
+
+
+def twister_command(relative, simulator, use_docker, coverage=False, scenario=None):
     """Build the Twister shell command for one test root and simulator."""
     platform = BOARDS[simulator]
-    artifact = artifact_name(relative, simulator)
+    artifact = artifact_name(relative, simulator, scenario)
     if coverage:
         artifact += "-coverage"
 
@@ -149,10 +169,12 @@ def twister_command(relative, simulator, use_docker, coverage=False):
     outdir = f"{platform_dir}/build/twister-{artifact}"
     test_root = f"{platform_dir}/{relative}"
     module_assignment = f"EXTRA_ZEPHYR_MODULES={module_dir}"
+    scenario_option = f" -s {shlex.quote(scenario)}" if scenario is not None else ""
 
     command = (
         f"west twister -T {shlex.quote(test_root)} -p {platform}"
         f" -x {shlex.quote(module_assignment)}"
+        f"{scenario_option}"
         f" --outdir {shlex.quote(outdir)} --inline-logs --clobber-output"
         # twister compiles with -Werror by default; the runtime is not built
         # with that in any other configuration
@@ -170,16 +192,16 @@ def twister_command(relative, simulator, use_docker, coverage=False):
     return command
 
 
-def run_test_root(relative, simulator, use_docker, coverage=False):
+def run_test_root(relative, simulator, use_docker, coverage=False, scenario=None):
     """Run the twister scenarios of one test root on one simulator."""
     platform = BOARDS[simulator]
-    artifact = artifact_name(relative, simulator)
+    artifact = artifact_name(relative, simulator, scenario)
     if coverage:
         artifact += "-coverage"
     log_path = LOG_DIR / f"{artifact}.log"
     log_path.unlink(missing_ok=True)
 
-    command = twister_command(relative, simulator, use_docker, coverage)
+    command = twister_command(relative, simulator, use_docker, coverage, scenario)
     platform_dir = ZEPHYR_PLATFORM_DIR if use_docker else str(HERE)
 
     if not use_docker:
@@ -256,6 +278,10 @@ def main():
         help="measure informational Twister coverage with gcovr",
     )
     parser.add_argument(
+        "--scenario",
+        help="run one exact Twister scenario and include it in artifact names",
+    )
+    parser.add_argument(
         "--sim",
         choices=sorted(BOARDS),
         action="append",
@@ -271,6 +297,8 @@ def main():
 
     try:
         test_root = resolve_test_root(args.sample)
+        if args.scenario is not None:
+            scenario_slug(args.scenario)
     except ValueError as error:
         parser.error(str(error))
 
@@ -279,7 +307,9 @@ def main():
         return 1
 
     for simulator in args.simulators or ["native_sim"]:
-        if not run_test_root(test_root, simulator, use_docker, args.coverage):
+        if not run_test_root(
+            test_root, simulator, use_docker, args.coverage, args.scenario
+        ):
             return 1
 
     print("all done")

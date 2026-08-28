@@ -222,7 +222,7 @@ and in the exit status:
   application, as the WASI exit code for the WASI samples and as the return
   value of the entry point for the others.
 - The Zephyr application checks the call result, the exception and the module
-  exit code, prints `ERROR: ...` for anything unexpected and
+  exit code, prints an `ERROR:` line for anything unexpected and
   `PASS: <what was verified>` once everything completed, then returns:
 
   | Code | Meaning |
@@ -307,71 +307,214 @@ exit status; do not infer a result from console text.
 
 ### Informational coverage
 
-Coverage is measurement only, not a pass threshold. The supported baseline
-uses the native platform API suite; native_sim is not isolation evidence:
+Coverage is a manually requested measurement job, not a pass threshold. The
+pinned CI baseline remains Zephyr 3.7.0. It runs two exact `native_sim`
+platform-API kernel scenarios sequentially because WAMR's generated version
+header races when configurations share a checkout. The second scenario changes
+only `CONFIG_THREAD_STACK_INFO=y`, which exercises the stack-information
+configuration without changing the test contracts:
 
 ```bash
-python3 build_and_run.py --no-docker --coverage --sim native_sim tests/platform_api
+python3 build_and_run.py --no-docker --coverage --sim native_sim \
+  --scenario wamr.zephyr.platform_api.kernel tests/platform_api
+python3 build_and_run.py --no-docker --coverage --sim native_sim \
+  --scenario wamr.zephyr.platform_api.kernel_stack_info tests/platform_api
+python3 coverage_report.py \
+  build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json \
+  build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
 ```
 
 The wrapper uses the Zephyr 3.7 Twister options `--coverage`,
 `--coverage-basedir`, `--coverage-tool gcovr`, and `--coverage-formats
-html,xml`. It keeps this run separate from the ordinary artifacts under
-`build/twister-tests-platform_api-native_sim-coverage/`; its log likewise uses
-`build/logs/tests-platform_api-native_sim-coverage.log`. Twister's verdict is
-still the command's exit status. The coverage artifact directory is
-`build/twister-tests-platform_api-native_sim-coverage/coverage/`, and its
-machine-readable report is
-`build/twister-tests-platform_api-native_sim-coverage/coverage/coverage.xml`.
-The reports from the pinned gcovr 8.2 are:
+html,xml`. The individual trace artifacts are:
 
-- `coverage/index.html`: browsable details;
-- `coverage/coverage.xml`: machine-readable Cobertura XML;
-- `coverage.json`: Twister's raw gcovr trace data.
+- `build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage/`
+  and its `coverage.json`;
+- `build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage/`
+  and its `coverage.json`.
 
-On 2026-08-12 the native run passed its one runnable configuration (the
-userspace configuration was statically filtered). The raw report contained 40
-compiled WAMR production files. Twister's `tests/*` exclusion omitted the test
-application, and no Zephyr or generated build sources appeared in the report.
-The focused `core/shared/platform/zephyr/` measurement was:
+`coverage_report.py` publishes the focused aggregate under
+`build/coverage-zephyr-platform-aggregate/`, including HTML, Cobertura XML,
+JSON, text summaries, and `inputs.txt`. The aggregate is union evidence from
+two real builds, not coverage from a single binary. CI uploads both individual
+coverage directories and raw traces with this aggregate as
+`zephyr-wamr-coverage-native-sim`.
 
-| Metric | Covered | Total | gcovr display |
-| --- | ---: | ---: | ---: |
-| Lines | 228 | 366 | 62% |
-| Branches | 51 | 110 | 46% |
+The `af729dc6` and `d286e15c` suffixes are the first eight hex characters of
+the scenario SHA-256. They keep same-slug scenarios distinct in this small
+trusted scenario set, which makes them collision-resistant here without
+claiming a collision-free naming scheme.
 
-Zephyr 3.7 Twister does not expose a source-filter option for coverage report
-generation. To reproduce the focused view without changing Twister's verdict,
-run these post-report commands from the WAMR checkout root:
+Task 6 established the Zephyr 3.7.0 pinned baseline on 2026-08-27. Task 7
+reran the affected 3.7 roots and both focused coverage scenarios on
+2026-08-28 after landing the 4.4-compatible fixes:
 
-```bash
-docker run --rm \
-  -v "$PWD:/root/zephyrproject/modules/wasm-micro-runtime" \
-  -w /root/zephyrproject/modules/wasm-micro-runtime wamr-zephyr \
-  gcovr -r /root/zephyrproject/modules/wasm-micro-runtime \
-  --filter 'core/shared/platform/zephyr/' \
-  --add-tracefile product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-coverage/coverage.json \
-  --txt-metric line --txt -
+| File | Lines | Exec | Line cover | Branches | Taken | Branch cover |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `core/shared/platform/zephyr/platform_internal.h` | 7 | 7 | 100% | 0 | 0 | -- |
+| `core/shared/platform/zephyr/zephyr_platform.c` | 51 | 49 | 96% | 8 | 8 | 100% |
+| `core/shared/platform/zephyr/zephyr_thread.c` | 530 | 441 | 83% | 316 | 211 | 66% |
+| `core/shared/platform/zephyr/zephyr_time.c` | 10 | 10 | 100% | 2 | 1 | 50% |
+| Total | 598 | 507 | 84% | 326 | 220 | 67% |
 
-docker run --rm \
-  -v "$PWD:/root/zephyrproject/modules/wasm-micro-runtime" \
-  -w /root/zephyrproject/modules/wasm-micro-runtime wamr-zephyr \
-  gcovr -r /root/zephyrproject/modules/wasm-micro-runtime \
-  --filter 'core/shared/platform/zephyr/' \
-  --add-tracefile product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-coverage/coverage.json \
-  --txt-metric branch --txt -
+Task 7 reran the affected ordinary roots on the pinned 3.7.0 baseline:
+
+| Group | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `native_sim simple-file` | 1 | 1 | 0 | 0 | 0 |
+| `native_sim simple-http` | 1 | 0 | 1 | 0 | 0 |
+| `native_sim tests/platform_api` | 2 | 126 | 28 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/platform_api` | 2 | 140 | 16 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs user-mode` | 2 | 2 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs user-mode-multi-thread` | 1 | 1 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/runtime` | 2 | 14 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/usermode_faults` | 5 | 5 | 0 | 0 | 0 |
+
+The complete 11-entry matrix verdict below combines those fresh Task 7 reruns
+with the three unaffected 2026-08-27 artifacts preserved from the initial full
+run. All 11 `twister.json` files contributing to this table reported zero
+null-status testcase records.
+
+| Entry | Evidence source | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `native_sim simple` | preserved from the initial 2026-08-27 full run | 1 | 1 | 0 | 0 | 0 |
+| `qemu_arc simple` | preserved from the initial 2026-08-27 full run | 1 | 1 | 0 | 0 | 0 |
+| `native_sim simple-file` | fresh rerun on 2026-08-28 after the Task 7 fixes | 1 | 1 | 0 | 0 | 0 |
+| `native_sim simple-http` | fresh rerun on 2026-08-28 after the Task 7 fixes | 1 | 0 | 1 | 0 | 0 |
+| `qemu_arc user-mode` | fresh rerun on 2026-08-28 after the Task 7 fixes | 2 | 2 | 0 | 0 | 0 |
+| `qemu_arc user-mode-multi-thread` | fresh rerun on 2026-08-28 after the Task 7 fixes | 1 | 1 | 0 | 0 | 0 |
+| `native_sim tests/platform_api` | fresh rerun on 2026-08-28 after the Task 7 fixes | 2 | 126 | 28 | 0 | 0 |
+| `qemu_arc tests/platform_api` | fresh rerun on 2026-08-28 after the Task 7 fixes | 2 | 140 | 16 | 0 | 0 |
+| `native_sim tests/runtime` | preserved from the initial 2026-08-27 full run | 1 | 8 | 0 | 0 | 0 |
+| `qemu_arc tests/runtime` | fresh rerun on 2026-08-28 after the Task 7 fixes | 2 | 14 | 0 | 0 | 0 |
+| `qemu_arc tests/usermode_faults` | fresh rerun on 2026-08-28 after the Task 7 fixes | 5 | 5 | 0 | 0 | 0 |
+
+| Platform group | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `native_sim` | 6 | 136 | 29 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs` | 13 | 163 | 16 | 0 | 0 |
+| Zephyr matrix total | 19 | 299 | 45 | 0 | 0 |
+
+The 2026-08-27 full-matrix run above stayed on the pinned Zephyr 3.7.0
+baseline. Task 7 then reran only the previously affected roots and focused
+coverage scenarios on 2026-08-28 in a disposable Zephyr 4.4.0 probe
+environment rooted at `/tmp/wamr-zephyr-4.4-probe`; those compatibility reruns
+do not change the repository pin.
+
+Exact disposable 4.4.0 probe inventory:
+
+- Zephyr `v4.4.0` (`684c9e8f32e4373a21098559f748f06915f950c9`)
+- `west` 1.5.0
+- Python 3.12.3
+- `gcovr` 8.6
+- Zephyr SDK 1.0.1
+- `gperf` 3.1 at `/tmp/task7-gperf/usr/bin/gperf`
+
+All commands below ran from `/home/tl/projects/wasm-micro-runtime`.
+
+Exact affected 4.4 ordinary rerun commands:
+
+```sh
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/simple-file --platform native_sim -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-simple-file-native_sim --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/simple-http --platform native_sim -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-simple-http-native_sim --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/platform_api --platform native_sim -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-tests-platform_api-native_sim --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/platform_api --platform qemu_arc/qemu_arc_hs -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-tests-platform_api-qemu_arc --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/user-mode --platform qemu_arc/qemu_arc_hs -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-user-mode-qemu_arc --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/user-mode-multi-thread --platform qemu_arc/qemu_arc_hs -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-user-mode-multi-thread-qemu_arc --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/runtime --platform qemu_arc/qemu_arc_hs -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-tests-runtime-qemu_arc --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/usermode_faults --platform qemu_arc/qemu_arc_hs -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --outdir /tmp/wamr-zephyr-4.4-probe/outputs/ordinary/twister-tests-usermode_faults-qemu_arc --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
 ```
 
-QEMU ARC coverage is not supported by this pinned setup. The single bounded
-feasibility run of `--coverage --sim qemu_arc tests/usermode_faults` exited 1:
-the instrumented suite timed out after
-`test_user_cannot_access_supervisor_runtime_state` reported
-`workflow_completed is false`, and Twister then reported `Can't find a suitable
-gcov tool`. CMake had resolved `CMAKE_GCOV` to the SDK's
-`arc-zephyr-elf-gcov`, but Twister's coverage post-processing did not use it
-and the container does not set `ZEPHYR_SDK_INSTALL_DIR`. No coverage report was
-produced. QEMU ARC remains behavioral evidence only; there is no QEMU coverage
-lane.
+Exact affected 4.4 focused coverage and aggregate commands:
+
+```sh
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/platform_api --platform native_sim -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --test wamr.zephyr.platform_api.kernel --coverage --coverage-basedir /home/tl/projects/wasm-micro-runtime --coverage-tool gcovr --coverage-formats html,xml --outdir /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/zephyr ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 west twister -T product-mini/platforms/zephyr/tests/platform_api --platform native_sim -x EXTRA_ZEPHYR_MODULES=/home/tl/projects/wasm-micro-runtime --test wamr.zephyr.platform_api.kernel_stack_info --coverage --coverage-basedir /home/tl/projects/wasm-micro-runtime --coverage-tool gcovr --coverage-formats html,xml --outdir /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH python3 product-mini/platforms/zephyr/coverage_report.py --root /home/tl/projects/wasm-micro-runtime --output-dir /tmp/wamr-zephyr-4.4-probe/outputs/coverage-zephyr-platform-aggregate-4.4 /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
+```
+
+QEMU ARC remains behavioral userspace evidence rather than a coverage lane.
+On 2026-08-28, Task 7 reran every previously affected Zephyr 4.4.0 root
+against the official signed `v4.4.0` tag
+(`684c9e8f32e4373a21098559f748f06915f950c9`) in
+`/tmp/wamr-zephyr-4.4-probe`. Before rerunning the userspace roots, Task 7
+installed `gperf` at `/tmp/task7-gperf/usr/bin/gperf` (`GNU gperf 3.1`) and
+reran the blocked outdirs with `--clobber-output`; the rebuilt 4.4 userspace
+`CMakeCache.txt` files now record
+`GPERF:FILEPATH=/tmp/task7-gperf/usr/bin/gperf`. Remaining optional misses were
+`CMAKE_C_COMPILER_CLANG_SCAN_DEPS`, `CMAKE_DLLTOOL`, `CMAKE_TAPI`, `IMGTOOL`,
+`PAHOLE`, `PTY_INTERFACE`, and `PUNCOVER`, and none of them blocked these
+roots.
+
+The resolved upstream issue is a Zephyr 4.4.x condvar timeout regression. The
+public `k_condvar_wait()` contract says the mutex is released while blocked and
+re-acquired before the call returns. In Zephyr 4.4.0 through 4.4.2,
+`kernel/condvar.c` reacquires the mutex only when `ret == 0`, so timeout
+returns `-EAGAIN` with the mutex still unlocked. WAMR's
+`os_cond_reltimedwait()` and userspace `os_cond_wait_user()` paths depended on
+that public contract, so
+`platform_sync.condition_timed_wait_returns` failed on `os_mutex_unlock()`
+after timeout and both native focused coverage scenarios failed the same way.
+Upstream commit `5c6c6837cc4026a70e670c265fc4d1e3b1f16379` fixes the
+behavior after the 4.4 release line. Task 7 therefore adds a
+`[4.4.0, 4.5.0)` workaround that relocks only on `-EAGAIN`. Zephyr 3.7.0
+cannot double-lock because its `k_condvar_wait()` implementation reacquires
+unconditionally before return; fixed 4.5+ releases cannot double-lock because
+the helper compiles to a no-op outside the affected 4.4.x interval.
+
+Task 7 also resolved three local 4.4 compatibility defects separately:
+
+| Root | Local defect | Final fix |
+| --- | --- | --- |
+| `simple-file/native_sim` | obsolete `CONFIG_ETH_NATIVE_POSIX=n`; native runtime also needed heap and file-descriptor capacity | remove `CONFIG_ETH_NATIVE_POSIX=n`, add `CONFIG_HEAP_MEM_POOL_SIZE=1024`, add `CONFIG_ZVFS_OPEN_MAX=4` |
+| `simple-http/native_sim` | native socket sample linked with unresolved `k_calloc` | add `CONFIG_HEAP_MEM_POOL_SIZE=1024` |
+| `tests/platform_api/qemu_arc/qemu_arc_hs` | `test_common.c` used `os_self_thread()` without the public prototype | include `platform_api_vmcore.h` |
+
+The `simple-file` fix is minimal: removing only `ETH_NATIVE_POSIX` still fails
+with unresolved `k_calloc`, and adding heap without `CONFIG_ZVFS_OPEN_MAX=4`
+still fails at `all file descriptor slots are in use (max = 0)`.
+
+The final affected 4.4 rerun set passed cleanly:
+
+| Root | Suites passed | Testcases passed | Testcases skipped | Testcases not run | Failed | Error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `native_sim simple-file` | 1 | 1 | 0 | 0 | 0 | 0 |
+| `native_sim simple-http` | 1 build-only | 0 | 0 | 1 | 0 | 0 |
+| `native_sim tests/platform_api` | 2 | 126 | 28 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/platform_api` | 2 | 140 | 16 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs user-mode` | 2 | 2 | 0 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs user-mode-multi-thread` | 1 | 1 | 0 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/runtime` | 2 | 14 | 0 | 0 | 0 | 0 |
+| `qemu_arc/qemu_arc_hs tests/usermode_faults` | 5 | 5 | 0 | 0 | 0 | 0 |
+
+Affected 4.4 rerun total: 15 executed configurations passed, 1 build-only
+configuration completed without failure, 289 testcases passed, 44 skipped, 1
+`not run`, and 0 failed or errored.
+
+The two 4.4 native coverage scenarios now pass as well:
+
+| Scenario | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `wamr.zephyr.platform_api.kernel` | 1 | 63 | 14 | 0 | 0 |
+| `wamr.zephyr.platform_api.kernel_stack_info` | 1 | 63 | 14 | 0 | 0 |
+
+The separate 4.4 aggregate at
+`/tmp/wamr-zephyr-4.4-probe/outputs/coverage-zephyr-platform-aggregate-4.4/`
+records the post-fix production totals below:
+
+| File | Lines | Exec | Line cover | Branches | Taken | Branch cover |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `core/shared/platform/zephyr/platform_internal.h` | 7 | 7 | 100% | 0 | 0 | -- |
+| `core/shared/platform/zephyr/zephyr_platform.c` | 51 | 49 | 96% | 8 | 8 | 100% |
+| `core/shared/platform/zephyr/zephyr_thread.c` | 532 | 443 | 83% | 318 | 213 | 67% |
+| `core/shared/platform/zephyr/zephyr_time.c` | 10 | 10 | 100% | 2 | 1 | 50% |
+| Total | 600 | 509 | 84% | 328 | 222 | 67% |
+
+Zephyr 3.7.0 remains the supported and pinned baseline. The Zephyr 4.4.0
+results are compatibility evidence and do not change the repository pin. No
+WASI, AOT, or broader I/O expansion was added in Task 7. Task 6 still provided
+the gcovr aggregate fix and the sync-pool permission fix for
+`platform_sync.test_prepared_native_sync_objects_require_inherited_permissions`.
 
 The pilot supports `native_sim` and `qemu_arc/qemu_arc_hs`. `native_sim` runs
 the kernel scenarios only and is a fast host smoke target, not a userspace
@@ -406,8 +549,8 @@ board testing remain lower-priority future work.
 
 1. Create a directory next to the existing samples with the usual Zephyr
    application layout: `CMakeLists.txt`, `prj.conf`, `src/`, and optionally
-   `boards/<board-identifier>.conf`. Keep `CMakeLists.txt` to
-   `find_package(Zephyr ...)`, `project(...)` and `target_sources(app ...)`;
+   `boards/<board-identifier>.conf`. Keep `CMakeLists.txt` to the usual
+   Zephyr `find_package`, `project`, and `target_sources` calls;
    the runtime comes from the module, so nothing WAMR specific belongs there.
 2. Select the runtime features with `CONFIG_WAMR_*` in `prj.conf`, as described
    in [Configuring the runtime](#configuring-the-runtime).

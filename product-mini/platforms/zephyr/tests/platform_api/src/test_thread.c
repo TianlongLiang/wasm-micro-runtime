@@ -417,6 +417,19 @@ wait_for_atomic_count(atomic_t *counter, size_t expected)
 ZTEST_SUITE(platform_thread, NULL, NULL, wamr_thread_test_before, pool_after,
             NULL);
 
+/* Catches a regression where stack metadata is ignored or exposed incorrectly. */
+ZTEST(platform_thread, test_stack_boundary_matches_configuration)
+{
+#if defined(CONFIG_THREAD_STACK_INFO) && !defined(CONFIG_USERSPACE)
+    zassert_equal(os_thread_get_stack_boundary(),
+                  (uint8_t *)k_current_get()->stack_info.start,
+                  "stack boundary does not match Zephyr metadata");
+#else
+    zassert_is_null(os_thread_get_stack_boundary(),
+                    "stack boundary exists without stack metadata");
+#endif
+}
+
 WAMR_CONTEXT_TEST(platform_thread,
                   test_platform_lifecycle_exposes_current_thread)
 {

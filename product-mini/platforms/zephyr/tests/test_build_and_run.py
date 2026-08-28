@@ -27,6 +27,7 @@ class ResolveTestRootTest(unittest.TestCase):
         self.assertIn("sample or tests/... test root", result.stdout)
         self.assertIn("sample.yaml or testcase.yaml", result.stdout)
         self.assertIn("--coverage", result.stdout)
+        self.assertIn("--scenario", result.stdout)
 
     def test_resolves_existing_sample(self):
         self.assertEqual(MODULE.resolve_test_root("simple"), Path("simple"))
@@ -42,7 +43,65 @@ class ResolveTestRootTest(unittest.TestCase):
             MODULE.resolve_test_root("../simple")
 
 
+class ScenarioNamingTest(unittest.TestCase):
+    def test_scenario_slug_uses_readable_artifact_component(self):
+        self.assertEqual(
+            MODULE.scenario_slug("wamr.zephyr.platform_api.kernel_stack_info"),
+            "wamr-zephyr-platform-api-kernel-stack-info",
+        )
+
+    def test_artifact_name_includes_scenario_slug(self):
+        self.assertEqual(
+            MODULE.artifact_name(
+                Path("tests/platform_api"),
+                "native_sim",
+                "wamr.zephyr.platform_api.kernel",
+            ),
+            "tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6",
+        )
+
+    def test_scenarios_with_same_readable_slug_have_distinct_artifacts(self):
+        scenarios = ("wamr.foo_bar", "wamr.foo.bar", "wamr.foo-bar")
+        artifacts = {
+            MODULE.artifact_name(Path("tests/platform_api"), "native_sim", name)
+            for name in scenarios
+        }
+
+        self.assertEqual(len(artifacts), len(scenarios))
+        self.assertEqual(
+            artifacts,
+            {
+                "tests-platform_api-native_sim-wamr-foo-bar-c30eabbb",
+                "tests-platform_api-native_sim-wamr-foo-bar-5c71e64b",
+                "tests-platform_api-native_sim-wamr-foo-bar-39d93039",
+            },
+        )
+
+    def test_scenarios_without_alphanumeric_content_are_rejected(self):
+        for scenario in ("", ".", "_", "-", "...", "_-.-"):
+            with self.subTest(scenario=scenario), self.assertRaises(ValueError):
+                MODULE.scenario_slug(scenario)
+
+    def test_scenario_with_path_separator_is_rejected(self):
+        with self.assertRaises(ValueError):
+            MODULE.artifact_name(
+                Path("tests/platform_api"), "native_sim", "wamr/zephyr"
+            )
+
+
 class TwisterCommandTest(unittest.TestCase):
+    def test_selected_scenario_is_forwarded_exactly(self):
+        scenario = "wamr.zephyr.platform_api.kernel_stack_info"
+        command = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "native_sim",
+            False,
+            scenario=scenario,
+        )
+
+        tokens = shlex.split(command)
+        self.assertEqual(tokens[tokens.index("-s") + 1], scenario)
+
     def test_coverage_forwards_zephyr_3_7_gcovr_options(self):
         command = MODULE.twister_command(
             Path("tests/platform_api"), "native_sim", False, coverage=True
@@ -113,3 +172,29 @@ class TwisterCommandTest(unittest.TestCase):
         self.assertIn(plain_outdir, plain)
         self.assertNotIn(f"{plain_outdir}-coverage", plain)
         self.assertNotIn("--coverage", plain.split())
+
+    def test_plain_and_coverage_outputs_include_selected_scenario(self):
+        scenario = "wamr.zephyr.platform_api.kernel"
+        slug = "wamr-zephyr-platform-api-kernel"
+        coverage = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "native_sim",
+            False,
+            coverage=True,
+            scenario=scenario,
+        )
+        plain = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "native_sim",
+            False,
+            scenario=scenario,
+        )
+
+        base = f"{MODULE.HERE}/build/twister-tests-platform_api-native_sim-{slug}"
+        base += "-af729dc6"
+        self.assertIn(f"--outdir {base}-coverage", coverage)
+        self.assertIn(f"--outdir {base}", plain)
+
+
+if __name__ == "__main__":
+    unittest.main()

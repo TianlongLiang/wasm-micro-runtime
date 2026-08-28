@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 
 #include "test_common.h"
+#include "platform_api_vmcore.h"
 #include "zephyr_sync_pool.h"
 #include "zephyr_thread_pool.h"
 
@@ -96,6 +97,22 @@ wamr_test_sync_pool_prepare(void)
     return wamr_zephyr_sync_pool_prepare(&wamr_test_sync, k_current_get());
 }
 
+void
+wamr_test_sync_pool_grant_current(void)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    k_tid_t current = k_current_get();
+
+    k_object_access_grant(wamr_test_sync.management_lock, current);
+    for (size_t i = 0; i < wamr_test_sync.mutex_count; i++) {
+        k_object_access_grant(&wamr_test_sync.mutexes[i], current);
+    }
+    for (size_t i = 0; i < wamr_test_sync.condvar_count; i++) {
+        k_object_access_grant(&wamr_test_sync.condvars[i], current);
+    }
+#endif
+}
+
 struct k_mutex *
 wamr_test_sync_mutex(void)
 {
@@ -118,14 +135,13 @@ wamr_thread_test_before(void *fixture)
     args.mem_alloc_type = Alloc_With_Pool;
     args.mem_alloc_option.pool.heap_buf = thread_test_pool;
     args.mem_alloc_option.pool.heap_size = sizeof(thread_test_pool);
-    zassert_equal(wamr_test_thread_pool_prepare(), BHT_OK,
-                  "thread pool preparation failed");
+    prepare_runtime_pools();
     zassert_true(wasm_runtime_full_init(&args), "pool init failed");
 }
 
 ZTEST_SUITE(platform_thread_pool, NULL, NULL, NULL, NULL, NULL);
 
-ZTEST(platform_thread_pool, test_prepare_validates_and_preserves_pool)
+ZTEST(platform_thread_pool, test_thread_pool_prepare_validates_and_preserves_pool)
 {
     wamr_zephyr_thread_pool_t malformed = wamr_test_threads;
     RuntimeInitArgs args = { 0 };
@@ -291,6 +307,9 @@ wamr_test_sync_pool_prepare_contract(k_tid_t owner)
     args.mem_alloc_type = Alloc_With_Pool;
     args.mem_alloc_option.pool.heap_buf = test_pool;
     args.mem_alloc_option.pool.heap_size = sizeof(test_pool);
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    (void)wamr_test_thread_pool_prepare();
+#endif
     fixture->runtime_init_succeeded = wasm_runtime_full_init(&args);
     if (fixture->runtime_init_succeeded) {
         wasm_runtime_destroy();
@@ -338,12 +357,22 @@ run_concurrent_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool)
                   "second concurrent prepare thread did not join");
 }
 
-ZTEST_SUITE(platform_sync_pool, NULL, NULL, NULL, NULL, NULL);
+static void
+sync_pool_before(void *fixture)
+{
+    ARG_UNUSED(fixture);
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    wamr_test_sync_pool_grant_current();
+#endif
+}
 
-ZTEST(platform_sync_pool, test_prepare_validates_and_preserves_pool)
+ZTEST_SUITE(platform_sync_pool, NULL, NULL, sync_pool_before, NULL, NULL);
+
+ZTEST(platform_sync_pool, test_sync_pool_prepare_validates_and_preserves_pool)
 {
     struct platform_sync_pool_fixture *fixture = &sync_pool_prepare_results;
 
+    wamr_test_sync_pool_prepare_contract(k_current_get());
     zassert_equal(fixture->null_pool_result, BHT_ERROR,
                   "null sync pool was accepted");
     zassert_equal(fixture->null_owner_result, BHT_ERROR,
@@ -385,8 +414,11 @@ ZTEST(platform_sync_pool, test_prepare_validates_and_preserves_pool)
 }
 
 ZTEST(platform_sync_pool,
-      test_concurrent_prepare_is_idempotent_and_rejects_replacement)
+      test_sync_pool_concurrent_prepare_preserves_owner)
 {
+    sync_pool_test_owner = k_current_get();
+    zassert_equal(wamr_test_sync_pool_prepare(), BHT_OK,
+                  "sync pool preparation failed before concurrent checks");
     run_concurrent_sync_pool_prepare(&wamr_test_sync);
     zassert_equal(concurrent_prepare_ctx[0].result, BHT_OK,
                   "first concurrent identical prepare failed");

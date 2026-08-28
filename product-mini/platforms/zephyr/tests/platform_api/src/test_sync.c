@@ -180,15 +180,19 @@ struct prepared_sync_access_context {
 ZTEST_DMEM static struct sync_fault_state sync_fault_state;
 ZTEST_DMEM static struct missing_condvar_wait_context missing_condvar_wait_ctx;
 ZTEST_DMEM static struct prepared_sync_access_context prepared_sync_access_ctx;
+ZTEST_DMEM static struct prepared_sync_access_context unrelated_sync_access_ctx;
 static struct k_thread missing_condvar_thread;
 static struct k_thread prepared_sync_access_thread;
-static k_tid_t prepared_sync_access_tid;
+static struct k_thread unrelated_sync_access_thread;
 static struct k_mutex missing_condvar_mutex;
 static struct k_condvar missing_condvar;
 static struct k_sem missing_condvar_fault_done;
+static struct k_sem unrelated_sync_access_fault_done;
 K_THREAD_STACK_DEFINE(missing_condvar_thread_stack,
                       WAMR_TEST_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(prepared_sync_access_thread_stack,
+                      WAMR_TEST_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(unrelated_sync_access_thread_stack,
                       WAMR_TEST_THREAD_STACK_SIZE);
 
 static void
@@ -428,16 +432,6 @@ sync_setup(void)
     memset(&prepared_sync_access_ctx, 0, sizeof(prepared_sync_access_ctx));
     prepared_sync_access_ctx.mutex = wamr_test_sync_mutex();
     prepared_sync_access_ctx.condvar = wamr_test_sync_condvar();
-    wamr_test_sync_pool_prepare_contract(k_current_get());
-    prepared_sync_access_tid = k_thread_create(
-        &prepared_sync_access_thread, prepared_sync_access_thread_stack,
-        K_THREAD_STACK_SIZEOF(prepared_sync_access_thread_stack),
-        prepared_sync_access_worker, &prepared_sync_access_ctx, NULL, NULL, 5,
-        K_USER | K_INHERIT_PERMS, K_FOREVER);
-    zassert_not_null(prepared_sync_access_tid,
-                     "prepared-sync user thread creation failed");
-#else
-    wamr_test_sync_pool_prepare_contract(k_current_get());
 #endif
     return &sync_results;
 }
@@ -570,30 +564,78 @@ WAMR_CONTEXT_TEST_F(platform_sync,
 #endif
 }
 
-ZTEST(platform_sync, test_prepared_native_sync_objects_are_user_accessible)
+ZTEST(platform_sync,
+      test_prepared_native_sync_objects_require_inherited_permissions)
 {
 #if defined(CONFIG_WAMR_TEST_USER_MODE)
+    k_tid_t inherited_tid;
+    k_tid_t unrelated_tid;
     int join_result;
+    int completion_result;
+    bool observed_fault;
 
+    /* Mutations caught: public grants or missing current-thread regrants. */
+    memset(&prepared_sync_access_ctx, 0, sizeof(prepared_sync_access_ctx));
+    prepared_sync_access_ctx.mutex = wamr_test_sync_mutex();
+    prepared_sync_access_ctx.condvar = wamr_test_sync_condvar();
     zassert_not_null(prepared_sync_access_ctx.mutex,
                      "prepared native mutex slot missing");
     zassert_not_null(prepared_sync_access_ctx.condvar,
                      "prepared native condvar slot missing");
-    k_thread_start(prepared_sync_access_tid);
-    join_result = k_thread_join(prepared_sync_access_tid, K_SECONDS(1));
+    inherited_tid = k_thread_create(
+        &prepared_sync_access_thread, prepared_sync_access_thread_stack,
+        K_THREAD_STACK_SIZEOF(prepared_sync_access_thread_stack),
+        prepared_sync_access_worker, &prepared_sync_access_ctx, NULL, NULL, 5,
+        K_USER | K_INHERIT_PERMS, K_FOREVER);
+    zassert_not_null(inherited_tid,
+                     "prepared-sync inherited user thread creation failed");
+    k_thread_start(inherited_tid);
+    join_result = k_thread_join(inherited_tid, K_SECONDS(1));
     if (join_result != 0) {
-        k_thread_abort(prepared_sync_access_tid);
+        k_thread_abort(inherited_tid);
     }
 
-    zassert_equal(join_result, 0, "prepared-sync user thread did not join");
+    zassert_equal(join_result, 0,
+                  "prepared-sync inherited user thread did not join");
     zassert_true(prepared_sync_access_ctx.completed,
-                 "prepared-sync user thread did not complete");
+                 "prepared-sync inherited user thread did not complete");
     zassert_equal(prepared_sync_access_ctx.lock_result, 0,
-                  "native mutex lock failed");
+                  "inherited native mutex lock failed");
     zassert_equal(prepared_sync_access_ctx.signal_result, 0,
-                  "native condvar signal failed");
+                  "inherited native condvar signal failed");
     zassert_equal(prepared_sync_access_ctx.unlock_result, 0,
-                  "native mutex unlock failed");
+                  "inherited native mutex unlock failed");
+
+    memset(&unrelated_sync_access_ctx, 0, sizeof(unrelated_sync_access_ctx));
+    unrelated_sync_access_ctx.mutex = wamr_test_sync_mutex();
+    unrelated_sync_access_ctx.condvar = wamr_test_sync_condvar();
+    k_sem_init(&unrelated_sync_access_fault_done, 0, 1);
+    unrelated_tid = k_thread_create(
+        &unrelated_sync_access_thread, unrelated_sync_access_thread_stack,
+        K_THREAD_STACK_SIZEOF(unrelated_sync_access_thread_stack),
+        prepared_sync_access_worker, &unrelated_sync_access_ctx, NULL, NULL, 5,
+        K_USER, K_FOREVER);
+    zassert_not_null(unrelated_tid,
+                     "prepared-sync unrelated user thread creation failed");
+    sync_fault_arm(unrelated_tid, &unrelated_sync_access_fault_done);
+    k_thread_start(unrelated_tid);
+    completion_result =
+        k_sem_take(&unrelated_sync_access_fault_done, K_SECONDS(1));
+    join_result = k_thread_join(unrelated_tid, K_SECONDS(1));
+    observed_fault = atomic_get(&sync_fault_state.observed) != 0;
+    if (join_result != 0) {
+        k_thread_abort(unrelated_tid);
+    }
+
+    zassert_equal(completion_result, 0,
+                  "unrelated user thread accessed sync pool without a fault");
+    zassert_equal(join_result, 0,
+                  "faulting unrelated user thread did not terminate");
+    zassert_false(unrelated_sync_access_ctx.completed,
+                  "unrelated user thread completed without inherited grants");
+    zassert_true(observed_fault,
+                 "unrelated sync-pool access was not observed as a fault");
+    sync_fault_disarm();
 #else
     ztest_test_skip();
 #endif

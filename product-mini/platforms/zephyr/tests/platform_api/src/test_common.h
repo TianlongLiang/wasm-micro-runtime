@@ -23,6 +23,8 @@ wamr_test_thread_pool_prepare(void);
 int
 wamr_test_sync_pool_prepare(void);
 void
+wamr_test_sync_pool_grant_current(void);
+void
 wamr_test_sync_pool_prepare_contract(k_tid_t owner);
 struct k_mutex *
 wamr_test_sync_mutex(void);
@@ -43,6 +45,18 @@ wamr_test_sync_condvar(void);
 WAMR_TEST_POOL_STORAGE static uint8_t test_pool[TEST_POOL_SIZE] __aligned(8);
 
 static void
+prepare_runtime_pools(void)
+{
+    zassert_equal(wamr_test_thread_pool_prepare(), BHT_OK,
+                  "thread pool preparation failed");
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    zassert_equal(wamr_test_sync_pool_prepare(), BHT_OK,
+                  "sync pool preparation failed");
+    wamr_test_sync_pool_grant_current();
+#endif
+}
+
+static void
 pool_before(void *fixture)
 {
     RuntimeInitArgs args = { 0 };
@@ -52,8 +66,7 @@ pool_before(void *fixture)
     args.mem_alloc_type = Alloc_With_Pool;
     args.mem_alloc_option.pool.heap_buf = test_pool;
     args.mem_alloc_option.pool.heap_size = sizeof(test_pool);
-    zassert_equal(wamr_test_thread_pool_prepare(), BHT_OK,
-                  "thread pool preparation failed");
+    prepare_runtime_pools();
     zassert_true(wasm_runtime_full_init(&args), "pool init failed");
 }
 

@@ -1422,6 +1422,29 @@ os_cond_destroy(korp_cond *cond)
 #endif
 }
 
+static int
+relock_condvar_timeout_mutex_if_needed(struct k_mutex *mutex, int wait_result)
+{
+#if KERNEL_VERSION_NUMBER >= ZEPHYR_VERSION(4, 4, 0) \
+    && KERNEL_VERSION_NUMBER < ZEPHYR_VERSION(4, 5, 0)
+    /*
+     * Zephyr 4.4.x returns -EAGAIN on timeout without re-locking the mutex,
+     * even though the public k_condvar_wait() contract says the mutex is
+     * reacquired before the wait call returns. Upstream commit 5c6c6837cc4
+     * fixes this after the 4.4 release line. Keep the workaround bounded to
+     * 4.4.x so older releases and fixed 4.5+ releases cannot double-lock.
+     */
+    if (wait_result == -EAGAIN) {
+        return k_mutex_lock(mutex, K_FOREVER);
+    }
+#else
+    ARG_UNUSED(mutex);
+    ARG_UNUSED(wait_result);
+#endif
+
+    return 0;
+}
+
 #if defined(CONFIG_USERSPACE)
 static int
 os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
@@ -1433,6 +1456,7 @@ os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
     struct k_mutex *native_mutex;
     korp_cond cond_handle;
     korp_mutex mutex_handle;
+    bool mutex_reacquired = true;
     int result;
 
     if (cond == NULL || *cond == NULL || mutex == NULL || *mutex == NULL
@@ -1461,6 +1485,9 @@ os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
     sync_metadata_unlock();
 
     result = k_condvar_wait(native_cond, native_mutex, timeout);
+    if (relock_condvar_timeout_mutex_if_needed(native_mutex, result) != 0) {
+        mutex_reacquired = false;
+    }
     if (!sync_metadata_lock()) {
         return BHT_ERROR;
     }
@@ -1474,13 +1501,16 @@ os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
         return BHT_ERROR;
     }
 
-    mutex_slot->owner = k_current_get();
-    mutex_slot->recursion = 1U;
+    mutex_slot->owner = mutex_reacquired ? k_current_get() : NULL;
+    mutex_slot->recursion = mutex_reacquired ? 1U : 0U;
     mutex_slot->active_operations--;
     cond_slot->active_waiters--;
     cond_slot->active_operations--;
     sync_metadata_unlock();
 
+    if (!mutex_reacquired) {
+        return BHT_ERROR;
+    }
     if (result == 0) {
         return BHT_OK;
     }
@@ -1537,6 +1567,9 @@ os_cond_reltimedwait(korp_cond *cond, korp_mutex *mutex, uint64 useconds)
                       "set to max timeout instead\n");
         }
         result = k_condvar_wait(cond, mutex, Z_TIMEOUT_MS(mills));
+        if (relock_condvar_timeout_mutex_if_needed(mutex, result) != 0) {
+            return BHT_ERROR;
+        }
         return result == 0 || result == -EAGAIN ? BHT_OK : BHT_ERROR;
     }
 #endif
