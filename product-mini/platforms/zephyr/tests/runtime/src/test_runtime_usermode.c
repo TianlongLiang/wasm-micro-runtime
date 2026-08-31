@@ -3,22 +3,83 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 
 #include <zephyr/app_memory/app_memdomain.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/ztest.h>
 
+#include "platform_api_vmcore.h"
+#include "platform_api_extension.h"
 #include "runtime_fixture.h"
 #include "wasm_fixtures.h"
 #include "zephyr_sync_pool.h"
+#include "zephyr_thread_pool.h"
 
 #define USER_WORKER_STACK_SIZE 8192U
 #define USER_WORKER_PRIORITY 5
-#define USER_WORKER_TIMEOUT K_SECONDS(1)
+#define USER_WORKER_TIMEOUT K_SECONDS(3)
 #define SMALL_POOL_SIZE 1024U
 #define FIXTURE_ACCESS_TOKEN 0x57414d52U
+#define RUNTIME_RESTART_ITERATIONS 8U
+#define RUNTIME_RESTART_GUARD_MS 1000U
+#define RUNTIME_WORKER_WAIT_MS 500U
+#define RUNTIME_FORCED_WORKER_WAIT_MS 2000U
+#define RUNTIME_TIMEOUT_US 10000U
+#define RUNTIME_WAMR_WORKER_STACK_SIZE 2048U
+
+enum runtime_restart_phase {
+    RUNTIME_RESTART_IDLE,
+    RUNTIME_RESTART_INITIALIZED,
+    RUNTIME_RESTART_WORKER_WAITING,
+    RUNTIME_RESTART_WORKER_RELEASED,
+    RUNTIME_RESTART_WORKER_FINISHED,
+    RUNTIME_RESTART_CLEANED,
+};
+
+struct runtime_restart_state {
+    korp_tid worker;
+    void *worker_return_value;
+    korp_mutex mutex;
+    korp_cond cond;
+    atomic_t phase;
+    uint32_t iteration;
+    int thread_create_result;
+    int thread_join_result;
+    int ready_wait_result;
+    int done_wait_result;
+    int recovery_lock_result;
+    int recovery_signal_result;
+    int recovery_unlock_result;
+    int exit_wait_result;
+    int worker_lock_result;
+    int worker_wait_result;
+    int worker_unlock_result;
+    int parent_lock_result;
+    int parent_signal_result;
+    int parent_unlock_result;
+    int timeout_result;
+    int timeout_unlock_result;
+    int reacquire_lock_result;
+    int reacquire_unlock_result;
+    int cond_destroy_result;
+    int mutex_destroy_result;
+    int teardown_command_result;
+    int root_join_result;
+    bool runtime_owned;
+    bool worker_owned;
+    bool mutex_owned;
+    bool cond_owned;
+    bool force_done_guard_timeout;
+    bool recovery_attempted;
+    bool guard_expired;
+    bool poisoned;
+    bool cleanup_complete;
+    bool workflow_succeeded;
+};
 
 struct runtime_user_mode_fixture {
     k_thread_entry_t worker_entry;
@@ -31,6 +92,7 @@ struct runtime_user_mode_fixture {
     uint32_t result;
     uint32_t run_count;
     uint32_t access_token;
+    struct runtime_restart_state restart;
     char diagnostic[WAMR_TEST_ERROR_SIZE];
 };
 
@@ -45,12 +107,288 @@ K_THREAD_STACK_DEFINE(runtime_worker_stack, USER_WORKER_STACK_SIZE);
 static k_tid_t runtime_worker_tid;
 static struct k_sem worker_command;
 static struct k_sem worker_done;
+static struct k_sem runtime_child_ready;
+static struct k_sem runtime_child_done;
 WAMR_ZEPHYR_SYNC_POOL_DEFINE(runtime_sync, 16, 8);
+WAMR_ZEPHYR_THREAD_POOL_DEFINE(runtime_threads, 4,
+                               RUNTIME_WAMR_WORKER_STACK_SIZE);
 
 K_APP_BMEM(wamr_partition) static struct loaded_runtime user_runtime;
 K_APP_BMEM(wamr_partition)
 static uint8_t small_pool[SMALL_POOL_SIZE] __aligned(8);
 ZTEST_DMEM static struct runtime_user_mode_fixture user_results = { 0 };
+
+static void
+complete_worker(struct runtime_user_mode_fixture *results);
+
+int
+wamr_zephyr_thread_test_wait(korp_tid handle, k_timeout_t timeout);
+struct k_mutex *
+wamr_zephyr_sync_test_native_mutex(korp_mutex handle);
+
+static int
+prepare_runtime_thread_pool(k_tid_t owner)
+{
+    return wamr_zephyr_thread_pool_prepare(&runtime_threads, owner);
+}
+
+static bool
+reset_restart_state(struct runtime_restart_state *state, uint32_t iteration)
+{
+    if (state->runtime_owned || state->worker_owned || state->mutex_owned
+        || state->cond_owned || state->poisoned) {
+        return false;
+    }
+    memset(state, 0, sizeof(*state));
+    state->iteration = iteration;
+    state->thread_create_result = BHT_ERROR;
+    state->thread_join_result = BHT_ERROR;
+    state->ready_wait_result = -EAGAIN;
+    state->done_wait_result = -EAGAIN;
+    state->recovery_lock_result = BHT_ERROR;
+    state->recovery_signal_result = BHT_ERROR;
+    state->recovery_unlock_result = BHT_ERROR;
+    state->exit_wait_result = BHT_ERROR;
+    state->worker_lock_result = BHT_ERROR;
+    state->worker_wait_result = BHT_ERROR;
+    state->worker_unlock_result = BHT_ERROR;
+    state->parent_lock_result = BHT_ERROR;
+    state->parent_signal_result = BHT_ERROR;
+    state->parent_unlock_result = BHT_ERROR;
+    state->timeout_result = BHT_ERROR;
+    state->timeout_unlock_result = BHT_ERROR;
+    state->reacquire_lock_result = BHT_ERROR;
+    state->reacquire_unlock_result = BHT_ERROR;
+    state->cond_destroy_result = BHT_ERROR;
+    state->mutex_destroy_result = BHT_ERROR;
+    state->teardown_command_result = -EAGAIN;
+    state->root_join_result = -EAGAIN;
+    return true;
+}
+
+static void *
+runtime_restart_child(void *arg)
+{
+    struct runtime_restart_state *state = arg;
+    int64_t deadline = k_uptime_get()
+                       + (state->force_done_guard_timeout
+                              ? RUNTIME_FORCED_WORKER_WAIT_MS
+                              : RUNTIME_WORKER_WAIT_MS);
+
+    state->worker_lock_result = os_mutex_lock(&state->mutex);
+    if (state->worker_lock_result == BHT_OK) {
+        atomic_set(&state->phase, RUNTIME_RESTART_WORKER_WAITING);
+        k_sem_give(&runtime_child_ready);
+        do {
+            int64_t remaining_ms = deadline - k_uptime_get();
+
+            if (remaining_ms <= 0) {
+                state->worker_wait_result = ETIMEDOUT;
+                break;
+            }
+            state->worker_wait_result = os_cond_reltimedwait(
+                &state->cond, &state->mutex,
+                (uint64)remaining_ms * 1000U);
+        } while (state->worker_wait_result == BHT_OK
+                 && atomic_get(&state->phase)
+                        != RUNTIME_RESTART_WORKER_RELEASED);
+        state->worker_unlock_result = os_mutex_unlock(&state->mutex);
+    }
+    atomic_set(&state->phase, RUNTIME_RESTART_WORKER_FINISHED);
+    k_sem_give(&runtime_child_done);
+    return state;
+}
+
+static void
+release_runtime_restart_child(struct runtime_restart_state *state)
+{
+    state->parent_lock_result = os_mutex_lock(&state->mutex);
+    if (state->parent_lock_result != BHT_OK) {
+        return;
+    }
+    atomic_set(&state->phase, RUNTIME_RESTART_WORKER_RELEASED);
+    state->parent_signal_result = os_cond_signal(&state->cond);
+    state->parent_unlock_result = os_mutex_unlock(&state->mutex);
+}
+
+static void
+recover_runtime_restart_child(struct runtime_restart_state *state)
+{
+    struct k_mutex *native_mutex;
+
+    if (state->recovery_attempted || !state->mutex_owned
+        || !state->cond_owned
+        || atomic_get(&state->phase) != RUNTIME_RESTART_WORKER_WAITING) {
+        return;
+    }
+
+    state->recovery_attempted = true;
+    native_mutex = wamr_zephyr_sync_test_native_mutex(state->mutex);
+    if (native_mutex == NULL) {
+        return;
+    }
+    state->recovery_lock_result = k_mutex_lock(
+        native_mutex, K_MSEC(RUNTIME_RESTART_GUARD_MS));
+    if (state->recovery_lock_result != 0) {
+        return;
+    }
+    atomic_set(&state->phase, RUNTIME_RESTART_WORKER_RELEASED);
+    state->recovery_signal_result = os_cond_broadcast(&state->cond);
+    state->recovery_unlock_result = k_mutex_unlock(native_mutex);
+}
+
+static void
+cleanup_runtime_restart(struct runtime_restart_state *state)
+{
+    if (state->worker_owned) {
+        state->done_wait_result = k_sem_take(
+            &runtime_child_done, K_MSEC(RUNTIME_RESTART_GUARD_MS));
+        if (state->done_wait_result != 0) {
+            state->guard_expired = true;
+            recover_runtime_restart_child(state);
+        }
+        state->exit_wait_result = wamr_zephyr_thread_test_wait(
+            state->worker, K_MSEC(RUNTIME_RESTART_GUARD_MS));
+        if (state->exit_wait_result == 0) {
+            state->thread_join_result =
+                os_thread_join(state->worker, &state->worker_return_value);
+            state->worker_owned = state->thread_join_result != BHT_OK;
+        }
+        if (state->worker_owned) {
+            state->poisoned = true;
+            return;
+        }
+    }
+    if (state->cond_owned) {
+        state->cond_destroy_result = os_cond_destroy(&state->cond);
+        state->cond_owned = state->cond_destroy_result != BHT_OK;
+    }
+    if (state->mutex_owned) {
+        state->mutex_destroy_result = os_mutex_destroy(&state->mutex);
+        state->mutex_owned = state->mutex_destroy_result != BHT_OK;
+    }
+    if (!state->cond_owned && !state->mutex_owned && state->runtime_owned) {
+        wamr_test_runtime_stop(&user_runtime.runtime);
+        state->runtime_owned = false;
+    }
+    state->cleanup_complete = !state->runtime_owned && !state->worker_owned
+                              && !state->mutex_owned && !state->cond_owned;
+    if (state->cleanup_complete) {
+        state->poisoned = false;
+        atomic_set(&state->phase, RUNTIME_RESTART_CLEANED);
+    }
+}
+
+static void
+runtime_worker_restart_workflow(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    struct runtime_restart_state *state = &results->restart;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    state->runtime_owned = wamr_test_runtime_init(
+        &user_runtime.runtime, user_runtime.pool, sizeof(user_runtime.pool));
+    if (state->runtime_owned) {
+        atomic_set(&state->phase, RUNTIME_RESTART_INITIALIZED);
+        state->mutex_owned = os_mutex_init(&state->mutex) == BHT_OK;
+        state->cond_owned = os_cond_init(&state->cond) == BHT_OK;
+    }
+    if (state->mutex_owned && state->cond_owned) {
+        state->thread_create_result = os_thread_create(
+            &state->worker, runtime_restart_child, state,
+            RUNTIME_WAMR_WORKER_STACK_SIZE);
+        state->worker_owned = state->thread_create_result == BHT_OK;
+    }
+    if (state->worker_owned) {
+        state->ready_wait_result = k_sem_take(
+            &runtime_child_ready, K_MSEC(RUNTIME_RESTART_GUARD_MS));
+        if (state->ready_wait_result == 0
+            && atomic_get(&state->phase)
+                   == RUNTIME_RESTART_WORKER_WAITING) {
+            if (!state->force_done_guard_timeout) {
+                release_runtime_restart_child(state);
+            }
+        }
+        else {
+            state->guard_expired = true;
+        }
+    }
+    cleanup_runtime_restart(state);
+    state->workflow_succeeded =
+        state->thread_create_result == BHT_OK
+        && state->thread_join_result == BHT_OK
+        && state->ready_wait_result == 0 && state->done_wait_result == 0
+        && state->exit_wait_result == 0
+        && state->worker_return_value == state
+        && state->worker_lock_result == BHT_OK
+        && state->worker_wait_result == BHT_OK
+        && state->worker_unlock_result == BHT_OK
+        && state->parent_lock_result == BHT_OK
+        && state->parent_signal_result == BHT_OK
+        && state->parent_unlock_result == BHT_OK
+        && state->cond_destroy_result == BHT_OK
+        && state->mutex_destroy_result == BHT_OK && !state->guard_expired
+        && state->cleanup_complete;
+    complete_worker(results);
+}
+
+static void
+runtime_timeout_restart_workflow(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+    struct runtime_restart_state *state = &results->restart;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    state->runtime_owned = wamr_test_runtime_init(
+        &user_runtime.runtime, user_runtime.pool, sizeof(user_runtime.pool));
+    if (state->runtime_owned) {
+        atomic_set(&state->phase, RUNTIME_RESTART_INITIALIZED);
+        state->mutex_owned = os_mutex_init(&state->mutex) == BHT_OK;
+        state->cond_owned = os_cond_init(&state->cond) == BHT_OK;
+    }
+    if (state->mutex_owned && state->cond_owned) {
+        state->parent_lock_result = os_mutex_lock(&state->mutex);
+        if (state->parent_lock_result == BHT_OK) {
+            state->timeout_result = os_cond_reltimedwait(
+                &state->cond, &state->mutex, RUNTIME_TIMEOUT_US);
+            state->timeout_unlock_result = os_mutex_unlock(&state->mutex);
+            state->reacquire_lock_result = os_mutex_lock(&state->mutex);
+            if (state->reacquire_lock_result == BHT_OK) {
+                state->reacquire_unlock_result =
+                    os_mutex_unlock(&state->mutex);
+            }
+        }
+    }
+    cleanup_runtime_restart(state);
+    state->workflow_succeeded = state->timeout_result == ETIMEDOUT
+                                && state->timeout_unlock_result == BHT_OK
+                                && state->reacquire_lock_result == BHT_OK
+                                && state->reacquire_unlock_result == BHT_OK
+                                && state->cond_destroy_result == BHT_OK
+                                && state->mutex_destroy_result == BHT_OK
+                                && state->cleanup_complete;
+    complete_worker(results);
+}
+
+static void
+runtime_restart_teardown_workflow(void *arg1, void *arg2, void *arg3)
+{
+    struct runtime_user_mode_fixture *results = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    cleanup_runtime_restart(&results->restart);
+    complete_worker(results);
+}
+
+static bool
+restart_state_has_ownership(const struct runtime_restart_state *state)
+{
+    return state->runtime_owned || state->worker_owned || state->mutex_owned
+           || state->cond_owned || state->poisoned;
+}
 
 static bool
 run_add_lifecycle(uint32_t *result)
@@ -237,6 +575,8 @@ runtime_user_mode_setup(void)
         "WAMR memory domain initialization failed");
     k_sem_init(&worker_command, 0, 1);
     k_sem_init(&worker_done, 0, 1);
+    k_sem_init(&runtime_child_ready, 0, 1);
+    k_sem_init(&runtime_child_done, 0, 1);
     runtime_worker_tid = k_thread_create(
         &runtime_worker, runtime_worker_stack,
         K_THREAD_STACK_SIZEOF(runtime_worker_stack), runtime_user_worker,
@@ -247,8 +587,12 @@ runtime_user_mode_setup(void)
     zassert_equal(
         wamr_zephyr_sync_pool_prepare(&runtime_sync, runtime_worker_tid), 0,
         "WAMR sync pool preparation failed");
+    zassert_equal(prepare_runtime_thread_pool(runtime_worker_tid), BHT_OK,
+                  "WAMR thread pool preparation failed");
     k_object_access_grant(&worker_command, runtime_worker_tid);
     k_object_access_grant(&worker_done, runtime_worker_tid);
+    k_object_access_grant(&runtime_child_ready, runtime_worker_tid);
+    k_object_access_grant(&runtime_child_done, runtime_worker_tid);
     k_thread_start(runtime_worker_tid);
     return &user_results;
 }
@@ -256,6 +600,12 @@ runtime_user_mode_setup(void)
 static void
 runtime_user_mode_before(void *fixture)
 {
+    struct runtime_user_mode_fixture *results = fixture;
+
+    if (restart_state_has_ownership(&results->restart)) {
+        zassert_unreachable("previous runtime restart retained ownership");
+        return;
+    }
     memset(fixture, 0, sizeof(struct runtime_user_mode_fixture));
 }
 
@@ -263,15 +613,30 @@ static void
 runtime_user_mode_teardown(void *fixture)
 {
     struct runtime_user_mode_fixture *results = fixture;
-    int join_result;
+    bool cleanup_required = restart_state_has_ownership(&results->restart);
+
+    if (cleanup_required) {
+        results->worker_entry = runtime_restart_teardown_workflow;
+        k_sem_give(&worker_command);
+        results->restart.teardown_command_result =
+            k_sem_take(&worker_done, USER_WORKER_TIMEOUT);
+    }
 
     results->worker_entry = NULL;
     k_sem_give(&worker_command);
-    join_result = k_thread_join(runtime_worker_tid, USER_WORKER_TIMEOUT);
-    if (join_result != 0) {
+    results->restart.root_join_result =
+        k_thread_join(runtime_worker_tid, USER_WORKER_TIMEOUT);
+    if (results->restart.root_join_result != 0) {
         k_thread_abort(runtime_worker_tid);
     }
-    zassert_equal(join_result, 0, "user worker did not join within the bound");
+    if (cleanup_required) {
+        zassert_equal(results->restart.teardown_command_result, 0,
+                      "runtime cleanup command exceeded its bound");
+        zassert_false(restart_state_has_ownership(&results->restart),
+                      "runtime teardown retained live child ownership");
+    }
+    zassert_equal(results->restart.root_join_result, 0,
+                  "user worker did not join within the bound");
 }
 
 ZTEST_SUITE(runtime_user_mode, NULL, runtime_user_mode_setup,
@@ -334,4 +699,120 @@ ZTEST_F(runtime_user_mode, test_missing_export_then_valid_workflow)
                  "missing export lookup did not fail cleanly");
     zassert_true(fixture->recovery_succeeded,
                  "valid workflow failed after missing export lookup");
+}
+
+ZTEST_F(runtime_user_mode, test_runtime_worker_restart_reuses_registered_pools)
+{
+    for (uint32_t iteration = 0U; iteration < RUNTIME_RESTART_ITERATIONS;
+         iteration++) {
+        zassert_true(reset_restart_state(&fixture->restart, iteration),
+                     "iteration %u reused owned restart state", iteration);
+        k_sem_reset(&runtime_child_ready);
+        k_sem_reset(&runtime_child_done);
+        zassert_equal(prepare_runtime_thread_pool(runtime_worker_tid), BHT_OK,
+                      "iteration %u thread pool preparation failed",
+                      iteration);
+        run_user_worker(fixture, runtime_worker_restart_workflow);
+
+        zassert_true(
+            fixture->restart.workflow_succeeded,
+            "iteration %u restart failed: create %d join %d return %p "
+            "wait %d signal %d destroy %d/%d phase %d guards %d/%d cleanup %d",
+            iteration, fixture->restart.thread_create_result,
+            fixture->restart.thread_join_result,
+            fixture->restart.worker_return_value,
+            fixture->restart.worker_wait_result,
+            fixture->restart.parent_signal_result,
+            fixture->restart.cond_destroy_result,
+            fixture->restart.mutex_destroy_result,
+            atomic_get(&fixture->restart.phase),
+            fixture->restart.ready_wait_result,
+            fixture->restart.done_wait_result,
+            fixture->restart.cleanup_complete);
+        zassert_equal(atomic_get(&fixture->restart.phase),
+                      RUNTIME_RESTART_CLEANED,
+                      "iteration %u did not reach bounded cleanup", iteration);
+        zassert_false(fixture->restart.guard_expired,
+                      "iteration %u exceeded a phase guard", iteration);
+    }
+}
+
+ZTEST_F(runtime_user_mode,
+        test_runtime_timeout_restart_reacquires_mutex_each_cycle)
+{
+    for (uint32_t iteration = 0U; iteration < RUNTIME_RESTART_ITERATIONS;
+         iteration++) {
+        zassert_true(reset_restart_state(&fixture->restart, iteration),
+                     "iteration %u reused owned restart state", iteration);
+        k_sem_reset(&runtime_child_ready);
+        k_sem_reset(&runtime_child_done);
+        zassert_equal(prepare_runtime_thread_pool(runtime_worker_tid), BHT_OK,
+                      "iteration %u thread pool preparation failed",
+                      iteration);
+        run_user_worker(fixture, runtime_timeout_restart_workflow);
+
+        zassert_true(
+            fixture->restart.workflow_succeeded,
+            "iteration %u timeout restart failed: timeout %d unlock %d "
+            "relock %d/%d destroy %d/%d phase %d cleanup %d",
+            iteration, fixture->restart.timeout_result,
+            fixture->restart.timeout_unlock_result,
+            fixture->restart.reacquire_lock_result,
+            fixture->restart.reacquire_unlock_result,
+            fixture->restart.cond_destroy_result,
+            fixture->restart.mutex_destroy_result,
+            atomic_get(&fixture->restart.phase),
+            fixture->restart.cleanup_complete);
+        zassert_equal(fixture->restart.timeout_result, ETIMEDOUT,
+                      "iteration %u did not observe the relative timeout",
+                      iteration);
+        zassert_equal(atomic_get(&fixture->restart.phase),
+                      RUNTIME_RESTART_CLEANED,
+                      "iteration %u did not reach bounded cleanup", iteration);
+    }
+}
+
+ZTEST_F(runtime_user_mode,
+        test_runtime_done_guard_recovers_before_reusing_fixture)
+{
+    zassert_true(reset_restart_state(&fixture->restart, 0U),
+                 "recovery test reused owned restart state");
+    fixture->restart.force_done_guard_timeout = true;
+    k_sem_reset(&runtime_child_ready);
+    k_sem_reset(&runtime_child_done);
+    zassert_equal(prepare_runtime_thread_pool(runtime_worker_tid), BHT_OK,
+                  "recovery thread pool preparation failed");
+    run_user_worker(fixture, runtime_worker_restart_workflow);
+
+    if (!fixture->restart.cleanup_complete) {
+        (void)wamr_zephyr_thread_test_wait(
+            fixture->restart.worker,
+            K_MSEC(RUNTIME_FORCED_WORKER_WAIT_MS));
+    }
+    zassert_equal(fixture->restart.ready_wait_result, 0,
+                  "ready guard failed: result %d phase %d",
+                  fixture->restart.ready_wait_result,
+                  atomic_get(&fixture->restart.phase));
+    zassert_not_equal(fixture->restart.done_wait_result, 0,
+                      "done guard did not expire: result %d phase %d",
+                      fixture->restart.done_wait_result,
+                      atomic_get(&fixture->restart.phase));
+    zassert_true(fixture->restart.guard_expired,
+                 "done guard expiry was not retained");
+    zassert_true(fixture->restart.recovery_attempted,
+                 "done guard expiry did not attempt recovery");
+    zassert_equal(fixture->restart.recovery_lock_result, BHT_OK,
+                  "recovery mutex lock failed");
+    zassert_equal(fixture->restart.recovery_signal_result, BHT_OK,
+                  "recovery condition broadcast failed");
+    zassert_equal(fixture->restart.recovery_unlock_result, BHT_OK,
+                  "recovery mutex unlock failed");
+    zassert_equal(fixture->restart.exit_wait_result, 0,
+                  "worker termination was not proven");
+    zassert_equal(fixture->restart.thread_join_result, BHT_OK,
+                  "recovered worker was not joined");
+    zassert_false(fixture->restart.worker_owned,
+                  "joined worker ownership was retained");
+    zassert_true(fixture->restart.cleanup_complete,
+                 "recovered worker state was not cleaned");
 }

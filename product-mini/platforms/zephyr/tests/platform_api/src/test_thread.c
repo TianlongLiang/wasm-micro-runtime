@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+#include <errno.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
 
@@ -13,11 +15,20 @@
 #include "zephyr_thread_pool.h"
 
 #define WAMR_TEST_STACK_SIZE 2048U
-#define THREAD_READY_TIMEOUT_MS 500
+#define THREAD_GUARD_TIMEOUT_MS 500
+#define THREAD_LIFECYCLE_ITERATIONS 16U
+#define THREAD_SATURATION_ITERATIONS 8U
+#define THREAD_OWNERSHIP_ITERATIONS 8U
+#define THREAD_NESTED_ITERATIONS 8U
+#define THREAD_POOL_CAPACITY BH_ZEPHYR_MPU_STACK_COUNT
 #define MAX_BLOCKED_THREADS (BH_ZEPHYR_MPU_STACK_COUNT + 1U)
+#define MAX_OWNED_THREADS (BH_ZEPHYR_MPU_STACK_COUNT + 3U)
 #define NESTED_GRANDCHILD_RESULT ((void *)0x2468U)
 #define NESTED_CHILD_RESULT ((void *)0x1357U)
 #define EXPLICIT_EXIT_RESULT ((void *)0x369CU)
+
+BUILD_ASSERT(THREAD_POOL_CAPACITY == 4U,
+             "thread stress tests require the four-slot fixture pool");
 
 BUILD_ASSERT(!__builtin_types_compatible_p(korp_tid, k_tid_t),
              "WAMR thread handles must be opaque to Zephyr");
@@ -64,9 +75,16 @@ struct blocked_thread_state {
     atomic_t exited;
 };
 
+struct phase_worker_state {
+    void *return_value;
+    int release_result;
+};
+
 struct nested_thread_state {
     int create_result;
     int join_result;
+    int child_release_result;
+    int grandchild_release_result;
     void *grandchild_result;
 };
 
@@ -91,39 +109,31 @@ struct concurrent_join_arg {
 
 struct join_detach_race_state {
     atomic_t hook_active;
-    atomic_t join_claimed;
-    atomic_t release_join;
     korp_tid target;
+    int hook_release_result;
     int join_result;
 };
 
 struct detached_join_state {
-    atomic_t completed;
     korp_tid target;
     int result;
 };
 
 struct detach_after_exit_race_state {
     atomic_t hook_active;
-    atomic_t target_claimed;
-    atomic_t release_detacher;
-    atomic_t detacher_done;
     korp_tid target;
+    int hook_release_result;
     int detach_result;
 };
 
 struct detached_reuse_race_state {
     atomic_t hook_active;
-    atomic_t start_join;
-    atomic_t join_paused;
-    atomic_t release_join;
-    atomic_t join_done;
-    atomic_t start_creator;
-    atomic_t creator_started;
-    atomic_t creator_done;
-    struct blocked_thread_state replacement_blocked;
+    struct phase_worker_state replacement_worker;
     korp_tid target;
     korp_tid replacement;
+    int hook_release_result;
+    int join_start_result;
+    int creator_start_result;
     int join_result;
     int replacement_create_result;
 };
@@ -140,6 +150,8 @@ struct platform_thread_fixture {
     struct identity_state identities;
     struct identity_arg identity_args[2];
     struct blocked_thread_state blocked;
+    struct phase_worker_state lifecycle;
+    struct phase_worker_state saturation_workers[THREAD_POOL_CAPACITY];
     struct nested_thread_state nested;
     struct concurrent_join_state concurrent_join;
     struct concurrent_join_arg concurrent_join_args[2];
@@ -148,10 +160,35 @@ struct platform_thread_fixture {
     struct detach_after_exit_race_state detach_after_exit_race;
     struct detached_reuse_race_state detached_reuse_race;
     struct explicit_exit_state explicit_exit;
+    korp_tid owned_threads[MAX_OWNED_THREADS];
     atomic_t child_exited;
 };
 
 ZTEST_DMEM static struct platform_thread_fixture thread_fixture;
+static struct k_sem phase_ready;
+static struct k_sem phase_release;
+static struct k_sem phase_done;
+static struct k_sem join_claimed;
+static struct k_sem join_release;
+static struct k_sem detach_claimed;
+static struct k_sem detach_release;
+static struct k_sem detached_join_done;
+static struct k_sem reuse_join_start;
+static struct k_sem reuse_join_paused;
+static struct k_sem reuse_join_release;
+static struct k_sem reuse_join_done;
+static struct k_sem reuse_creator_start;
+static struct k_sem reuse_creator_started;
+static struct k_sem reuse_creator_done;
+static struct k_sem nested_child_ready;
+static struct k_sem nested_child_release;
+static struct k_sem nested_child_done;
+static struct k_sem nested_grandchild_ready;
+static struct k_sem nested_grandchild_release;
+static struct k_sem nested_grandchild_done;
+
+static void
+own_thread(korp_tid thread);
 
 static void *
 write_result(void *arg)
@@ -187,9 +224,32 @@ block_for_stack_recovery(void *arg)
 }
 
 static void *
+publish_ready_and_return(void *arg)
+{
+    struct phase_worker_state *state = arg;
+
+    k_sem_give(&phase_ready);
+    state->release_result =
+        k_sem_take(&phase_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    if (state->release_result != 0) {
+        return NULL;
+    }
+    k_sem_give(&phase_done);
+    return state->return_value;
+}
+
+static void *
 return_nested_grandchild_result(void *arg)
 {
-    ARG_UNUSED(arg);
+    struct nested_thread_state *state = arg;
+
+    k_sem_give(&nested_grandchild_ready);
+    state->grandchild_release_result = k_sem_take(
+        &nested_grandchild_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    if (state->grandchild_release_result != 0) {
+        return NULL;
+    }
+    k_sem_give(&nested_grandchild_done);
     return NESTED_GRANDCHILD_RESULT;
 }
 
@@ -199,14 +259,20 @@ create_and_join_grandchild(void *arg)
     struct nested_thread_state *state = arg;
     korp_tid grandchild;
 
+    k_sem_give(&nested_child_ready);
+    state->child_release_result =
+        k_sem_take(&nested_child_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    if (state->child_release_result != 0) {
+        return NULL;
+    }
     state->create_result =
-        os_thread_create(&grandchild, return_nested_grandchild_result, NULL,
+        os_thread_create(&grandchild, return_nested_grandchild_result, state,
                          WAMR_TEST_STACK_SIZE);
     if (state->create_result != BHT_OK) {
         return NULL;
     }
-
     state->join_result = os_thread_join(grandchild, &state->grandchild_result);
+    k_sem_give(&nested_child_done);
     return state->join_result == BHT_OK
                    && state->grandchild_result == NESTED_GRANDCHILD_RESULT
                ? NESTED_CHILD_RESULT
@@ -237,19 +303,17 @@ wamr_zephyr_thread_join_test_hook(int phase)
 
     if (atomic_get(&reuse_state->hook_active)
         && phase == WAMR_JOIN_TEST_ENTERED) {
-        atomic_set(&reuse_state->join_paused, 1);
-        while (!atomic_get(&reuse_state->release_join)) {
-            k_sleep(K_MSEC(1));
-        }
+        k_sem_give(&reuse_join_paused);
+        reuse_state->hook_release_result = k_sem_take(
+            &reuse_join_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
         return;
     }
 
     if (atomic_get(&join_detach_state->hook_active)
         && phase == WAMR_JOIN_TEST_CLAIMED) {
-        atomic_set(&join_detach_state->join_claimed, 1);
-        while (!atomic_get(&join_detach_state->release_join)) {
-            k_sleep(K_MSEC(1));
-        }
+        k_sem_give(&join_claimed);
+        join_detach_state->hook_release_result =
+            k_sem_take(&join_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
         return;
     }
 
@@ -298,10 +362,9 @@ wamr_zephyr_thread_detach_test_hook(int phase)
         return;
     }
 
-    atomic_set(&state->target_claimed, 1);
-    while (!atomic_get(&state->release_detacher)) {
-        k_sleep(K_MSEC(1));
-    }
+    k_sem_give(&detach_claimed);
+    state->hook_release_result =
+        k_sem_take(&detach_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
 }
 
 static void *
@@ -316,7 +379,8 @@ join_target_concurrently(void *arg)
         state->replacement_create_result = os_thread_create(
             &state->replacement, return_argument, NULL, WAMR_TEST_STACK_SIZE);
         if (state->replacement_create_result == BHT_OK) {
-            (void)wamr_zephyr_thread_test_wait(state->replacement, K_FOREVER);
+            (void)wamr_zephyr_thread_test_wait(
+                state->replacement, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
         }
         atomic_set(&state->winner_done, 1);
     }
@@ -330,7 +394,7 @@ join_detached_target(void *arg)
     struct detached_join_state *state = arg;
 
     state->result = os_thread_join(state->target, NULL);
-    atomic_set(&state->completed, 1);
+    k_sem_give(&detached_join_done);
     return NULL;
 }
 
@@ -349,7 +413,6 @@ detach_exited_target(void *arg)
     struct detach_after_exit_race_state *state = arg;
 
     state->detach_result = os_thread_detach(state->target);
-    atomic_set(&state->detacher_done, 1);
     return NULL;
 }
 
@@ -358,11 +421,14 @@ join_detached_target_during_reuse(void *arg)
 {
     struct detached_reuse_race_state *state = arg;
 
-    while (!atomic_get(&state->start_join)) {
-        k_sleep(K_MSEC(1));
+    state->join_start_result =
+        k_sem_take(&reuse_join_start, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    if (state->join_start_result != 0) {
+        k_sem_give(&reuse_join_done);
+        return NULL;
     }
     state->join_result = os_thread_join(state->target, NULL);
-    atomic_set(&state->join_done, 1);
+    k_sem_give(&reuse_join_done);
     return NULL;
 }
 
@@ -371,14 +437,17 @@ create_replacement_during_join(void *arg)
 {
     struct detached_reuse_race_state *state = arg;
 
-    while (!atomic_get(&state->start_creator)) {
-        k_sleep(K_MSEC(1));
+    state->creator_start_result =
+        k_sem_take(&reuse_creator_start, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    if (state->creator_start_result != 0) {
+        k_sem_give(&reuse_creator_done);
+        return NULL;
     }
-    atomic_set(&state->creator_started, 1);
+    k_sem_give(&reuse_creator_started);
     state->replacement_create_result =
-        os_thread_create(&state->replacement, block_for_stack_recovery,
-                         &state->replacement_blocked, WAMR_TEST_STACK_SIZE);
-    atomic_set(&state->creator_done, 1);
+        os_thread_create(&state->replacement, publish_ready_and_return,
+                         &state->replacement_worker, WAMR_TEST_STACK_SIZE);
+    k_sem_give(&reuse_creator_done);
     return NULL;
 }
 
@@ -404,7 +473,7 @@ reset_result(struct thread_result *result, int input)
 static bool
 wait_for_atomic_count(atomic_t *counter, size_t expected)
 {
-    int64_t deadline = k_uptime_get() + THREAD_READY_TIMEOUT_MS;
+    int64_t deadline = k_uptime_get() + THREAD_GUARD_TIMEOUT_MS;
 
     while ((size_t)atomic_get(counter) < expected
            && k_uptime_get() < deadline) {
@@ -414,7 +483,123 @@ wait_for_atomic_count(atomic_t *counter, size_t expected)
     return (size_t)atomic_get(counter) >= expected;
 }
 
-ZTEST_SUITE(platform_thread, NULL, NULL, wamr_thread_test_before, pool_after,
+static void
+own_thread(korp_tid thread)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(thread_fixture.owned_threads); ++i) {
+        if (thread_fixture.owned_threads[i] == NULL) {
+            thread_fixture.owned_threads[i] = thread;
+            return;
+        }
+    }
+
+    zassert_unreachable("thread fixture ownership capacity exceeded");
+}
+
+static void
+disown_thread(korp_tid thread)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(thread_fixture.owned_threads); ++i) {
+        if (thread_fixture.owned_threads[i] == thread) {
+            thread_fixture.owned_threads[i] = NULL;
+            return;
+        }
+    }
+}
+
+static void
+init_phase_sem(struct k_sem *sem)
+{
+    k_sem_init(sem, 0, MAX_OWNED_THREADS);
+#if defined(CONFIG_USERSPACE)
+    k_object_access_grant(sem, k_current_get());
+#endif
+}
+
+static void
+thread_before(void *fixture)
+{
+    memset(&thread_fixture, 0, sizeof(thread_fixture));
+    init_phase_sem(&phase_ready);
+    init_phase_sem(&phase_release);
+    init_phase_sem(&phase_done);
+    init_phase_sem(&join_claimed);
+    init_phase_sem(&join_release);
+    init_phase_sem(&detach_claimed);
+    init_phase_sem(&detach_release);
+    init_phase_sem(&detached_join_done);
+    init_phase_sem(&reuse_join_start);
+    init_phase_sem(&reuse_join_paused);
+    init_phase_sem(&reuse_join_release);
+    init_phase_sem(&reuse_join_done);
+    init_phase_sem(&reuse_creator_start);
+    init_phase_sem(&reuse_creator_started);
+    init_phase_sem(&reuse_creator_done);
+    init_phase_sem(&nested_child_ready);
+    init_phase_sem(&nested_child_release);
+    init_phase_sem(&nested_child_done);
+    init_phase_sem(&nested_grandchild_ready);
+    init_phase_sem(&nested_grandchild_release);
+    init_phase_sem(&nested_grandchild_done);
+    wamr_thread_test_before(fixture);
+}
+
+static void
+thread_after(void *fixture)
+{
+    atomic_set(&thread_fixture.blocked.release, 1);
+    for (size_t i = 0; i < MAX_OWNED_THREADS; ++i) {
+        k_sem_give(&phase_release);
+        k_sem_give(&join_release);
+        k_sem_give(&detach_release);
+        k_sem_give(&reuse_join_start);
+        k_sem_give(&reuse_join_release);
+        k_sem_give(&reuse_creator_start);
+        k_sem_give(&nested_child_release);
+        k_sem_give(&nested_grandchild_release);
+    }
+    atomic_set(&thread_fixture.concurrent_join.before_claim_arrivals, 2);
+    atomic_set(&thread_fixture.concurrent_join.protected_lookup_arrivals, 2);
+    atomic_set(&thread_fixture.concurrent_join.cleanup_started, 1);
+    atomic_set(&thread_fixture.concurrent_join.winner_done, 1);
+
+    for (size_t i = 0; i < ARRAY_SIZE(thread_fixture.owned_threads); ++i) {
+        korp_tid thread = thread_fixture.owned_threads[i];
+
+        if (thread == NULL) {
+            continue;
+        }
+        if (wamr_zephyr_thread_test_wait(
+                thread, K_MSEC(THREAD_GUARD_TIMEOUT_MS)) == 0) {
+            (void)os_thread_join(thread, NULL);
+        }
+        else {
+            (void)os_thread_detach(thread);
+        }
+        thread_fixture.owned_threads[i] = NULL;
+    }
+
+    if (thread_fixture.concurrent_join.replacement != NULL
+        && thread_fixture.concurrent_join.replacement_create_result == BHT_OK) {
+        (void)wamr_zephyr_thread_test_wait(
+            thread_fixture.concurrent_join.replacement,
+            K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+        (void)os_thread_join(thread_fixture.concurrent_join.replacement, NULL);
+    }
+    if (thread_fixture.detached_reuse_race.replacement != NULL
+        && thread_fixture.detached_reuse_race.replacement_create_result
+               == BHT_OK) {
+        (void)wamr_zephyr_thread_test_wait(
+            thread_fixture.detached_reuse_race.replacement,
+            K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+        (void)os_thread_join(thread_fixture.detached_reuse_race.replacement,
+                             NULL);
+    }
+
+    pool_after(fixture);
+}
+
+ZTEST_SUITE(platform_thread, NULL, NULL, thread_before, thread_after,
             NULL);
 
 /* Catches a regression where stack metadata is ignored or exposed incorrectly. */
@@ -507,104 +692,272 @@ WAMR_CONTEXT_TEST(platform_thread, test_second_join_is_rejected)
                   "second join unexpectedly claimed released metadata");
 }
 
+/* Mutation caught: join omits the return value or leaves its slot generation
+ * reusable through a stale handle. */
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_create_join_reuse_repeats_and_rejects_stale_handle)
+{
+    struct phase_worker_state *state = &thread_fixture.lifecycle;
+
+    for (size_t iteration = 0; iteration < THREAD_LIFECYCLE_ITERATIONS;
+         ++iteration) {
+        korp_tid thread;
+        void *actual = NULL;
+        void *expected = (void *)(uintptr_t)(iteration + 1U);
+        int create_result;
+        int join_result;
+        int stale_join_result;
+
+        memset(state, 0, sizeof(*state));
+        state->return_value = expected;
+        state->release_result = -EAGAIN;
+        create_result = os_thread_create(&thread, publish_ready_and_return,
+                                         state, WAMR_TEST_STACK_SIZE);
+        if (create_result == BHT_OK) {
+            own_thread(thread);
+        }
+        zassert_equal(create_result, BHT_OK,
+                      "iteration %zu create returned %d", iteration,
+                      create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu worker did not publish ready",
+                      iteration);
+
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu worker did not publish done",
+                      iteration);
+        zassert_equal(state->release_result, 0,
+                      "iteration %zu worker release returned %d", iteration,
+                      state->release_result);
+        join_result = os_thread_join(thread, &actual);
+        if (join_result == BHT_OK) {
+            disown_thread(thread);
+        }
+        zassert_equal(join_result, BHT_OK,
+                      "iteration %zu join returned %d", iteration,
+                      join_result);
+        zassert_equal_ptr(actual, expected,
+                          "iteration %zu join returned value %p", iteration,
+                          actual);
+
+        stale_join_result = os_thread_join(thread, NULL);
+        zassert_equal(stale_join_result, BHT_ERROR,
+                      "iteration %zu stale join returned %d", iteration,
+                      stale_join_result);
+    }
+}
+
+/* Mutation caught: join lookup stops atomically claiming exclusive cleanup
+ * ownership and lets both joiners accept one target generation. */
 WAMR_CONTEXT_TEST(platform_thread, test_concurrent_join_has_one_owner)
 {
     struct concurrent_join_state *state = &thread_fixture.concurrent_join;
-    korp_tid joiners[2];
-    unsigned int successful_joins = 0U;
 
-    memset(state, 0, sizeof(*state));
-    state->join_results[0] = BHT_ERROR;
-    state->join_results[1] = BHT_ERROR;
-    state->replacement_create_result = BHT_ERROR;
-    atomic_set(&state->replacement_pending, 1);
-    zassert_equal(os_thread_create(&state->target, return_argument, NULL,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "target creation failed");
-    zassert_equal(wamr_zephyr_thread_test_wait(state->target, K_FOREVER), 0,
-                  "target did not exit before concurrent joins");
+    for (size_t iteration = 0; iteration < THREAD_OWNERSHIP_ITERATIONS;
+         ++iteration) {
+        struct phase_worker_state *target_worker = &thread_fixture.lifecycle;
+        korp_tid joiners[2] = { NULL, NULL };
+        unsigned int successful_joins = 0U;
+        int target_create_result;
+        int target_cleanup_result;
+        int joiner_join_results[2];
 
-    atomic_set(&state->hook_active, 1);
-    for (size_t i = 0; i < ARRAY_SIZE(joiners); ++i) {
-        thread_fixture.concurrent_join_args[i].state = state;
-        thread_fixture.concurrent_join_args[i].slot = i;
-        zassert_equal(os_thread_create(&joiners[i], join_target_concurrently,
-                                       &thread_fixture.concurrent_join_args[i],
-                                       WAMR_TEST_STACK_SIZE),
-                      BHT_OK, "joiner creation failed at index %zu", i);
+        memset(state, 0, sizeof(*state));
+        memset(target_worker, 0, sizeof(*target_worker));
+        target_worker->release_result = -EAGAIN;
+        state->join_results[0] = BHT_ERROR;
+        state->join_results[1] = BHT_ERROR;
+        state->replacement_create_result = BHT_ERROR;
+        atomic_set(&state->replacement_pending, 1);
+        target_create_result = os_thread_create(
+            &state->target, publish_ready_and_return, target_worker,
+            WAMR_TEST_STACK_SIZE);
+        if (target_create_result == BHT_OK) {
+            own_thread(state->target);
+        }
+        zassert_equal(target_create_result, BHT_OK,
+                      "iteration %zu target create returned %d", iteration,
+                      target_create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish ready",
+                      iteration);
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish done",
+                      iteration);
+        zassert_equal(target_worker->release_result, 0,
+                      "iteration %zu target release returned %d", iteration,
+                      target_worker->release_result);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          state->target, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not exit", iteration);
+
+        atomic_set(&state->hook_active, 1);
+        for (size_t i = 0; i < ARRAY_SIZE(joiners); ++i) {
+            int create_result;
+
+            thread_fixture.concurrent_join_args[i].state = state;
+            thread_fixture.concurrent_join_args[i].slot = i;
+            create_result = os_thread_create(
+                &joiners[i], join_target_concurrently,
+                &thread_fixture.concurrent_join_args[i],
+                WAMR_TEST_STACK_SIZE);
+            if (create_result == BHT_OK) {
+                own_thread(joiners[i]);
+            }
+            zassert_equal(create_result, BHT_OK,
+                          "iteration %zu joiner %zu create returned %d",
+                          iteration, i, create_result);
+        }
+
+        for (size_t i = 0; i < ARRAY_SIZE(joiners); ++i) {
+            zassert_equal(wamr_zephyr_thread_test_wait(
+                              joiners[i], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "iteration %zu joiner %zu did not exit",
+                          iteration, i);
+        }
+        atomic_clear(&state->hook_active);
+
+        for (size_t i = 0; i < ARRAY_SIZE(joiners); ++i) {
+            joiner_join_results[i] = os_thread_join(joiners[i], NULL);
+            if (joiner_join_results[i] == BHT_OK) {
+                disown_thread(joiners[i]);
+            }
+        }
+        target_cleanup_result = os_thread_join(state->target, NULL);
+        disown_thread(state->target);
+        if (state->replacement_create_result == BHT_OK) {
+            int replacement_join_result =
+                os_thread_join(state->replacement, NULL);
+
+            if (replacement_join_result == BHT_OK) {
+                disown_thread(state->replacement);
+            }
+            zassert_equal(replacement_join_result, BHT_OK,
+                          "iteration %zu replacement join returned %d",
+                          iteration, replacement_join_result);
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(state->join_results); ++i) {
+            successful_joins += state->join_results[i] == BHT_OK;
+        }
+
+        for (size_t i = 0; i < ARRAY_SIZE(joiners); ++i) {
+            zassert_equal(joiner_join_results[i], BHT_OK,
+                          "iteration %zu joiner %zu cleanup returned %d",
+                          iteration, i, joiner_join_results[i]);
+        }
+        zassert_equal(target_cleanup_result, BHT_ERROR,
+                      "iteration %zu unclaimed target cleanup returned %d",
+                      iteration, target_cleanup_result);
+        zassert_equal(state->replacement_create_result, BHT_OK,
+                      "iteration %zu replacement create returned %d",
+                      iteration, state->replacement_create_result);
+        zassert_equal(successful_joins, 1U,
+                      "iteration %zu observed %u successful joiners",
+                      iteration, successful_joins);
     }
-
-    zassert_equal(wamr_zephyr_thread_test_wait(joiners[0], K_FOREVER), 0,
-                  "first joiner did not exit");
-    zassert_equal(wamr_zephyr_thread_test_wait(joiners[1], K_FOREVER), 0,
-                  "second joiner did not exit");
-    atomic_clear(&state->hook_active);
-
-    zassert_equal(os_thread_join(joiners[0], NULL), BHT_OK,
-                  "first joiner cleanup failed");
-    zassert_equal(os_thread_join(joiners[1], NULL), BHT_OK,
-                  "second joiner cleanup failed");
-    if (state->replacement_create_result == BHT_OK) {
-        (void)os_thread_join(state->replacement, NULL);
-    }
-    for (size_t i = 0; i < ARRAY_SIZE(state->join_results); ++i) {
-        successful_joins += state->join_results[i] == BHT_OK;
-    }
-
-    zassert_equal(state->replacement_create_result, BHT_OK,
-                  "winning joiner could not create a replacement generation");
-    zassert_equal(successful_joins, 1U,
-                  "concurrent joiners claimed two metadata generations");
 }
 
+/* Mutation caught: detach ignores an already claimed join and steals target
+ * cleanup ownership before the worker exits. */
 WAMR_CONTEXT_TEST(platform_thread,
                   test_join_claim_serializes_against_competing_detach)
 {
     struct join_detach_race_state *state = &thread_fixture.join_detach_race;
-    korp_tid target;
-    korp_tid joiner;
-    int lifecycle_lock_result;
-    int detach_result;
 
-    memset(state, 0, sizeof(*state));
-    atomic_clear(&thread_fixture.blocked.ready);
-    atomic_clear(&thread_fixture.blocked.release);
-    atomic_clear(&thread_fixture.blocked.exited);
-    state->join_result = BHT_ERROR;
+    for (size_t iteration = 0; iteration < THREAD_OWNERSHIP_ITERATIONS;
+         ++iteration) {
+        struct phase_worker_state *target_worker = &thread_fixture.lifecycle;
+        korp_tid target;
+        korp_tid joiner;
+        int target_create_result;
+        int joiner_create_result;
+        int lifecycle_lock_result;
+        int detach_result;
+        int joiner_join_result;
+        int target_cleanup_result;
 
-    zassert_equal(os_thread_create(&target, block_for_stack_recovery,
-                                   &thread_fixture.blocked,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "target creation failed");
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.ready, 1U),
-                 "target did not block");
-    lifecycle_lock_result = wamr_zephyr_thread_test_lifecycle_lock(target);
+        memset(state, 0, sizeof(*state));
+        memset(target_worker, 0, sizeof(*target_worker));
+        target_worker->release_result = -EAGAIN;
+        state->hook_release_result = -EAGAIN;
+        state->join_result = BHT_ERROR;
+        target_create_result = os_thread_create(
+            &target, publish_ready_and_return, target_worker,
+            WAMR_TEST_STACK_SIZE);
+        if (target_create_result == BHT_OK) {
+            own_thread(target);
+        }
+        zassert_equal(target_create_result, BHT_OK,
+                      "iteration %zu target create returned %d", iteration,
+                      target_create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish ready",
+                      iteration);
+        lifecycle_lock_result = wamr_zephyr_thread_test_lifecycle_lock(target);
 
-    state->target = target;
-    atomic_set(&state->hook_active, 1);
-    zassert_equal(os_thread_create(&joiner, join_before_competing_detach, state,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "joiner creation failed");
-    zassert_true(wait_for_atomic_count(&state->join_claimed, 1U),
-                 "joiner did not claim lifecycle ownership");
+        state->target = target;
+        atomic_set(&state->hook_active, 1);
+        joiner_create_result = os_thread_create(
+            &joiner, join_before_competing_detach, state,
+            WAMR_TEST_STACK_SIZE);
+        if (joiner_create_result == BHT_OK) {
+            own_thread(joiner);
+        }
+        zassert_equal(joiner_create_result, BHT_OK,
+                      "iteration %zu joiner create returned %d", iteration,
+                      joiner_create_result);
+        zassert_equal(k_sem_take(&join_claimed,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu joiner did not claim ownership",
+                      iteration);
 
-    detach_result = os_thread_detach(target);
-    atomic_set(&thread_fixture.blocked.release, 1);
-    atomic_set(&state->release_join, 1);
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.exited, 1U),
-                 "target did not publish exit");
-    zassert_equal(wamr_zephyr_thread_test_wait(joiner, K_FOREVER), 0,
-                  "joiner did not exit");
-    atomic_clear(&state->hook_active);
-    zassert_equal(os_thread_join(joiner, NULL), BHT_OK,
-                  "joiner cleanup failed");
+        detach_result = os_thread_detach(target);
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish done",
+                      iteration);
+        zassert_equal(target_worker->release_result, 0,
+                      "iteration %zu target release returned %d", iteration,
+                      target_worker->release_result);
+        k_sem_give(&join_release);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          joiner, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu joiner did not exit", iteration);
+        atomic_clear(&state->hook_active);
+        joiner_join_result = os_thread_join(joiner, NULL);
+        if (joiner_join_result == BHT_OK) {
+            disown_thread(joiner);
+        }
+        target_cleanup_result = os_thread_join(target, NULL);
+        disown_thread(target);
 
-    zassert_equal(lifecycle_lock_result, BHT_OK,
-                  "thread lifecycle depends on an invalid per-thread lock");
-    zassert_equal(detach_result, BHT_ERROR,
-                  "detach stole cleanup ownership from a claimed join");
-    zassert_equal(state->join_result, BHT_OK,
-                  "claimed join did not retain cleanup ownership");
+        zassert_equal(lifecycle_lock_result, BHT_OK,
+                      "iteration %zu lifecycle lock returned %d", iteration,
+                      lifecycle_lock_result);
+        zassert_equal(detach_result, BHT_ERROR,
+                      "iteration %zu competing detach returned %d", iteration,
+                      detach_result);
+        zassert_equal(state->hook_release_result, 0,
+                      "iteration %zu join hook release returned %d", iteration,
+                      state->hook_release_result);
+        zassert_equal(state->join_result, BHT_OK,
+                      "iteration %zu claimed join returned %d", iteration,
+                      state->join_result);
+        zassert_equal(joiner_join_result, BHT_OK,
+                      "iteration %zu joiner cleanup returned %d", iteration,
+                      joiner_join_result);
+        zassert_equal(target_cleanup_result, BHT_ERROR,
+                      "iteration %zu stale target cleanup returned %d",
+                      iteration, target_cleanup_result);
+    }
 }
 
 WAMR_CONTEXT_TEST(platform_thread, test_thread_identities_are_distinct)
@@ -666,28 +1019,80 @@ WAMR_CONTEXT_TEST(platform_thread, test_multiple_threads_leave_no_stale_state)
     }
 }
 
-WAMR_CONTEXT_TEST(platform_thread, test_nested_thread_creation_inherits_access)
+/* Mutation caught: user-pool creation is incorrectly restricted to the
+ * original owner and rejects an authorized child creating a grandchild. */
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_child_nested_creation_repeats_inherited_access)
 {
     struct nested_thread_state *state = &thread_fixture.nested;
-    korp_tid child;
-    void *child_result = NULL;
 
-    /* Mutations caught: removing K_INHERIT_PERMS or WAMR-domain inheritance. */
-    memset(state, 0, sizeof(*state));
-    state->create_result = BHT_ERROR;
-    state->join_result = BHT_ERROR;
-    zassert_equal(os_thread_create(&child, create_and_join_grandchild, state,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "child creation failed");
-    zassert_equal(os_thread_join(child, &child_result), BHT_OK,
-                  "child join failed");
-    zassert_equal(state->create_result, BHT_OK,
-                  "nested grandchild creation failed");
-    zassert_equal(state->join_result, BHT_OK, "nested grandchild join failed");
-    zassert_equal_ptr(state->grandchild_result, NESTED_GRANDCHILD_RESULT,
-                      "grandchild literal result was lost");
-    zassert_equal_ptr(child_result, NESTED_CHILD_RESULT,
-                      "child did not report the nested literal result");
+    for (size_t iteration = 0; iteration < THREAD_NESTED_ITERATIONS;
+         ++iteration) {
+        korp_tid child;
+        void *child_result = NULL;
+        int child_create_result;
+        int child_join_result;
+
+        memset(state, 0, sizeof(*state));
+        state->create_result = BHT_ERROR;
+        state->join_result = BHT_ERROR;
+        state->child_release_result = -EAGAIN;
+        state->grandchild_release_result = -EAGAIN;
+        child_create_result = os_thread_create(
+            &child, create_and_join_grandchild, state, WAMR_TEST_STACK_SIZE);
+        if (child_create_result == BHT_OK) {
+            own_thread(child);
+        }
+        zassert_equal(child_create_result, BHT_OK,
+                      "iteration %zu child create returned %d", iteration,
+                      child_create_result);
+        zassert_equal(k_sem_take(&nested_child_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu child did not publish ready",
+                      iteration);
+        k_sem_give(&nested_child_release);
+        zassert_equal(k_sem_take(&nested_grandchild_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu grandchild did not publish ready",
+                      iteration);
+        k_sem_give(&nested_grandchild_release);
+        zassert_equal(k_sem_take(&nested_grandchild_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu grandchild did not publish done",
+                      iteration);
+        zassert_equal(k_sem_take(&nested_child_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu child did not publish done",
+                      iteration);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          child, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu child did not exit", iteration);
+        child_join_result = os_thread_join(child, &child_result);
+        if (child_join_result == BHT_OK) {
+            disown_thread(child);
+        }
+        zassert_equal(child_join_result, BHT_OK,
+                      "iteration %zu child join returned %d", iteration,
+                      child_join_result);
+        zassert_equal(state->create_result, BHT_OK,
+                      "iteration %zu grandchild create returned %d", iteration,
+                      state->create_result);
+        zassert_equal(state->join_result, BHT_OK,
+                      "iteration %zu grandchild join returned %d", iteration,
+                      state->join_result);
+        zassert_equal(state->child_release_result, 0,
+                      "iteration %zu child release returned %d", iteration,
+                      state->child_release_result);
+        zassert_equal(state->grandchild_release_result, 0,
+                      "iteration %zu grandchild release returned %d", iteration,
+                      state->grandchild_release_result);
+        zassert_equal_ptr(state->grandchild_result, NESTED_GRANDCHILD_RESULT,
+                          "iteration %zu grandchild result was %p", iteration,
+                          state->grandchild_result);
+        zassert_equal_ptr(child_result, NESTED_CHILD_RESULT,
+                          "iteration %zu child result was %p", iteration,
+                          child_result);
+    }
 }
 
 WAMR_CONTEXT_TEST(platform_thread, test_create_rejects_null_tid)
@@ -766,59 +1171,142 @@ WAMR_CONTEXT_TEST(platform_thread, test_create_rejects_disallowed_priority)
 }
 #endif
 
-WAMR_CONTEXT_TEST(platform_thread, test_stack_pool_recovers_after_exhaustion)
+/* Mutation caught: the pool scan stops before slot four or a joined generation
+ * is not returned to the free list for the next saturation cycle. */
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_capacity_saturation_repeats_and_recovers)
 {
     korp_tid threads[MAX_BLOCKED_THREADS];
-    korp_tid recovery_thread;
-    int join_results[BH_ZEPHYR_MPU_STACK_COUNT];
-    int unexpected_join_result = BHT_OK;
-    int exhaustion_result;
+    int join_results[THREAD_POOL_CAPACITY];
 
-    /* Mutations caught: reusing slot zero or failing exhaustion rollback. */
-    atomic_clear(&thread_fixture.blocked.ready);
-    atomic_clear(&thread_fixture.blocked.release);
-    atomic_clear(&thread_fixture.blocked.exited);
-    for (size_t i = 0; i < BH_ZEPHYR_MPU_STACK_COUNT; ++i) {
-        zassert_equal(os_thread_create(&threads[i], block_for_stack_recovery,
-                                       &thread_fixture.blocked,
-                                       WAMR_TEST_STACK_SIZE),
-                      BHT_OK, "thread creation failed at index %zu", i);
-        zassert_true(
-            wait_for_atomic_count(&thread_fixture.blocked.ready, i + 1U),
-            "thread did not block at index %zu", i);
-        for (size_t j = 0; j < i; ++j) {
-            zassert_not_equal(threads[i], threads[j],
-                              "threads %zu and %zu share a pool slot", i, j);
+    for (size_t cycle = 0; cycle < THREAD_SATURATION_ITERATIONS; ++cycle) {
+        struct phase_worker_state *replacement = &thread_fixture.lifecycle;
+        korp_tid replacement_thread;
+        int exhaustion_result;
+        int unexpected_join_result = BHT_OK;
+        int replacement_create_result;
+        int replacement_join_result;
+
+        memset(threads, 0, sizeof(threads));
+        for (size_t i = 0; i < THREAD_POOL_CAPACITY; ++i) {
+            struct phase_worker_state *worker =
+                &thread_fixture.saturation_workers[i];
+            int create_result;
+
+            memset(worker, 0, sizeof(*worker));
+            worker->release_result = -EAGAIN;
+            create_result = os_thread_create(&threads[i],
+                                             publish_ready_and_return, worker,
+                                             WAMR_TEST_STACK_SIZE);
+            if (create_result == BHT_OK) {
+                own_thread(threads[i]);
+            }
+            zassert_equal(create_result, BHT_OK,
+                          "cycle %zu slot %zu create returned %d", cycle, i,
+                          create_result);
+            zassert_equal(k_sem_take(&phase_ready,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "cycle %zu slot %zu did not publish ready", cycle,
+                          i);
+            for (size_t j = 0; j < i; ++j) {
+                zassert_not_equal(
+                    threads[i], threads[j],
+                    "cycle %zu slots %zu and %zu share handle %p", cycle, i,
+                    j, threads[i]);
+            }
         }
+
+        memset(replacement, 0, sizeof(*replacement));
+        replacement->release_result = -EAGAIN;
+        exhaustion_result = os_thread_create(
+            &threads[THREAD_POOL_CAPACITY], publish_ready_and_return,
+            replacement, WAMR_TEST_STACK_SIZE);
+        if (exhaustion_result == BHT_OK) {
+            own_thread(threads[THREAD_POOL_CAPACITY]);
+            zassert_equal(k_sem_take(&phase_ready,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "cycle %zu unexpected fifth worker not ready",
+                          cycle);
+        }
+
+        for (size_t i = 0;
+             i < THREAD_POOL_CAPACITY + (exhaustion_result == BHT_OK); ++i) {
+            k_sem_give(&phase_release);
+        }
+        for (size_t i = 0;
+             i < THREAD_POOL_CAPACITY + (exhaustion_result == BHT_OK); ++i) {
+            zassert_equal(k_sem_take(&phase_done,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "cycle %zu worker %zu did not publish done", cycle,
+                          i);
+        }
+        for (size_t i = 0; i < THREAD_POOL_CAPACITY; ++i) {
+            zassert_equal(thread_fixture.saturation_workers[i].release_result,
+                          0, "cycle %zu slot %zu release returned %d", cycle,
+                          i,
+                          thread_fixture.saturation_workers[i].release_result);
+        }
+        if (exhaustion_result == BHT_OK) {
+            zassert_equal(replacement->release_result, 0,
+                          "cycle %zu unexpected fifth release returned %d",
+                          cycle, replacement->release_result);
+        }
+        for (size_t i = 0; i < THREAD_POOL_CAPACITY; ++i) {
+            join_results[i] = os_thread_join(threads[i], NULL);
+            if (join_results[i] == BHT_OK) {
+                disown_thread(threads[i]);
+            }
+        }
+        if (exhaustion_result == BHT_OK) {
+            unexpected_join_result =
+                os_thread_join(threads[THREAD_POOL_CAPACITY], NULL);
+            if (unexpected_join_result == BHT_OK) {
+                disown_thread(threads[THREAD_POOL_CAPACITY]);
+            }
+        }
+
+        zassert_equal(exhaustion_result, BHT_ERROR,
+                      "cycle %zu fifth create returned %d", cycle,
+                      exhaustion_result);
+        zassert_equal(unexpected_join_result, BHT_OK,
+                      "cycle %zu unexpected fifth join returned %d", cycle,
+                      unexpected_join_result);
+        for (size_t i = 0; i < THREAD_POOL_CAPACITY; ++i) {
+            zassert_equal(join_results[i], BHT_OK,
+                          "cycle %zu slot %zu join returned %d", cycle, i,
+                          join_results[i]);
+        }
+
+        memset(replacement, 0, sizeof(*replacement));
+        replacement->return_value = (void *)(uintptr_t)(cycle + 1U);
+        replacement->release_result = -EAGAIN;
+        replacement_create_result = os_thread_create(
+            &replacement_thread, publish_ready_and_return, replacement,
+            WAMR_TEST_STACK_SIZE);
+        if (replacement_create_result == BHT_OK) {
+            own_thread(replacement_thread);
+        }
+        zassert_equal(replacement_create_result, BHT_OK,
+                      "cycle %zu replacement create returned %d", cycle,
+                      replacement_create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "cycle %zu replacement did not publish ready", cycle);
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "cycle %zu replacement did not publish done", cycle);
+        zassert_equal(replacement->release_result, 0,
+                      "cycle %zu replacement release returned %d", cycle,
+                      replacement->release_result);
+        replacement_join_result = os_thread_join(replacement_thread, NULL);
+        if (replacement_join_result == BHT_OK) {
+            disown_thread(replacement_thread);
+        }
+        zassert_equal(replacement_join_result, BHT_OK,
+                      "cycle %zu replacement join returned %d", cycle,
+                      replacement_join_result);
     }
-    exhaustion_result = os_thread_create(
-        &threads[BH_ZEPHYR_MPU_STACK_COUNT], block_for_stack_recovery,
-        &thread_fixture.blocked, WAMR_TEST_STACK_SIZE);
-    atomic_set(&thread_fixture.blocked.release, 1);
-    for (size_t i = 0; i < BH_ZEPHYR_MPU_STACK_COUNT; ++i) {
-        join_results[i] = os_thread_join(threads[i], NULL);
-    }
-    if (exhaustion_result == BHT_OK) {
-        unexpected_join_result =
-            os_thread_join(threads[BH_ZEPHYR_MPU_STACK_COUNT], NULL);
-    }
-    zassert_equal(exhaustion_result, BHT_ERROR,
-                  "fifth reservation did not report exhaustion");
-    zassert_equal(unexpected_join_result, BHT_OK,
-                  "unexpected fifth thread cleanup failed");
-    for (size_t i = 0; i < BH_ZEPHYR_MPU_STACK_COUNT; ++i) {
-        zassert_equal(join_results[i], BHT_OK,
-                      "thread join failed at index %zu", i);
-    }
-    reset_result(&thread_fixture.result, 1);
-    zassert_equal(os_thread_create(&recovery_thread, write_result,
-                                   &thread_fixture.result,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "stack pool did not recover");
-    zassert_equal(os_thread_join(recovery_thread, NULL), BHT_OK,
-                  "recovery thread join failed");
-    zassert_equal(thread_fixture.result.writes, 1U,
-                  "recovery thread did not run");
 }
 
 WAMR_CONTEXT_TEST(platform_thread, test_exited_threads_keep_slots_until_join)
@@ -879,7 +1367,7 @@ WAMR_CONTEXT_TEST(platform_thread,
                  "blocked threads did not publish exit");
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
         zassert_equal(wamr_zephyr_thread_test_wait(
-                          threads[i], K_MSEC(THREAD_READY_TIMEOUT_MS)),
+                          threads[i], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
                       0, "thread did not exit at index %zu", i);
     }
 
@@ -917,7 +1405,7 @@ WAMR_CONTEXT_TEST(platform_thread,
     }
     for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
         zassert_equal(wamr_zephyr_thread_test_wait(
-                          threads[i], K_MSEC(THREAD_READY_TIMEOUT_MS)),
+                          threads[i], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
                       0, "thread did not exit at index %zu", i);
     }
     zassert_equal(os_thread_detach(threads[0]), BHT_OK,
@@ -942,55 +1430,104 @@ WAMR_CONTEXT_TEST(platform_thread,
                   "detach did not release an exited thread slot");
 }
 
+/* Mutation caught: join accepts a target after detach has already claimed
+ * cleanup ownership, or waits for that detached target to exit. */
 WAMR_CONTEXT_TEST(platform_thread, test_join_rejects_detached_running_thread)
 {
     struct detached_join_state *state = &thread_fixture.detached_join;
-    korp_tid thread;
-    korp_tid joiner;
-    korp_tid replacement;
-    bool join_completed_while_target_running;
 
-    /* Mutation caught: allowing join ownership after detach owns cleanup. */
-    atomic_clear(&thread_fixture.blocked.ready);
-    atomic_clear(&thread_fixture.blocked.release);
-    atomic_clear(&thread_fixture.blocked.exited);
-    atomic_clear(&state->completed);
-    state->result = BHT_ERROR;
-    zassert_equal(os_thread_create(&thread, block_for_stack_recovery,
-                                   &thread_fixture.blocked,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "thread creation failed");
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.ready, 1U),
-                 "thread did not block");
-    zassert_equal(os_thread_detach(thread), BHT_OK,
-                  "running-thread detach failed");
-    state->target = thread;
-    zassert_equal(os_thread_create(&joiner, join_detached_target, state,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "join-attempt thread creation failed");
-    join_completed_while_target_running =
-        wait_for_atomic_count(&state->completed, 1U);
+    for (size_t iteration = 0; iteration < THREAD_OWNERSHIP_ITERATIONS;
+         ++iteration) {
+        struct phase_worker_state *target_worker = &thread_fixture.lifecycle;
+        korp_tid thread;
+        korp_tid joiner;
+        korp_tid replacement;
+        int target_create_result;
+        int detach_result;
+        int joiner_create_result;
+        int joiner_join_result;
+        int replacement_create_result;
+        int replacement_join_result;
 
-    atomic_set(&thread_fixture.blocked.release, 1);
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.exited, 1U),
-                 "thread did not publish exit");
-    zassert_equal(
-        wamr_zephyr_thread_test_wait(thread, K_MSEC(THREAD_READY_TIMEOUT_MS)),
-        0, "thread did not exit");
-    zassert_true(wait_for_atomic_count(&state->completed, 1U),
-                 "join-attempt thread did not finish after target exit");
-    zassert_equal(os_thread_join(joiner, NULL), BHT_OK,
-                  "join-attempt thread cleanup failed");
+        memset(state, 0, sizeof(*state));
+        memset(target_worker, 0, sizeof(*target_worker));
+        target_worker->release_result = -EAGAIN;
+        state->result = BHT_OK;
+        target_create_result = os_thread_create(
+            &thread, publish_ready_and_return, target_worker,
+            WAMR_TEST_STACK_SIZE);
+        if (target_create_result == BHT_OK) {
+            own_thread(thread);
+        }
+        zassert_equal(target_create_result, BHT_OK,
+                      "iteration %zu target create returned %d", iteration,
+                      target_create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish ready",
+                      iteration);
+        detach_result = os_thread_detach(thread);
 
-    zassert_equal(os_thread_create(&replacement, return_argument, NULL,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "join rejection corrupted the released slot");
-    zassert_equal(os_thread_join(replacement, NULL), BHT_OK,
-                  "replacement join failed");
-    zassert_true(join_completed_while_target_running,
-                 "join blocked on a detached running thread");
-    zassert_equal(state->result, BHT_ERROR,
-                  "join unexpectedly claimed a detached thread");
+        state->target = thread;
+        joiner_create_result = os_thread_create(
+            &joiner, join_detached_target, state, WAMR_TEST_STACK_SIZE);
+        if (joiner_create_result == BHT_OK) {
+            own_thread(joiner);
+        }
+        zassert_equal(joiner_create_result, BHT_OK,
+                      "iteration %zu joiner create returned %d", iteration,
+                      joiner_create_result);
+        zassert_equal(k_sem_take(&detached_join_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu join attempt did not finish",
+                      iteration);
+
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish done",
+                      iteration);
+        zassert_equal(target_worker->release_result, 0,
+                      "iteration %zu target release returned %d", iteration,
+                      target_worker->release_result);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          thread, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not exit", iteration);
+        disown_thread(thread);
+        joiner_join_result = os_thread_join(joiner, NULL);
+        if (joiner_join_result == BHT_OK) {
+            disown_thread(joiner);
+        }
+
+        replacement_create_result = os_thread_create(
+            &replacement, return_argument, NULL, WAMR_TEST_STACK_SIZE);
+        if (replacement_create_result == BHT_OK) {
+            own_thread(replacement);
+            replacement_join_result = os_thread_join(replacement, NULL);
+            if (replacement_join_result == BHT_OK) {
+                disown_thread(replacement);
+            }
+        }
+        else {
+            replacement_join_result = BHT_ERROR;
+        }
+
+        zassert_equal(detach_result, BHT_OK,
+                      "iteration %zu detach returned %d", iteration,
+                      detach_result);
+        zassert_equal(state->result, BHT_ERROR,
+                      "iteration %zu detached join returned %d", iteration,
+                      state->result);
+        zassert_equal(joiner_join_result, BHT_OK,
+                      "iteration %zu joiner cleanup returned %d", iteration,
+                      joiner_join_result);
+        zassert_equal(replacement_create_result, BHT_OK,
+                      "iteration %zu replacement create returned %d",
+                      iteration, replacement_create_result);
+        zassert_equal(replacement_join_result, BHT_OK,
+                      "iteration %zu replacement join returned %d", iteration,
+                      replacement_join_result);
+    }
 }
 
 WAMR_CONTEXT_TEST(platform_thread,
@@ -1010,7 +1547,7 @@ WAMR_CONTEXT_TEST(platform_thread,
                                        WAMR_TEST_STACK_SIZE),
                       BHT_OK, "thread creation failed at index %zu", i);
         zassert_equal(wamr_zephyr_thread_test_wait(
-                          threads[i], K_MSEC(THREAD_READY_TIMEOUT_MS)),
+                          threads[i], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
                       0, "thread did not exit at index %zu", i);
     }
     zassert_equal(os_thread_join(threads[1], NULL), BHT_OK,
@@ -1018,24 +1555,27 @@ WAMR_CONTEXT_TEST(platform_thread,
 
     memset(state, 0, sizeof(*state));
     state->target = threads[0];
+    state->hook_release_result = -EAGAIN;
     state->detach_result = BHT_ERROR;
     atomic_set(&state->hook_active, 1);
     zassert_equal(os_thread_create(&detacher, detach_exited_target, state,
                                    WAMR_TEST_STACK_SIZE),
                   BHT_OK, "detacher creation failed");
-    zassert_true(wait_for_atomic_count(&state->target_claimed, 1U),
-                 "detacher did not claim the exited target");
+    zassert_equal(k_sem_take(&detach_claimed,
+                             K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                  0, "detacher did not claim the exited target");
 
     first_create_result = os_thread_create(&replacement, return_argument, NULL,
                                            WAMR_TEST_STACK_SIZE);
     if (first_create_result == BHT_OK) {
         zassert_equal(wamr_zephyr_thread_test_wait(
-                          replacement, K_MSEC(THREAD_READY_TIMEOUT_MS)),
+                          replacement, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
                       0, "unexpected replacement did not exit");
     }
-    atomic_set(&state->release_detacher, 1);
-    zassert_true(wait_for_atomic_count(&state->detacher_done, 1U),
-                 "detacher did not finish");
+    k_sem_give(&detach_release);
+    zassert_equal(wamr_zephyr_thread_test_wait(
+                      detacher, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                  0, "detacher did not finish");
     atomic_clear(&state->hook_active);
 
     zassert_equal(os_thread_join(detacher, NULL), BHT_OK,
@@ -1056,105 +1596,189 @@ WAMR_CONTEXT_TEST(platform_thread,
     }
 
     zassert_equal(state->detach_result, BHT_OK, "exited-thread detach failed");
+    zassert_equal(state->hook_release_result, 0,
+                  "detacher hook release failed");
     zassert_equal(first_create_result, BHT_ERROR,
                   "creator reused the target during detach cleanup");
     zassert_equal(retry_create_result, BHT_OK,
                   "target slot was not released after detach cleanup");
 }
 
+/* Mutation caught: stale-handle lookup compares the reused native thread ID
+ * and binds a detached generation to its live replacement. */
 WAMR_CONTEXT_TEST(platform_thread,
                   test_detached_handle_join_cannot_bind_replacement)
 {
     struct detached_reuse_race_state *state =
         &thread_fixture.detached_reuse_race;
-    korp_tid target;
-    korp_tid creator;
-    korp_tid joiner;
-    bool creator_completed_before_join_release;
-    bool join_completed_before_replacement_release = false;
 
-    /* Mutation caught: stale join lookup binding a reused static k_tid. */
-    atomic_clear(&thread_fixture.blocked.ready);
-    atomic_clear(&thread_fixture.blocked.release);
-    atomic_clear(&thread_fixture.blocked.exited);
-    zassert_equal(os_thread_create(&target, block_for_stack_recovery,
-                                   &thread_fixture.blocked,
-                                   WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "target creation failed");
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.ready, 1U),
-                 "target did not block");
-    zassert_equal(os_thread_detach(target), BHT_OK, "target detach failed");
+    for (size_t iteration = 0; iteration < THREAD_OWNERSHIP_ITERATIONS;
+         ++iteration) {
+        struct phase_worker_state *target_worker = &thread_fixture.lifecycle;
+        korp_tid target;
+        korp_tid creator;
+        korp_tid joiner;
+        bool creator_completed_before_join_release;
+        bool join_completed_before_replacement_release;
+        int target_create_result;
+        int detach_result;
+        int creator_create_result;
+        int joiner_create_result;
+        int creator_join_result;
+        int joiner_join_result;
+        int replacement_join_result = BHT_OK;
 
-    memset(state, 0, sizeof(*state));
-    state->target = target;
-    state->join_result = BHT_OK;
-    state->replacement_create_result = BHT_ERROR;
-    atomic_set(&state->hook_active, 1);
-    zassert_equal(os_thread_create(&creator, create_replacement_during_join,
-                                   state, WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "creator-driver creation failed");
-    zassert_equal(os_thread_create(&joiner, join_detached_target_during_reuse,
-                                   state, WAMR_TEST_STACK_SIZE),
-                  BHT_OK, "stale-join driver creation failed");
+        memset(state, 0, sizeof(*state));
+        memset(target_worker, 0, sizeof(*target_worker));
+        target_worker->release_result = -EAGAIN;
+        state->hook_release_result = -EAGAIN;
+        state->join_start_result = -EAGAIN;
+        state->creator_start_result = -EAGAIN;
+        state->join_result = BHT_OK;
+        state->replacement_create_result = BHT_ERROR;
+        state->replacement_worker.release_result = -EAGAIN;
+        target_create_result = os_thread_create(
+            &target, publish_ready_and_return, target_worker,
+            WAMR_TEST_STACK_SIZE);
+        if (target_create_result == BHT_OK) {
+            own_thread(target);
+        }
+        zassert_equal(target_create_result, BHT_OK,
+                      "iteration %zu target create returned %d", iteration,
+                      target_create_result);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish ready",
+                      iteration);
+        detach_result = os_thread_detach(target);
 
-    atomic_set(&thread_fixture.blocked.release, 1);
-    zassert_true(wait_for_atomic_count(&thread_fixture.blocked.exited, 1U),
-                 "target did not publish exit");
-    zassert_equal(
-        wamr_zephyr_thread_test_wait(target, K_MSEC(THREAD_READY_TIMEOUT_MS)),
-        0, "target did not exit");
-    atomic_set(&state->start_join, 1);
-    zassert_true(wait_for_atomic_count(&state->join_paused, 1U),
-                 "stale join did not reach the lookup boundary");
+        state->target = target;
+        atomic_set(&state->hook_active, 1);
+        creator_create_result = os_thread_create(
+            &creator, create_replacement_during_join, state,
+            WAMR_TEST_STACK_SIZE);
+        if (creator_create_result == BHT_OK) {
+            own_thread(creator);
+        }
+        zassert_equal(creator_create_result, BHT_OK,
+                      "iteration %zu creator create returned %d", iteration,
+                      creator_create_result);
+        joiner_create_result = os_thread_create(
+            &joiner, join_detached_target_during_reuse, state,
+            WAMR_TEST_STACK_SIZE);
+        if (joiner_create_result == BHT_OK) {
+            own_thread(joiner);
+        }
+        zassert_equal(joiner_create_result, BHT_OK,
+                      "iteration %zu stale joiner create returned %d",
+                      iteration, joiner_create_result);
 
-    atomic_set(&state->start_creator, 1);
-    zassert_true(wait_for_atomic_count(&state->creator_started, 1U),
-                 "creator driver did not start");
-    creator_completed_before_join_release =
-        wait_for_atomic_count(&state->creator_done, 1U);
-    atomic_set(&state->release_join, 1);
-    zassert_true(wait_for_atomic_count(&state->creator_done, 1U),
-                 "creator driver did not finish");
+        k_sem_give(&phase_release);
+        zassert_equal(k_sem_take(&phase_done,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not publish done",
+                      iteration);
+        zassert_equal(target_worker->release_result, 0,
+                      "iteration %zu target release returned %d", iteration,
+                      target_worker->release_result);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          target, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu target did not exit", iteration);
+        disown_thread(target);
 
-    if (state->replacement_create_result == BHT_OK) {
-        zassert_true(
-            wait_for_atomic_count(&state->replacement_blocked.ready, 1U),
-            "replacement did not block");
+        k_sem_give(&reuse_join_start);
+        zassert_equal(k_sem_take(&reuse_join_paused,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu stale join did not pause", iteration);
+        k_sem_give(&reuse_creator_start);
+        zassert_equal(k_sem_take(&reuse_creator_started,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu creator did not start", iteration);
+        creator_completed_before_join_release =
+            k_sem_take(&reuse_creator_done,
+                       K_MSEC(THREAD_GUARD_TIMEOUT_MS)) == 0;
+        k_sem_give(&reuse_join_release);
+
+        if (state->replacement_create_result == BHT_OK) {
+            zassert_equal(k_sem_take(&phase_ready,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "iteration %zu replacement not ready", iteration);
+        }
         join_completed_before_replacement_release =
-            wait_for_atomic_count(&state->join_done, 1U);
-        atomic_set(&state->replacement_blocked.release, 1);
-        zassert_true(
-            wait_for_atomic_count(&state->replacement_blocked.exited, 1U),
-            "replacement did not publish exit");
-    }
-    zassert_true(wait_for_atomic_count(&state->join_done, 1U),
-                 "stale-join driver did not finish");
-    atomic_clear(&state->hook_active);
+            k_sem_take(&reuse_join_done,
+                       K_MSEC(THREAD_GUARD_TIMEOUT_MS)) == 0;
+        if (state->replacement_create_result == BHT_OK) {
+            k_sem_give(&phase_release);
+            zassert_equal(k_sem_take(&phase_done,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "iteration %zu replacement did not finish",
+                          iteration);
+            zassert_equal(state->replacement_worker.release_result, 0,
+                          "iteration %zu replacement release returned %d",
+                          iteration,
+                          state->replacement_worker.release_result);
+        }
+        if (!join_completed_before_replacement_release) {
+            zassert_equal(k_sem_take(&reuse_join_done,
+                                     K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                          0, "iteration %zu stale joiner did not finish",
+                          iteration);
+        }
+        atomic_clear(&state->hook_active);
 
-    zassert_equal(
-        wamr_zephyr_thread_test_wait(creator, K_MSEC(THREAD_READY_TIMEOUT_MS)),
-        0, "creator driver did not exit");
-    zassert_equal(
-        wamr_zephyr_thread_test_wait(joiner, K_MSEC(THREAD_READY_TIMEOUT_MS)),
-        0, "stale-join driver did not exit");
-    zassert_equal(os_thread_join(creator, NULL), BHT_OK,
-                  "creator-driver cleanup failed");
-    zassert_equal(os_thread_join(joiner, NULL), BHT_OK,
-                  "stale-join driver cleanup failed");
-    if (state->replacement_create_result == BHT_OK
-        && state->join_result == BHT_ERROR) {
-        zassert_equal(os_thread_join(state->replacement, NULL), BHT_OK,
-                      "replacement cleanup failed");
-    }
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          creator, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu creator did not exit", iteration);
+        zassert_equal(wamr_zephyr_thread_test_wait(
+                          joiner, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "iteration %zu stale joiner did not exit", iteration);
+        creator_join_result = os_thread_join(creator, NULL);
+        if (creator_join_result == BHT_OK) {
+            disown_thread(creator);
+        }
+        joiner_join_result = os_thread_join(joiner, NULL);
+        if (joiner_join_result == BHT_OK) {
+            disown_thread(joiner);
+        }
+        if (state->replacement_create_result == BHT_OK
+            && state->join_result == BHT_ERROR) {
+            replacement_join_result = os_thread_join(state->replacement, NULL);
+        }
 
-    zassert_true(creator_completed_before_join_release,
-                 "creator did not reuse the slot before stale join lookup");
-    zassert_equal(state->replacement_create_result, BHT_OK,
-                  "replacement generation was not created");
-    zassert_true(join_completed_before_replacement_release,
-                 "stale join blocked on the replacement generation");
-    zassert_equal(state->join_result, BHT_ERROR,
-                  "stale detached handle joined the replacement generation");
+        zassert_equal(detach_result, BHT_OK,
+                      "iteration %zu detach returned %d", iteration,
+                      detach_result);
+        zassert_true(creator_completed_before_join_release,
+                     "iteration %zu creator missed the reuse boundary",
+                     iteration);
+        zassert_equal(state->hook_release_result, 0,
+                      "iteration %zu stale join hook returned %d", iteration,
+                      state->hook_release_result);
+        zassert_equal(state->join_start_result, 0,
+                      "iteration %zu stale join start returned %d", iteration,
+                      state->join_start_result);
+        zassert_equal(state->creator_start_result, 0,
+                      "iteration %zu creator start returned %d", iteration,
+                      state->creator_start_result);
+        zassert_equal(state->replacement_create_result, BHT_OK,
+                      "iteration %zu replacement create returned %d",
+                      iteration, state->replacement_create_result);
+        zassert_true(join_completed_before_replacement_release,
+                     "iteration %zu stale join waited for replacement",
+                     iteration);
+        zassert_equal(state->join_result, BHT_ERROR,
+                      "iteration %zu stale join returned %d", iteration,
+                      state->join_result);
+        zassert_equal(creator_join_result, BHT_OK,
+                      "iteration %zu creator cleanup returned %d", iteration,
+                      creator_join_result);
+        zassert_equal(joiner_join_result, BHT_OK,
+                      "iteration %zu joiner cleanup returned %d", iteration,
+                      joiner_join_result);
+        zassert_equal(replacement_join_result, BHT_OK,
+                      "iteration %zu replacement cleanup returned %d",
+                      iteration, replacement_join_result);
+    }
 }
 
 WAMR_CONTEXT_TEST(platform_thread,
@@ -1173,7 +1797,7 @@ WAMR_CONTEXT_TEST(platform_thread,
     zassert_true(wait_for_atomic_count(&state->exit_started, 1U),
                  "explicit-exit thread did not detach");
     zassert_equal(
-        wamr_zephyr_thread_test_wait(thread, K_MSEC(THREAD_READY_TIMEOUT_MS)),
+        wamr_zephyr_thread_test_wait(thread, K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
         0, "explicit-exit thread did not terminate");
 
     zassert_equal(os_thread_create(&replacement, return_argument, NULL,

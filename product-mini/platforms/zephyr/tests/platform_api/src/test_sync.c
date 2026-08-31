@@ -46,6 +46,13 @@ BUILD_ASSERT(__builtin_types_compatible_p(korp_cond, struct k_condvar));
 #define CONDITION_POLL_INTERVAL_MS 1
 #define TEST_MUTEX_POOL_COUNT 8
 #define TEST_COND_POOL_COUNT 4
+#define SYNC_STRESS_WORKERS 4U
+#define SYNC_STRESS_INCREMENTS 100U
+#define SYNC_STRESS_LIGHTWEIGHT_ITERATIONS 16U
+#define SYNC_STRESS_POOL_ITERATIONS 8U
+#define SYNC_STRESS_COUNTER_CYCLES 8U
+#define SYNC_STRESS_GUARD_MS 500U
+#define SYNC_STRESS_WAIT_US ((uint64)SYNC_STRESS_GUARD_MS * 1000U)
 
 enum {
     WAMR_SYNC_TEST_MUTEX_OPERATION_CLAIMED = 1,
@@ -63,6 +70,30 @@ struct mutex_counter_worker {
     bool timed_out;
     int lock_result;
     int unlock_result;
+};
+
+struct stress_counter_worker {
+    korp_mutex *mutex;
+    int *counter;
+    int release_result;
+    int lock_result;
+    int unlock_result;
+};
+
+struct stress_condition_waiter {
+    korp_mutex *mutex;
+    korp_cond *cond;
+    atomic_t *generation;
+    atomic_t *released;
+    int expected_generation;
+    int lock_result;
+    int wait_result;
+    int unlock_result;
+    int wait_attempts;
+    bool waiting;
+    bool woke;
+    bool timed_out;
+    bool observed_signal;
 };
 
 struct condition_waiter {
@@ -97,6 +128,8 @@ struct sync_claim_hook_state {
     atomic_t reached;
     atomic_t release;
     uintptr_t expected_handle;
+    bool semaphore_mode;
+    int release_result;
 };
 
 struct shutdown_recovery_result {
@@ -105,16 +138,26 @@ struct shutdown_recovery_result {
     korp_tid clean_identity;
     korp_tid recovered_identity;
     korp_tid final_identity;
-    int leaked_init_result;
-    int leaked_destroy_result;
+    int selected_init_result;
+    int selected_destroy_result;
     int reinit_result;
     int recovered_init_result;
     int recovered_destroy_result;
+    bool recovered_handle_valid;
+    bool cycle_results_valid;
+    size_t failed_cycle;
 };
 
 struct platform_sync_fixture {
     struct mutex_counter counter;
     struct mutex_counter_worker counter_workers[2];
+    korp_mutex stress_mutex;
+    korp_cond stress_cond;
+    int stress_counter;
+    struct stress_counter_worker stress_counter_workers[SYNC_STRESS_WORKERS];
+    struct stress_condition_waiter stress_condition_waiters[2];
+    atomic_t stress_generation;
+    atomic_t stress_released;
     korp_mutex condition_mutex;
     korp_cond condition_cond;
     korp_mutex claimed_mutex;
@@ -131,6 +174,16 @@ struct platform_sync_fixture {
 ZTEST_DMEM static struct platform_sync_fixture sync_results = { 0 };
 ZTEST_DMEM static korp_mutex test_mutex = { 0 };
 ZTEST_DMEM static struct sync_claim_hook_state sync_claim_hook;
+static struct k_sem stress_counter_ready;
+static struct k_sem stress_counter_release;
+static struct k_sem stress_counter_done;
+static struct k_sem stress_condition_ready;
+static struct k_sem stress_condition_done;
+static struct k_sem stress_mutex_claimed;
+static struct k_sem stress_mutex_release;
+
+int
+wamr_zephyr_thread_test_wait(korp_tid handle, k_timeout_t timeout);
 
 void
 wamr_zephyr_sync_test_hook(int phase, uintptr_t handle)
@@ -138,6 +191,13 @@ wamr_zephyr_sync_test_hook(int phase, uintptr_t handle)
     if (phase != WAMR_SYNC_TEST_MUTEX_OPERATION_CLAIMED
         || handle != sync_claim_hook.expected_handle
         || !atomic_cas(&sync_claim_hook.armed, 1, 0)) {
+        return;
+    }
+
+    if (sync_claim_hook.semaphore_mode) {
+        k_sem_give(&stress_mutex_claimed);
+        sync_claim_hook.release_result =
+            k_sem_take(&stress_mutex_release, K_MSEC(SYNC_STRESS_GUARD_MS));
         return;
     }
 
@@ -425,6 +485,88 @@ join_waiter(korp_tid thread, struct condition_waiter *waiter)
     zassert_true(waiter->woke, "waiter did not return from condition wait");
 }
 
+static void
+init_stress_sem(struct k_sem *sem, unsigned int limit)
+{
+    k_sem_init(sem, 0, limit);
+#if defined(CONFIG_USERSPACE)
+    k_object_access_grant(sem, k_current_get());
+#endif
+}
+
+static void *
+run_stress_counter_worker(void *arg)
+{
+    struct stress_counter_worker *worker = arg;
+
+    k_sem_give(&stress_counter_ready);
+    worker->release_result =
+        k_sem_take(&stress_counter_release, K_MSEC(SYNC_STRESS_GUARD_MS));
+    if (worker->release_result == 0) {
+        for (unsigned int i = 0; i < SYNC_STRESS_INCREMENTS; i++) {
+            worker->lock_result = os_mutex_lock(worker->mutex);
+            if (worker->lock_result != BHT_OK) {
+                break;
+            }
+            (*worker->counter)++;
+            worker->unlock_result = os_mutex_unlock(worker->mutex);
+            if (worker->unlock_result != BHT_OK) {
+                break;
+            }
+        }
+    }
+    k_sem_give(&stress_counter_done);
+    return NULL;
+}
+
+static void *
+run_stress_condition_waiter(void *arg)
+{
+    struct stress_condition_waiter *waiter = arg;
+    int64_t deadline = k_uptime_get() + SYNC_STRESS_GUARD_MS;
+    int64_t wake_time = deadline;
+
+    waiter->lock_result = os_mutex_lock(waiter->mutex);
+    if (waiter->lock_result == BHT_OK) {
+        waiter->waiting = true;
+        k_sem_give(&stress_condition_ready);
+        while (atomic_get(waiter->generation) != waiter->expected_generation) {
+            int64_t remaining_ms = deadline - k_uptime_get();
+
+            if (remaining_ms <= 0) {
+                waiter->timed_out = true;
+                break;
+            }
+            waiter->wait_attempts++;
+            waiter->wait_result = os_cond_reltimedwait(
+                waiter->cond, waiter->mutex, (uint64)remaining_ms * 1000U);
+            wake_time = k_uptime_get();
+            if (waiter->wait_result != BHT_OK
+                && waiter->wait_result != ETIMEDOUT) {
+                break;
+            }
+        }
+        waiter->observed_signal = waiter->wait_result == BHT_OK
+                                  && atomic_get(waiter->generation)
+                                         == waiter->expected_generation
+                                  && wake_time < deadline;
+        if (!waiter->observed_signal) {
+            waiter->timed_out = wake_time >= deadline
+                                || waiter->wait_result == ETIMEDOUT;
+        }
+        waiter->woke = waiter->observed_signal;
+        if (waiter->woke) {
+            atomic_inc(waiter->released);
+        }
+        waiter->unlock_result = os_mutex_unlock(waiter->mutex);
+    }
+    else {
+        k_sem_give(&stress_condition_ready);
+    }
+    k_sem_give(&stress_condition_done);
+    return NULL;
+}
+
 static void *
 sync_setup(void)
 {
@@ -439,6 +581,13 @@ sync_setup(void)
 static void
 sync_before(void *fixture)
 {
+    init_stress_sem(&stress_counter_ready, SYNC_STRESS_WORKERS);
+    init_stress_sem(&stress_counter_release, SYNC_STRESS_WORKERS);
+    init_stress_sem(&stress_counter_done, SYNC_STRESS_WORKERS);
+    init_stress_sem(&stress_condition_ready, SYNC_STRESS_WORKERS);
+    init_stress_sem(&stress_condition_done, SYNC_STRESS_WORKERS);
+    init_stress_sem(&stress_mutex_claimed, 1U);
+    init_stress_sem(&stress_mutex_release, 1U);
     sync_results.runtime_destroyed = false;
     pool_before(fixture);
 }
@@ -471,43 +620,92 @@ WAMR_CONTEXT_TEST_F(platform_sync, test_mutex_lifecycle)
 
 #if defined(CONFIG_USERSPACE)
 static void
-run_shutdown_recovery(bool leak_mutex, struct shutdown_recovery_result *result)
+assert_shutdown_recovery(bool selected_mutex,
+                         const struct shutdown_recovery_result *result);
+
+static void
+run_shutdown_recovery(bool selected_mutex,
+                      struct shutdown_recovery_result *result)
 {
-    korp_mutex mutex = NULL;
+    korp_mutex mutex = { 0 };
     korp_cond cond = NULL;
 
     memset(result, 0, sizeof(*result));
-    result->leaked_init_result = BHT_ERROR;
-    result->leaked_destroy_result = BHT_ERROR;
+    result->selected_init_result = BHT_ERROR;
+    result->selected_destroy_result = BHT_ERROR;
     result->reinit_result = BHT_ERROR;
     result->recovered_init_result = BHT_ERROR;
     result->recovered_destroy_result = BHT_ERROR;
+    result->cycle_results_valid = true;
+    result->failed_cycle = SYNC_STRESS_POOL_ITERATIONS;
     result->initial_identity = os_self_thread();
-    result->leaked_init_result =
-        leak_mutex ? os_mutex_init(&mutex) : os_cond_init(&cond);
 
+    for (size_t iteration = 0; iteration < SYNC_STRESS_POOL_ITERATIONS;
+         iteration++) {
+        int cycle_init_result;
+        int active_destroy_result = BHT_ERROR;
+        korp_tid cycle_refused_identity;
+
+        cycle_init_result = selected_mutex ? os_mutex_init(&mutex)
+                                           : os_cond_init(&cond);
+
+        os_thread_sys_destroy();
+        cycle_refused_identity = os_self_thread();
+
+        if (selected_mutex && mutex != NULL) {
+            active_destroy_result = os_mutex_destroy(&mutex);
+        }
+        else if (!selected_mutex && cond != NULL) {
+            active_destroy_result = os_cond_destroy(&cond);
+        }
+
+        if (result->initial_identity == NULL || cycle_init_result != BHT_OK
+            || cycle_refused_identity != result->initial_identity
+            || active_destroy_result != BHT_OK
+            || os_self_thread() != result->initial_identity) {
+            result->cycle_results_valid = false;
+            if (result->failed_cycle == SYNC_STRESS_POOL_ITERATIONS) {
+                result->failed_cycle = iteration;
+            }
+            break;
+        }
+    }
+
+    if (selected_mutex && mutex != NULL) {
+        (void)os_mutex_destroy(&mutex);
+    }
+    else if (!selected_mutex && cond != NULL) {
+        (void)os_cond_destroy(&cond);
+    }
+
+    result->selected_init_result =
+        selected_mutex ? os_mutex_init(&mutex) : os_cond_init(&cond);
+
+    /*
+     * Runtime destruction releases its own synchronization slots before the
+     * platform audit. The selected test slot is therefore the only reason the
+     * supervisor identity remains mapped after this call.
+     */
     sync_results.runtime_destroyed = true;
     wasm_runtime_destroy();
     result->refused_identity = os_self_thread();
-
-    if (leak_mutex && mutex != NULL) {
-        result->leaked_destroy_result = os_mutex_destroy(&mutex);
+    if (selected_mutex && mutex != NULL) {
+        result->selected_destroy_result = os_mutex_destroy(&mutex);
     }
-    else if (!leak_mutex && cond != NULL) {
-        result->leaked_destroy_result = os_cond_destroy(&cond);
+    else if (!selected_mutex && cond != NULL) {
+        result->selected_destroy_result = os_cond_destroy(&cond);
     }
-
-    os_thread_sys_destroy();
     result->clean_identity = os_self_thread();
     result->reinit_result = os_thread_sys_init();
     result->recovered_identity = os_self_thread();
-
     result->recovered_init_result =
-        leak_mutex ? os_mutex_init(&mutex) : os_cond_init(&cond);
-    if (leak_mutex && mutex != NULL) {
+        selected_mutex ? os_mutex_init(&mutex) : os_cond_init(&cond);
+    result->recovered_handle_valid =
+        selected_mutex ? mutex != NULL : cond != NULL;
+    if (selected_mutex && mutex != NULL) {
         result->recovered_destroy_result = os_mutex_destroy(&mutex);
     }
-    else if (!leak_mutex && cond != NULL) {
+    else if (!selected_mutex && cond != NULL) {
         result->recovered_destroy_result = os_cond_destroy(&cond);
     }
 
@@ -516,29 +714,51 @@ run_shutdown_recovery(bool leak_mutex, struct shutdown_recovery_result *result)
 }
 
 static void
-assert_shutdown_recovery(const struct shutdown_recovery_result *result,
-                         const char *slot_type)
+assert_shutdown_recovery(bool selected_mutex,
+                         const struct shutdown_recovery_result *result)
 {
+    const char *slot_kind = selected_mutex ? "mutex" : "condition";
+
     zassert_not_null(result->initial_identity,
-                     "initial WAMR thread identity is missing");
-    zassert_equal(result->leaked_init_result, BHT_OK,
-                  "%s slot initialization failed", slot_type);
+                     "%s shutdown failed_cycle %zu missing identity",
+                     slot_kind, result->failed_cycle);
+    zassert_true(result->cycle_results_valid,
+                 "%s shutdown failed_cycle %zu repeated deferral failed",
+                 slot_kind, result->failed_cycle);
+    zassert_equal(result->selected_init_result, BHT_OK,
+                  "%s shutdown failed_cycle %zu selected init %d", slot_kind,
+                  result->failed_cycle, result->selected_init_result);
     zassert_equal_ptr(result->refused_identity, result->initial_identity,
-                      "shutdown did not refuse an active %s slot", slot_type);
-    zassert_equal(result->leaked_destroy_result, BHT_OK,
-                  "leaked %s slot cleanup failed", slot_type);
+                      "%s shutdown failed_cycle %zu selected slot did not "
+                      "defer runtime destroy",
+                      slot_kind, result->failed_cycle);
+    zassert_equal(result->selected_destroy_result, BHT_OK,
+                  "%s shutdown failed_cycle %zu selected destroy %d",
+                  slot_kind, result->failed_cycle,
+                  result->selected_destroy_result);
     zassert_is_null(result->clean_identity,
-                    "clean shutdown did not clear WAMR thread identity");
+                    "%s shutdown failed_cycle %zu selected destroy did not "
+                    "complete shutdown",
+                    slot_kind, result->failed_cycle);
     zassert_equal(result->reinit_result, BHT_OK,
-                  "thread subsystem did not recover after clean shutdown");
+                  "%s shutdown failed_cycle %zu reinit %d", slot_kind,
+                  result->failed_cycle, result->reinit_result);
     zassert_not_null(result->recovered_identity,
-                     "reinitialized WAMR thread identity is missing");
+                     "%s shutdown failed_cycle %zu missing recovered identity",
+                     slot_kind, result->failed_cycle);
     zassert_equal(result->recovered_init_result, BHT_OK,
-                  "%s pool was reset or rebound during shutdown", slot_type);
+                  "%s shutdown failed_cycle %zu recovery init %d", slot_kind,
+                  result->failed_cycle, result->recovered_init_result);
+    zassert_true(result->recovered_handle_valid,
+                 "%s shutdown failed_cycle %zu invalid recovered handle",
+                 slot_kind, result->failed_cycle);
     zassert_equal(result->recovered_destroy_result, BHT_OK,
-                  "recovered %s slot cleanup failed", slot_type);
+                  "%s shutdown failed_cycle %zu recovery destroy %d",
+                  slot_kind, result->failed_cycle,
+                  result->recovered_destroy_result);
     zassert_is_null(result->final_identity,
-                    "final clean shutdown left WAMR thread identity mapped");
+                    "%s shutdown failed_cycle %zu final shutdown incomplete",
+                    slot_kind, result->failed_cycle);
 }
 #endif
 
@@ -547,7 +767,7 @@ WAMR_CONTEXT_TEST_F(platform_sync,
 {
 #if defined(CONFIG_USERSPACE)
     run_shutdown_recovery(true, &fixture->shutdown_recovery);
-    assert_shutdown_recovery(&fixture->shutdown_recovery, "mutex");
+    assert_shutdown_recovery(true, &fixture->shutdown_recovery);
 #else
     ztest_test_skip();
 #endif
@@ -558,7 +778,7 @@ WAMR_CONTEXT_TEST_F(platform_sync,
 {
 #if defined(CONFIG_USERSPACE)
     run_shutdown_recovery(false, &fixture->shutdown_recovery);
-    assert_shutdown_recovery(&fixture->shutdown_recovery, "condition");
+    assert_shutdown_recovery(false, &fixture->shutdown_recovery);
 #else
     ztest_test_skip();
 #endif
@@ -1392,6 +1612,623 @@ WAMR_CONTEXT_TEST(platform_sync,
                   "recovered mutex cleanup failed");
     zassert_equal(recovery_cond_destroy_result, BHT_OK,
                   "recovered condition cleanup failed");
+#else
+    ztest_test_skip();
+#endif
+}
+
+WAMR_CONTEXT_TEST(platform_sync, test_mutex_serializes_exact_worker_counter)
+{
+    for (size_t cycle = 0; cycle < SYNC_STRESS_COUNTER_CYCLES; cycle++) {
+        korp_tid threads[SYNC_STRESS_WORKERS] = { NULL };
+        korp_mutex *mutex = &sync_results.stress_mutex;
+        struct stress_counter_worker *workers =
+            sync_results.stress_counter_workers;
+        int *counter = &sync_results.stress_counter;
+        int create_results[SYNC_STRESS_WORKERS] = { BHT_ERROR };
+        int ready_results[SYNC_STRESS_WORKERS] = { -EAGAIN };
+        int done_results[SYNC_STRESS_WORKERS] = { -EAGAIN };
+        int wait_results[SYNC_STRESS_WORKERS] = { BHT_ERROR };
+        int join_results[SYNC_STRESS_WORKERS] = { BHT_ERROR };
+        int init_result;
+        int destroy_result = BHT_ERROR;
+
+        memset(mutex, 0, sizeof(*mutex));
+        memset(workers, 0, sizeof(sync_results.stress_counter_workers));
+        *counter = 0;
+        init_result = os_mutex_init(mutex);
+        for (size_t i = 0; i < ARRAY_SIZE(threads); i++) {
+            workers[i].mutex = mutex;
+            workers[i].counter = counter;
+            workers[i].release_result = -EAGAIN;
+            workers[i].lock_result = BHT_ERROR;
+            workers[i].unlock_result = BHT_ERROR;
+            if (init_result == BHT_OK) {
+                create_results[i] = os_thread_create(
+                    &threads[i], run_stress_counter_worker, &workers[i],
+                    WAMR_TEST_THREAD_STACK_SIZE);
+            }
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(threads); i++) {
+            if (create_results[i] == BHT_OK) {
+                ready_results[i] = k_sem_take(
+                    &stress_counter_ready, K_MSEC(SYNC_STRESS_GUARD_MS));
+            }
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(threads); i++) {
+            if (create_results[i] == BHT_OK) {
+                k_sem_give(&stress_counter_release);
+            }
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(threads); i++) {
+            if (create_results[i] == BHT_OK) {
+                done_results[i] = k_sem_take(
+                    &stress_counter_done, K_MSEC(SYNC_STRESS_GUARD_MS));
+                wait_results[i] = wamr_zephyr_thread_test_wait(
+                    threads[i], K_MSEC(SYNC_STRESS_GUARD_MS));
+                if (wait_results[i] == 0) {
+                    join_results[i] = os_thread_join(threads[i], NULL);
+                }
+            }
+        }
+        if (init_result == BHT_OK) {
+            destroy_result = os_mutex_destroy(mutex);
+        }
+
+        zassert_equal(init_result, BHT_OK,
+                      "counter cycle %zu init result %d", cycle, init_result);
+        for (size_t i = 0; i < ARRAY_SIZE(threads); i++) {
+            zassert_equal(create_results[i], BHT_OK,
+                          "counter cycle %zu worker %zu create result %d",
+                          cycle, i, create_results[i]);
+            zassert_equal(ready_results[i], 0,
+                          "counter cycle %zu worker %zu ready result %d", cycle,
+                          i, ready_results[i]);
+            zassert_equal(done_results[i], 0,
+                          "counter cycle %zu worker %zu done result %d", cycle,
+                          i, done_results[i]);
+            zassert_equal(wait_results[i], 0,
+                          "counter cycle %zu worker %zu exit result %d", cycle,
+                          i, wait_results[i]);
+            zassert_equal(join_results[i], BHT_OK,
+                          "counter cycle %zu worker %zu join result %d", cycle,
+                          i, join_results[i]);
+            zassert_equal(workers[i].release_result, 0,
+                          "counter cycle %zu worker %zu release result %d",
+                          cycle, i, workers[i].release_result);
+            zassert_equal(workers[i].lock_result, BHT_OK,
+                          "counter cycle %zu worker %zu lock result %d", cycle,
+                          i, workers[i].lock_result);
+            zassert_equal(workers[i].unlock_result, BHT_OK,
+                          "counter cycle %zu worker %zu unlock result %d",
+                          cycle, i, workers[i].unlock_result);
+        }
+        zassert_equal(*counter, SYNC_STRESS_WORKERS * SYNC_STRESS_INCREMENTS,
+                      "counter cycle %zu total result %d", cycle, *counter);
+        zassert_equal(destroy_result, BHT_OK,
+                      "counter cycle %zu destroy result %d", cycle,
+                      destroy_result);
+    }
+}
+
+static void
+run_condition_release_cycles(bool broadcast)
+{
+    korp_mutex *mutex = &sync_results.stress_mutex;
+    korp_cond *cond = &sync_results.stress_cond;
+    atomic_t *generation = &sync_results.stress_generation;
+    atomic_t *released = &sync_results.stress_released;
+    const size_t waiter_count = broadcast ? 2U : 1U;
+    int mutex_init_result;
+    int cond_init_result;
+    int cond_destroy_result = BHT_ERROR;
+    int mutex_destroy_result = BHT_ERROR;
+    bool cycles_valid = true;
+    size_t failed_iteration = SYNC_STRESS_LIGHTWEIGHT_ITERATIONS;
+
+    memset(mutex, 0, sizeof(*mutex));
+    memset(cond, 0, sizeof(*cond));
+    atomic_clear(generation);
+    atomic_clear(released);
+    mutex_init_result = os_mutex_init(mutex);
+    cond_init_result = os_cond_init(cond);
+    for (size_t iteration = 0; iteration < SYNC_STRESS_LIGHTWEIGHT_ITERATIONS;
+         iteration++) {
+        korp_tid threads[2] = { NULL, NULL };
+        struct stress_condition_waiter *waiters =
+            sync_results.stress_condition_waiters;
+        int create_results[2] = { BHT_ERROR, BHT_ERROR };
+        int ready_results[2] = { -EAGAIN, -EAGAIN };
+        int first_done_results[2] = { -EAGAIN, -EAGAIN };
+        int cleanup_done_results[2] = { -EAGAIN, -EAGAIN };
+        int wait_results[2] = { BHT_ERROR, BHT_ERROR };
+        int join_results[2] = { BHT_ERROR, BHT_ERROR };
+        int lock_result = BHT_ERROR;
+        int release_result = BHT_ERROR;
+        int unlock_result = BHT_ERROR;
+        int cleanup_lock_result = BHT_ERROR;
+        int cleanup_broadcast_result = BHT_ERROR;
+        int cleanup_unlock_result = BHT_ERROR;
+        bool all_ready = true;
+        bool iteration_failed = false;
+        bool cleanup_needed = false;
+
+        memset(waiters, 0, sizeof(sync_results.stress_condition_waiters));
+        for (size_t i = 0; i < waiter_count; i++) {
+            waiters[i].mutex = mutex;
+            waiters[i].cond = cond;
+            waiters[i].generation = generation;
+            waiters[i].released = released;
+            waiters[i].expected_generation = (int)iteration + 1;
+            waiters[i].lock_result = BHT_ERROR;
+            waiters[i].wait_result = BHT_ERROR;
+            waiters[i].unlock_result = BHT_ERROR;
+            if (mutex_init_result == BHT_OK && cond_init_result == BHT_OK) {
+                create_results[i] = os_thread_create(
+                    &threads[i], run_stress_condition_waiter, &waiters[i],
+                    WAMR_TEST_THREAD_STACK_SIZE);
+            }
+            if (create_results[i] == BHT_OK) {
+                ready_results[i] = k_sem_take(
+                    &stress_condition_ready, K_MSEC(SYNC_STRESS_GUARD_MS));
+                all_ready = all_ready && ready_results[i] == 0
+                            && waiters[i].waiting;
+            }
+            else {
+                all_ready = false;
+            }
+        }
+        if (all_ready) {
+            lock_result = os_mutex_lock(mutex);
+            if (lock_result == BHT_OK) {
+                atomic_set(generation, (atomic_val_t)iteration + 1);
+                release_result = broadcast ? os_cond_broadcast(cond)
+                                           : os_cond_signal(cond);
+                unlock_result = os_mutex_unlock(mutex);
+            }
+        }
+        for (size_t i = 0; i < waiter_count; i++) {
+            if (create_results[i] == BHT_OK) {
+                first_done_results[i] = k_sem_take(
+                    &stress_condition_done, K_MSEC(SYNC_STRESS_GUARD_MS));
+            }
+        }
+        for (size_t i = 0; i < waiter_count; i++) {
+            if (create_results[i] == BHT_OK && first_done_results[i] != 0) {
+                cleanup_needed = true;
+            }
+        }
+        if (cleanup_needed) {
+            cleanup_lock_result = os_mutex_lock(mutex);
+            if (cleanup_lock_result == BHT_OK) {
+                cleanup_broadcast_result = os_cond_broadcast(cond);
+                cleanup_unlock_result = os_mutex_unlock(mutex);
+            }
+        }
+        for (size_t i = 0; i < waiter_count; i++) {
+            if (create_results[i] == BHT_OK) {
+                if (first_done_results[i] != 0) {
+                    cleanup_done_results[i] = k_sem_take(
+                        &stress_condition_done, K_MSEC(SYNC_STRESS_GUARD_MS));
+                }
+                wait_results[i] = wamr_zephyr_thread_test_wait(
+                    threads[i], K_MSEC(SYNC_STRESS_GUARD_MS));
+                if (wait_results[i] == 0) {
+                    join_results[i] = os_thread_join(threads[i], NULL);
+                }
+            }
+        }
+        if (!all_ready || lock_result != BHT_OK || release_result != BHT_OK
+            || unlock_result != BHT_OK) {
+            iteration_failed = true;
+        }
+        for (size_t i = 0; i < waiter_count; i++) {
+            if (first_done_results[i] != 0
+                || wait_results[i] != 0 || join_results[i] != BHT_OK
+                || waiters[i].wait_result != BHT_OK || !waiters[i].woke
+                || waiters[i].timed_out || !waiters[i].observed_signal
+                || waiters[i].unlock_result != BHT_OK) {
+                iteration_failed = true;
+            }
+        }
+        if (atomic_get(released) != (atomic_val_t)((iteration + 1) * waiter_count)) {
+            iteration_failed = true;
+        }
+        if (iteration_failed && !cleanup_needed) {
+            cleanup_needed = true;
+            cleanup_lock_result = os_mutex_lock(mutex);
+            if (cleanup_lock_result == BHT_OK) {
+                cleanup_broadcast_result = os_cond_broadcast(cond);
+                cleanup_unlock_result = os_mutex_unlock(mutex);
+            }
+        }
+        if (cleanup_needed && (cleanup_lock_result != BHT_OK
+                               || cleanup_broadcast_result != BHT_OK
+                               || cleanup_unlock_result != BHT_OK
+                               || cleanup_done_results[0] != 0)) {
+            iteration_failed = true;
+        }
+        if (iteration_failed) {
+            cycles_valid = false;
+            failed_iteration = iteration;
+            break;
+        }
+    }
+    if (cond_init_result == BHT_OK) {
+        cond_destroy_result = os_cond_destroy(cond);
+    }
+    if (mutex_init_result == BHT_OK) {
+        mutex_destroy_result = os_mutex_destroy(mutex);
+    }
+    zassert_equal(mutex_init_result, BHT_OK, "stress mutex init returned %d",
+                  mutex_init_result);
+    zassert_equal(cond_init_result, BHT_OK, "stress condition init returned %d",
+                  cond_init_result);
+    zassert_equal(cond_destroy_result, BHT_OK,
+                  "stress condition destroy returned %d", cond_destroy_result);
+    zassert_equal(mutex_destroy_result, BHT_OK,
+                  "stress mutex destroy returned %d", mutex_destroy_result);
+    zassert_true(cycles_valid, "%s cycle %zu failed after cleanup",
+                 broadcast ? "broadcast" : "signal", failed_iteration);
+}
+
+WAMR_CONTEXT_TEST(platform_sync, test_condition_signal_releases_each_waiter)
+{
+    run_condition_release_cycles(false);
+}
+
+WAMR_CONTEXT_TEST(platform_sync, test_condition_broadcast_releases_all_waiters)
+{
+    run_condition_release_cycles(true);
+}
+
+WAMR_CONTEXT_TEST(platform_sync, test_condition_timeout_reacquires_mutex)
+{
+    korp_mutex mutex = { 0 };
+    korp_cond cond = { 0 };
+    int protected_iteration = 0;
+    int mutex_init_result = os_mutex_init(&mutex);
+    int cond_init_result = os_cond_init(&cond);
+    int lock_results[SYNC_STRESS_LIGHTWEIGHT_ITERATIONS];
+    int wait_results[SYNC_STRESS_LIGHTWEIGHT_ITERATIONS];
+    int unlock_results[SYNC_STRESS_LIGHTWEIGHT_ITERATIONS];
+    int protected_results[SYNC_STRESS_LIGHTWEIGHT_ITERATIONS];
+    int cond_destroy_result = BHT_ERROR;
+    int mutex_destroy_result = BHT_ERROR;
+
+    for (size_t iteration = 0; iteration < SYNC_STRESS_LIGHTWEIGHT_ITERATIONS;
+         iteration++) {
+        int lock_result = BHT_ERROR;
+        int wait_result = BHT_ERROR;
+        int unlock_result = BHT_ERROR;
+
+        if (mutex_init_result == BHT_OK && cond_init_result == BHT_OK) {
+            lock_result = os_mutex_lock(&mutex);
+        }
+        if (lock_result == BHT_OK) {
+            wait_result = os_cond_reltimedwait(&cond, &mutex, 1000U);
+#if defined(CONFIG_USERSPACE)
+            if (wait_result == ETIMEDOUT) {
+#else
+            if (wait_result == BHT_OK) {
+#endif
+                protected_iteration = (int)iteration + 1;
+            }
+            unlock_result = os_mutex_unlock(&mutex);
+        }
+        lock_results[iteration] = lock_result;
+        wait_results[iteration] = wait_result;
+        unlock_results[iteration] = unlock_result;
+        protected_results[iteration] = protected_iteration;
+    }
+    if (cond_init_result == BHT_OK) {
+        cond_destroy_result = os_cond_destroy(&cond);
+    }
+    if (mutex_init_result == BHT_OK) {
+        mutex_destroy_result = os_mutex_destroy(&mutex);
+    }
+    zassert_equal(mutex_init_result, BHT_OK, "timeout mutex init returned %d",
+                  mutex_init_result);
+    zassert_equal(cond_init_result, BHT_OK, "timeout condition init returned %d",
+                  cond_init_result);
+    zassert_equal(cond_destroy_result, BHT_OK,
+                  "timeout condition destroy returned %d", cond_destroy_result);
+    zassert_equal(mutex_destroy_result, BHT_OK,
+                  "timeout mutex destroy returned %d", mutex_destroy_result);
+    for (size_t iteration = 0; iteration < SYNC_STRESS_LIGHTWEIGHT_ITERATIONS;
+         iteration++) {
+        zassert_equal(lock_results[iteration], BHT_OK,
+                      "timeout iteration %zu lock %d", iteration,
+                      lock_results[iteration]);
+#if defined(CONFIG_USERSPACE)
+        zassert_equal(wait_results[iteration], ETIMEDOUT,
+                      "timeout iteration %zu wait %d", iteration,
+                      wait_results[iteration]);
+#else
+        zassert_equal(wait_results[iteration], BHT_OK,
+                      "timeout iteration %zu wait %d", iteration,
+                      wait_results[iteration]);
+#endif
+        zassert_equal(protected_results[iteration], (int)iteration + 1,
+                      "timeout iteration %zu lost mutex", iteration);
+        zassert_equal(unlock_results[iteration], BHT_OK,
+                      "timeout iteration %zu unlock %d", iteration,
+                      unlock_results[iteration]);
+    }
+}
+
+WAMR_CONTEXT_TEST(platform_sync, test_active_sync_destroy_recovers_each_cycle)
+{
+#if defined(CONFIG_USERSPACE)
+    for (size_t iteration = 0; iteration < SYNC_STRESS_LIGHTWEIGHT_ITERATIONS;
+         iteration++) {
+        korp_mutex *mutex = &sync_results.stress_mutex;
+        korp_cond *cond = &sync_results.stress_cond;
+        korp_tid mutex_thread = NULL;
+        korp_tid condition_thread = NULL;
+        struct mutex_operation_context *operation =
+            &sync_results.claimed_operation;
+        struct stress_condition_waiter *waiter =
+            &sync_results.stress_condition_waiters[0];
+        atomic_t *generation = &sync_results.stress_generation;
+        atomic_t *released = &sync_results.stress_released;
+        int mutex_init;
+        int mutex_create = BHT_ERROR;
+        int claim_guard = -EAGAIN;
+        int mutex_busy_destroy = BHT_ERROR;
+        int mutex_exit_guard = BHT_ERROR;
+        int mutex_join = BHT_ERROR;
+        int mutex_destroy = BHT_ERROR;
+        int condition_init = BHT_ERROR;
+        int cond_create = BHT_ERROR;
+        int ready_guard = -EAGAIN;
+        int cond_busy_destroy = BHT_ERROR;
+        int cond_signal = BHT_ERROR;
+        int cond_unlock = BHT_ERROR;
+        int done_guard = -EAGAIN;
+        int cond_exit_guard = BHT_ERROR;
+        int cond_join = BHT_ERROR;
+        int cond_destroy = BHT_ERROR;
+
+        memset(mutex, 0, sizeof(*mutex));
+        memset(cond, 0, sizeof(*cond));
+        memset(operation, 0, sizeof(*operation));
+        memset(waiter, 0, sizeof(*waiter));
+        operation->mutex = mutex;
+        operation->lock_result = BHT_ERROR;
+        operation->unlock_result = BHT_ERROR;
+        waiter->mutex = mutex;
+        waiter->cond = cond;
+        waiter->lock_result = BHT_ERROR;
+        waiter->wait_result = BHT_ERROR;
+        waiter->unlock_result = BHT_ERROR;
+        atomic_clear(generation);
+        atomic_clear(released);
+        mutex_init = os_mutex_init(mutex);
+        sync_claim_hook.semaphore_mode = true;
+        sync_claim_hook.release_result = -EAGAIN;
+        atomic_set(&sync_claim_hook.armed, 1);
+        if (mutex_init == BHT_OK) {
+            sync_claim_hook.expected_handle = (uintptr_t)*mutex;
+            mutex_create = os_thread_create(&mutex_thread,
+                                            run_claimed_mutex_operation,
+                                            operation,
+                                            WAMR_TEST_THREAD_STACK_SIZE);
+        }
+        if (mutex_create == BHT_OK) {
+            claim_guard = k_sem_take(&stress_mutex_claimed,
+                                     K_MSEC(SYNC_STRESS_GUARD_MS));
+            if (claim_guard == 0) {
+                mutex_busy_destroy = os_mutex_destroy(mutex);
+            }
+            k_sem_give(&stress_mutex_release);
+            mutex_exit_guard = wamr_zephyr_thread_test_wait(
+                mutex_thread, K_MSEC(SYNC_STRESS_GUARD_MS));
+            if (mutex_exit_guard == 0) {
+                mutex_join = os_thread_join(mutex_thread, NULL);
+            }
+        }
+        if (*mutex != NULL) {
+            mutex_destroy = os_mutex_destroy(mutex);
+        }
+
+        condition_init = os_cond_init(cond);
+        waiter->generation = generation;
+        waiter->released = released;
+        waiter->expected_generation = 1;
+        if (mutex_init == BHT_OK && condition_init == BHT_OK && *mutex == NULL) {
+            mutex_init = os_mutex_init(mutex);
+        }
+        if (mutex_init == BHT_OK && condition_init == BHT_OK) {
+            cond_create = os_thread_create(&condition_thread,
+                                           run_stress_condition_waiter, waiter,
+                                           WAMR_TEST_THREAD_STACK_SIZE);
+        }
+        if (cond_create == BHT_OK) {
+            ready_guard = k_sem_take(&stress_condition_ready,
+                                     K_MSEC(SYNC_STRESS_GUARD_MS));
+            if (ready_guard == 0) {
+                int lock = os_mutex_lock(mutex);
+
+                if (lock == BHT_OK) {
+                    cond_busy_destroy = os_cond_destroy(cond);
+                    atomic_set(generation, 1);
+                    cond_signal = os_cond_signal(cond);
+                    cond_unlock = os_mutex_unlock(mutex);
+                }
+            }
+            done_guard = k_sem_take(&stress_condition_done,
+                                     K_MSEC(SYNC_STRESS_GUARD_MS));
+            cond_exit_guard = wamr_zephyr_thread_test_wait(
+                condition_thread, K_MSEC(SYNC_STRESS_GUARD_MS));
+            if (cond_exit_guard == 0) {
+                cond_join = os_thread_join(condition_thread, NULL);
+            }
+        }
+        if (*cond != NULL) {
+            cond_destroy = os_cond_destroy(cond);
+        }
+        if (*mutex != NULL) {
+            mutex_destroy = os_mutex_destroy(mutex);
+        }
+        sync_claim_hook.semaphore_mode = false;
+
+        zassert_equal(mutex_init, BHT_OK, "active iteration %zu mutex init %d",
+                      iteration, mutex_init);
+        zassert_equal(mutex_create, BHT_OK,
+                      "active iteration %zu mutex worker create %d", iteration,
+                      mutex_create);
+        zassert_equal(claim_guard, 0,
+                      "active iteration %zu mutex claim guard %d", iteration,
+                      claim_guard);
+        zassert_equal(mutex_busy_destroy, BHT_ERROR,
+                      "active iteration %zu destroyed claimed mutex", iteration);
+        zassert_equal(sync_claim_hook.release_result, 0,
+                      "active iteration %zu mutex release guard %d", iteration,
+                      sync_claim_hook.release_result);
+        zassert_equal(mutex_exit_guard, 0,
+                      "active iteration %zu mutex exit guard %d", iteration,
+                      mutex_exit_guard);
+        zassert_equal(mutex_join, BHT_OK,
+                      "active iteration %zu mutex join %d", iteration,
+                      mutex_join);
+        zassert_equal(operation->lock_result, BHT_OK,
+                      "active iteration %zu mutex lock %d", iteration,
+                      operation->lock_result);
+        zassert_equal(operation->unlock_result, BHT_OK,
+                      "active iteration %zu mutex unlock %d", iteration,
+                      operation->unlock_result);
+        zassert_equal(condition_init, BHT_OK,
+                      "active iteration %zu condition init %d", iteration,
+                      condition_init);
+        zassert_equal(cond_create, BHT_OK,
+                      "active iteration %zu condition worker create %d",
+                      iteration, cond_create);
+        zassert_equal(ready_guard, 0,
+                      "active iteration %zu condition ready guard %d",
+                      iteration, ready_guard);
+        zassert_equal(cond_busy_destroy, BHT_ERROR,
+                      "active iteration %zu destroyed waiting condition",
+                      iteration);
+        zassert_equal(cond_signal, BHT_OK,
+                      "active iteration %zu condition signal %d", iteration,
+                      cond_signal);
+        zassert_equal(cond_unlock, BHT_OK,
+                      "active iteration %zu condition unlock %d", iteration,
+                      cond_unlock);
+        zassert_equal(done_guard, 0,
+                      "active iteration %zu condition done guard %d", iteration,
+                      done_guard);
+        zassert_equal(cond_exit_guard, 0,
+                      "active iteration %zu condition exit guard %d", iteration,
+                      cond_exit_guard);
+        zassert_equal(cond_join, BHT_OK,
+                      "active iteration %zu condition join %d", iteration,
+                      cond_join);
+        zassert_equal(waiter->wait_result, BHT_OK,
+                      "active iteration %zu condition wait %d", iteration,
+                      waiter->wait_result);
+        zassert_equal(waiter->unlock_result, BHT_OK,
+                      "active iteration %zu condition waiter unlock %d",
+                      iteration, waiter->unlock_result);
+        zassert_true(waiter->woke,
+                     "active iteration %zu condition waiter did not wake",
+                     iteration);
+        zassert_equal(cond_destroy, BHT_OK,
+                      "active iteration %zu condition destroy %d", iteration,
+                      cond_destroy);
+        zassert_equal(mutex_destroy, BHT_OK,
+                      "active iteration %zu mutex destroy %d", iteration,
+                      mutex_destroy);
+    }
+#else
+    ztest_test_skip();
+#endif
+}
+
+WAMR_CONTEXT_TEST(platform_sync_pool,
+                  test_sync_pools_exhaust_and_recover_each_cycle)
+{
+#if defined(CONFIG_USERSPACE)
+    for (size_t cycle = 0; cycle < SYNC_STRESS_POOL_ITERATIONS; cycle++) {
+        korp_mutex mutexes[TEST_MUTEX_POOL_COUNT + 1] = { NULL };
+        korp_cond conditions[TEST_COND_POOL_COUNT + 1] = { NULL };
+        korp_cond independent_cond = NULL;
+        korp_mutex independent_mutex = NULL;
+        korp_mutex recovered_mutex = NULL;
+        korp_cond recovered_cond = NULL;
+        int mutex_results[TEST_MUTEX_POOL_COUNT + 1];
+        int cond_results[TEST_COND_POOL_COUNT + 1];
+        int independent_cond_result;
+        int independent_mutex_result;
+        int recovered_mutex_result;
+        int recovered_cond_result;
+        bool cleanup_ok = true;
+
+        for (size_t i = 0; i < ARRAY_SIZE(mutexes); i++) {
+            mutex_results[i] = os_mutex_init(&mutexes[i]);
+        }
+        independent_cond_result = os_cond_init(&independent_cond);
+        if (independent_cond != NULL
+            && os_cond_destroy(&independent_cond) != BHT_OK) {
+            cleanup_ok = false;
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(mutexes); i++) {
+            if (mutexes[i] != NULL && os_mutex_destroy(&mutexes[i]) != BHT_OK) {
+                cleanup_ok = false;
+            }
+        }
+        recovered_mutex_result = os_mutex_init(&recovered_mutex);
+        if (recovered_mutex != NULL
+            && os_mutex_destroy(&recovered_mutex) != BHT_OK) {
+            cleanup_ok = false;
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(conditions); i++) {
+            cond_results[i] = os_cond_init(&conditions[i]);
+        }
+        independent_mutex_result = os_mutex_init(&independent_mutex);
+        if (independent_mutex != NULL
+            && os_mutex_destroy(&independent_mutex) != BHT_OK) {
+            cleanup_ok = false;
+        }
+        for (size_t i = 0; i < ARRAY_SIZE(conditions); i++) {
+            if (conditions[i] != NULL
+                && os_cond_destroy(&conditions[i]) != BHT_OK) {
+                cleanup_ok = false;
+            }
+        }
+        recovered_cond_result = os_cond_init(&recovered_cond);
+        if (recovered_cond != NULL
+            && os_cond_destroy(&recovered_cond) != BHT_OK) {
+            cleanup_ok = false;
+        }
+
+        for (size_t i = 0; i < TEST_MUTEX_POOL_COUNT; i++) {
+            zassert_equal(mutex_results[i], BHT_OK,
+                          "pool cycle %zu mutex slot %zu init %d", cycle, i,
+                          mutex_results[i]);
+        }
+        zassert_equal(mutex_results[TEST_MUTEX_POOL_COUNT], BHT_ERROR,
+                      "pool cycle %zu allocated one mutex too many", cycle);
+        zassert_equal(independent_cond_result, BHT_OK,
+                      "pool cycle %zu mutex exhaustion used condition slot",
+                      cycle);
+        zassert_equal(recovered_mutex_result, BHT_OK,
+                      "pool cycle %zu mutex pool did not recover", cycle);
+        for (size_t i = 0; i < TEST_COND_POOL_COUNT; i++) {
+            zassert_equal(cond_results[i], BHT_OK,
+                          "pool cycle %zu condition slot %zu init %d", cycle,
+                          i, cond_results[i]);
+        }
+        zassert_equal(cond_results[TEST_COND_POOL_COUNT], BHT_ERROR,
+                      "pool cycle %zu allocated one condition too many", cycle);
+        zassert_equal(independent_mutex_result, BHT_OK,
+                      "pool cycle %zu condition exhaustion used mutex slot",
+                      cycle);
+        zassert_equal(recovered_cond_result, BHT_OK,
+                      "pool cycle %zu condition pool did not recover", cycle);
+        zassert_true(cleanup_ok, "pool cycle %zu cleanup failed", cycle);
+    }
 #else
     ztest_test_skip();
 #endif

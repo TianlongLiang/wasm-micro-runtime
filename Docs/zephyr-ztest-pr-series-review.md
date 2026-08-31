@@ -130,6 +130,43 @@ Supporting verification: 29 Python tests; all 11 ordinary Zephyr 3.7 CI matrix
 entries; both focused coverage scenarios and aggregation; plus targeted Zephyr
 4.4.0 and 4.4.1 condition-variable runs. Zero configurations failed or errored.
 
+## Deterministic thread and synchronization lifecycle phase
+
+Purpose: raise confidence in the Zephyr thread/synchronization implementation
+through deterministic lifecycle repetition rather than timing-dependent stress.
+Thread slots, join/detach ownership, mutex/condition pools, timed-wait mutex
+reacquisition, and shutdown are coordinated by semaphores/atomics and bounded
+guards. Two runtime workflows repeatedly cover WAMR-worker create/join/restart
+and timeout-with-reacquisition followed by destruction/reinitialization.
+
+The ordinary scenarios remain required: their affected-root wall times are
+13.64/27.77 s for `platform_api` and 7.08/25.72 s for `runtime`
+(native_sim/QEMU ARC), well below the two-to-three-minute ceiling. Focused native coverage
+is 507/598 lines (84%) and 223/326 branches (68%), a +3 branch/+0 line change
+over baseline. The kernel aggregate cannot cover the QEMU userspace slot path,
+but that path has direct saturation/recovery coverage; allocator-failure exits
+remain configuration/hardware-only, so no memory test was justified.
+
+Evidence: 29/29 host tests from discovery of both host test modules; all 11
+pinned Zephyr 3.7.0 ordinary reports (324 passed and 51 skipped testcase
+records, zero failed/error/null); and both focused coverage scenarios (68
+passed/16 skipped each). Official disposable Zephyr 4.4.0 and 4.4.1 probes
+passed `platform_api` on native_sim and QEMU ARC and `runtime` on native_sim
+and QEMU ARC (313 passed/50 skipped records per version, zero
+failed/error/null). The existing bounded 4.4.x condvar-timeout relock is
+retained. The probe also exposed a test-only missing public
+`os_mutex_*` declaration; the existing userspace runtime regression scenario
+failed before adding `platform_api_vmcore.h` and then passed 9/9 on 4.4.0.
+
+Fresh Task 8 wall times for the eleven 3.7 entries were 11.34 s (native
+`simple`), 9.86 s (QEMU `simple`), 12.94 s (`simple-file`), 8.20 s
+(`simple-http` build-only), 34.21 s (`user-mode`), 18.85 s
+(`user-mode-multi-thread`), 13.64/27.77 s (`platform_api` native/QEMU),
+7.08/25.72 s (`runtime` native/QEMU), and 74.24 s (`usermode_faults`). The two
+coverage scenarios took 11.48 s and 10.80 s; aggregation took 1.07 s. The
+4.4.0 affected roots took 17.88/27.28 s (`platform_api`) and 7.48/25.76 s
+(`runtime`); 4.4.1 took 17.02/27.81 s and 9.11/25.70 s, respectively.
+
 ## Suggested Review Order
 
 Review and merge one PR at a time in the order above. For each PR, compare it

@@ -6,7 +6,61 @@ kernel, verifier, or MPU test matrices.
 
 All current runtime scenarios use the interpreter and
 `WAMR_BUILD_GLOBAL_HEAP_POOL`. AOT, alternate allocators, filesystem and socket
-APIs, stress testing, and physical-board coverage are outside this test set.
+APIs, randomized/timing-dependent/load stress testing, and physical-board
+coverage are outside this test set.
+
+## Deterministic lifecycle stress and current evidence
+
+The platform and runtime roots include deterministic stress for WAMR thread and
+synchronization lifecycles: slot reuse and saturation/recovery, competing
+join/detach order, mutex/condition pool recovery, timed-wait mutex
+reacquisition, and teardown with active synchronization.  They use named,
+bounded iteration counts (normally 8--32) and semaphores/atomics to establish
+each phase; finite waits are deadlock guards, never scheduling mechanisms.
+
+Operational contracts use `WAMR_CONTEXT_TEST()`/`WAMR_CONTEXT_TEST_F()` so the
+same body runs as a supervisor caller in the kernel scenarios and as a user
+caller on QEMU ARC. Pool provisioning, object-permission, and deliberately
+missing-grant checks remain supervisor-controlled plain `ZTEST` cases: they
+exercise embedding infrastructure rather than a public user-call contract.
+
+Measured final ordinary-root wall times are 13.64 s (`platform_api` native),
+27.77 s (`platform_api` QEMU ARC), 7.08 s (`runtime` native), and 25.72 s
+(`runtime` QEMU ARC). They are far below the two-to-three-minute placement
+ceiling, so every deterministic case remains in its existing ordinary required
+scenario; no dedicated scenario, Kconfig switch, or wrapper lane is needed.
+
+The focused native coverage measurement runs the two commands in the
+Informational coverage section sequentially, then aggregates their
+`coverage.json` inputs. The final aggregate is 507/598 lines (84%) and
+223/326 branches (68%), compared with the 507/598 lines (84%) and 220/326
+branches (67%) baseline: three additional `zephyr_thread.c` branch outcomes
+and no new executable lines. The kernel-only aggregate cannot enter the
+QEMU-only userspace registered-thread-slot path; its direct saturation and
+recovery test is the corresponding behavioral evidence. Allocator-failure
+exits remain configuration/hardware-only, so the coverage gate correctly
+added no memory test.
+
+Fresh 2026-08-30 verification on the pinned Zephyr 3.7.0 image ran all eleven
+ordinary entries plus host discovery. Host discovery passed 29/29 tests. The
+eleven `twister.json` files contain 324 passed and 51 skipped testcase records,
+with zero failed, error, or null statuses. Both focused coverage scenarios
+passed 68 testcase records and skipped 16, with the same zero-status-failure
+check.
+
+Compatibility probes use official Zephyr `v4.4.0`
+(`684c9e8f32e4373a21098559f748f06915f950c9`) and `v4.4.1`
+(`1f6485ec`) in disposable `/tmp/wamr-zephyr-4.4-probe/{4.4.0,4.4.1}`
+workspaces, with Python 3.12 and Zephyr SDK 1.0.1; the repository's 3.7.0 pin
+is unchanged. For each version, `platform_api` passed on native_sim (136
+passed/32 skipped) and QEMU ARC (152/18), while `runtime` passed on native_sim
+(8/0) and QEMU ARC (17/0), all with zero failed, error, and null statuses.
+The known 4.4.x `k_condvar_wait()` timeout regression remains handled by the
+existing bounded `[4.4.0, 4.5.0)` `-EAGAIN` relock workaround. This probe also
+found and fixed a separate test-only declaration regression: the userspace
+runtime workflow now includes the public `platform_api_vmcore.h` declaration
+for `os_mutex_*`; its 4.4.0 failing build was reproduced and its focused 9/9
+scenario rerun passed.
 
 ## Test roots
 
@@ -17,6 +71,7 @@ APIs, stress testing, and physical-board coverage are outside this test set.
 | `usermode_faults/` | WAMR-specific memory-domain and MPU boundaries, expected user faults, recovery, and the distinction between a Wasm trap and an MPU fault. |
 | `common/` | Shared Wasm byte fixtures and runtime workflow helpers used by the runtime and fault suites. It is not a standalone Twister root. |
 | `test_build_and_run.py` | Host-side unit tests for `build_and_run.py`. |
+| `test_coverage_report.py` | Host-side unit tests for `coverage_report.py`. |
 
 Each runnable root has a `testcase.yaml`. Twister is the source of the test
 verdict and records individual Ztest results in its JSON and XML reports.
@@ -118,10 +173,13 @@ Inside an already configured Zephyr workspace or the CI container, add
 python3 build_and_run.py --no-docker --sim qemu_arc tests/platform_api
 ```
 
-Run the host-side wrapper tests from the repository root:
+Run the complete host-side unit-test discovery from the repository root. This
+includes both `test_build_and_run.py` and `test_coverage_report.py` (29 tests
+in the current final evidence):
 
 ```sh
-python3 -m unittest product-mini/platforms/zephyr/tests/test_build_and_run.py
+python3 -m unittest discover -s product-mini/platforms/zephyr/tests \
+  -p 'test*.py' -v
 ```
 
 Ordinary artifacts are written below:
@@ -190,9 +248,11 @@ binary. QEMU ARC remains behavioral userspace evidence rather than coverage.
 Hardware cache branches and impossible defensive branches are intentionally not
 targeted.
 
-Task 6 established the Zephyr 3.7.0 pinned baseline on 2026-08-27. Task 7
-reran the affected 3.7 roots and both focused coverage scenarios on
-2026-08-28 after landing the 4.4-compatible fixes:
+Historical pre-feature/pilot evidence: Task 6 established the Zephyr 3.7.0
+pinned baseline on 2026-08-27. The earlier Task 7 pilot reran affected 3.7
+roots and both focused coverage scenarios on 2026-08-28 after landing the
+then-current 4.4-compatible fixes. These values are not the current final
+verification summarized above:
 
 | Coverage input | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -223,10 +283,12 @@ Task 7 reran the affected ordinary roots on the pinned 3.7.0 baseline:
 | `qemu_arc/qemu_arc_hs tests/runtime` | 2 | 14 | 0 | 0 | 0 |
 | `qemu_arc/qemu_arc_hs tests/usermode_faults` | 5 | 5 | 0 | 0 | 0 |
 
-The complete 11-entry Zephyr 3.7 matrix table below combines those fresh Task 7
-reruns with the three unaffected 2026-08-27 artifacts preserved from the
-initial full run. All 11 `twister.json` files contributing to this table
-reported zero null-status testcase records.
+The historical pre-feature/pilot 11-entry Zephyr 3.7 matrix table below
+combines those earlier reruns with the three unaffected 2026-08-27 artifacts
+preserved from the initial full run. It is retained for provenance; use the
+current 324/51 final verification above for this phase. All 11
+`twister.json` files contributing to this older table reported zero
+null-status testcase records.
 
 | Entry | Evidence source | Suites passed | Testcases passed | Testcases skipped | Failed | Error |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
