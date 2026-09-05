@@ -59,13 +59,13 @@ def _reject_symlink_components(path: Path) -> None:
             raise ValueError(f"unsafe symlink in output path: {current}")
 
 
-def _reject_input_artifact(path: Path, traces: list[Path]) -> None:
-    if any(path == trace or path in trace.parents for trace in traces):
+def _reject_input_artifact(path: Path, inputs: list[Path]) -> None:
+    if any(path == item or path in item.parents for item in inputs):
         raise ValueError(f"output path contains an input artifact: {path}")
 
 
 def _validate_output_paths(
-    output_dir: Path, traces: list[Path]
+    output_dir: Path, inputs: list[Path]
 ) -> tuple[Path, Path, Path]:
     output_dir = _absolute_unresolved(output_dir)
     if not output_dir.name:
@@ -74,17 +74,17 @@ def _validate_output_paths(
     backup = output_dir.with_name(f"{output_dir.name}.bak")
     for path in (output_dir, temporary, backup):
         _reject_symlink_components(path)
-        _reject_input_artifact(path, traces)
+        _reject_input_artifact(path, inputs)
     return output_dir, temporary, backup
 
 
 def _remove_temporary_directory(
-    temporary: Path, parent: Path, traces: list[Path]
+    temporary: Path, parent: Path, inputs: list[Path]
 ) -> None:
     if temporary.parent != parent:
         raise ValueError(f"temporary output is outside requested parent: {temporary}")
     _reject_symlink_components(temporary)
-    _reject_input_artifact(temporary, traces)
+    _reject_input_artifact(temporary, inputs)
     if not temporary.exists():
         return
     if not temporary.is_dir() or temporary.is_symlink():
@@ -92,11 +92,11 @@ def _remove_temporary_directory(
     shutil.rmtree(temporary)
 
 
-def _remove_backup_directory(backup: Path, parent: Path, traces: list[Path]) -> None:
+def _remove_backup_directory(backup: Path, parent: Path, inputs: list[Path]) -> None:
     if backup.parent != parent:
         raise ValueError(f"backup output is outside requested parent: {backup}")
     _reject_symlink_components(backup)
-    _reject_input_artifact(backup, traces)
+    _reject_input_artifact(backup, inputs)
     if not backup.exists():
         return
     if not backup.is_dir() or backup.is_symlink():
@@ -110,10 +110,11 @@ def aggregate_coverage(root: Path, traces: list[Path], output_dir: Path) -> bool
     if len(set(resolved_traces)) != len(resolved_traces):
         raise ValueError("duplicate resolved coverage trace path")
 
-    output_dir, temporary, backup = _validate_output_paths(output_dir, resolved_traces)
+    inputs = [root.resolve(), *resolved_traces]
+    output_dir, temporary, backup = _validate_output_paths(output_dir, inputs)
     output_parent = output_dir.parent
     output_parent.mkdir(parents=True, exist_ok=True)
-    _remove_temporary_directory(temporary, output_parent, resolved_traces)
+    _remove_temporary_directory(temporary, output_parent, inputs)
     if backup.exists() or backup.is_symlink():
         raise ValueError(f"backup output already exists: {backup}")
     temporary.mkdir()
@@ -140,11 +141,11 @@ def aggregate_coverage(root: Path, traces: list[Path], output_dir: Path) -> bool
             output_dir.replace(backup)
         temporary.replace(output_dir)
         if previous_output:
-            _remove_backup_directory(backup, output_parent, resolved_traces)
+            _remove_backup_directory(backup, output_parent, inputs)
     except Exception:
         if backup.exists() and not output_dir.exists():
             backup.replace(output_dir)
-        _remove_temporary_directory(temporary, output_parent, resolved_traces)
+        _remove_temporary_directory(temporary, output_parent, inputs)
         raise
     return True
 
@@ -158,7 +159,12 @@ def main() -> int:
 
     try:
         aggregate_coverage(args.root, args.traces, args.output_dir)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as error:
         print(f"coverage aggregation failed: {error}", file=sys.stderr)
         return 1
     return 0

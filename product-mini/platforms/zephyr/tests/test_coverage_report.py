@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -242,6 +243,28 @@ class AggregateCoverageTest(unittest.TestCase):
             self.assertTrue(trace.exists())
             run.assert_not_called()
 
+    def test_refuses_output_artifacts_that_contain_the_source_root(self):
+        cases = (
+            ("checkout", "checkout"),
+            ("aggregate.tmp", "aggregate"),
+        )
+        for root_name, output_name in cases:
+            with self.subTest(root_name=root_name, output_name=output_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / root_name
+                    root.mkdir()
+                    sentinel = root / "source.txt"
+                    sentinel.write_text("source")
+                    trace = self.write_trace(directory)
+                    output = Path(directory) / output_name
+
+                    with mock.patch.object(MODULE.subprocess, "run") as run:
+                        with self.assertRaisesRegex(ValueError, "input artifact"):
+                            MODULE.aggregate_coverage(root, [trace], output)
+
+                    self.assertEqual(sentinel.read_text(), "source")
+                    run.assert_not_called()
+
     def test_refuses_stale_temporary_directory_containing_input_trace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -306,6 +329,41 @@ class AggregateCoverageTest(unittest.TestCase):
 
 
 class CoverageReportCliTest(unittest.TestCase):
+    def test_cli_reports_symlink_loop_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "loop"
+            root.symlink_to("loop", target_is_directory=True)
+            trace = Path(directory) / "coverage.json"
+            trace.write_text(
+                '{"files": [{"file": "core/shared/platform/zephyr/'
+                'zephyr_time.c", "lines": []}]}'
+            )
+
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        "--root",
+                        str(root),
+                        "--output-dir",
+                        str(Path(directory) / "aggregate"),
+                        str(trace),
+                    ],
+                ),
+                mock.patch.object(
+                    sys, "stderr", new_callable=io.StringIO
+                ) as stderr,
+            ):
+                result = MODULE.main()
+
+            self.assertEqual(result, 1)
+            self.assertIn(
+                "coverage aggregation failed: Symlink loop", stderr.getvalue()
+            )
+            self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_cli_forwards_root_output_and_trace_arguments(self):
         root = Path("/checkout")
         output = Path("/reports")

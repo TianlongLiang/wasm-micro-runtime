@@ -86,15 +86,49 @@ run_unmapped_self_thread(korp_tid *result)
 }
 
 int
+wamr_test_thread_pool_prepare_for(k_tid_t owner)
+{
+    return wamr_zephyr_thread_pool_prepare(&wamr_test_threads, owner);
+}
+
+int
 wamr_test_thread_pool_prepare(void)
 {
-    return wamr_zephyr_thread_pool_prepare(&wamr_test_threads, k_current_get());
+    return wamr_test_thread_pool_prepare_for(k_current_get());
 }
+
+int
+wamr_test_sync_pool_prepare_for(k_tid_t owner)
+{
+    return wamr_zephyr_sync_pool_prepare(&wamr_test_sync, owner);
+}
+
+#if !defined(CONFIG_WAMR_TEST_USER_MODE)
+k_tid_t
+wamr_test_sync_pool_owner(void)
+{
+    return k_current_get();
+}
+#endif
 
 int
 wamr_test_sync_pool_prepare(void)
 {
-    return wamr_zephyr_sync_pool_prepare(&wamr_test_sync, k_current_get());
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    k_tid_t owner = wamr_test_sync_pool_owner();
+    int result;
+
+    if (k_is_user_context()) {
+        return wamr_test_sync_pool_prepare_for(owner);
+    }
+    /* Keep ordinary fixture retries neutral; dedicated tests use prepare_for. */
+    k_object_access_grant(owner, k_current_get());
+    result = wamr_test_sync_pool_prepare_for(owner);
+    k_object_access_revoke(owner, k_current_get());
+    return result;
+#else
+    return wamr_test_sync_pool_prepare_for(wamr_test_sync_pool_owner());
+#endif
 }
 
 void
@@ -219,6 +253,7 @@ wamr_test_sync_pool_prepare_contract(k_tid_t owner)
     RuntimeInitArgs args = { 0 };
 
     memset(fixture, 0, sizeof(*fixture));
+    k_object_access_grant(owner, k_current_get());
     fixture->null_pool_result =
         wamr_zephyr_sync_pool_prepare(NULL, k_current_get());
     fixture->null_owner_result =
@@ -349,6 +384,8 @@ run_concurrent_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool)
     zassert_not_null(first, "first concurrent prepare thread creation failed");
     zassert_not_null(second,
                      "second concurrent prepare thread creation failed");
+    k_object_access_grant(sync_pool_test_owner, first);
+    k_object_access_grant(sync_pool_test_owner, second);
     k_thread_start(first);
     k_thread_start(second);
     zassert_equal(k_thread_join(first, K_SECONDS(1)), 0,
@@ -372,7 +409,7 @@ ZTEST(platform_sync_pool, test_sync_pool_prepare_validates_and_preserves_pool)
 {
     struct platform_sync_pool_fixture *fixture = &sync_pool_prepare_results;
 
-    wamr_test_sync_pool_prepare_contract(k_current_get());
+    wamr_test_sync_pool_prepare_contract(wamr_test_sync_pool_owner());
     zassert_equal(fixture->null_pool_result, BHT_ERROR,
                   "null sync pool was accepted");
     zassert_equal(fixture->null_owner_result, BHT_ERROR,
@@ -416,7 +453,7 @@ ZTEST(platform_sync_pool, test_sync_pool_prepare_validates_and_preserves_pool)
 ZTEST(platform_sync_pool,
       test_sync_pool_concurrent_prepare_preserves_owner)
 {
-    sync_pool_test_owner = k_current_get();
+    sync_pool_test_owner = wamr_test_sync_pool_owner();
     zassert_equal(wamr_test_sync_pool_prepare(), BHT_OK,
                   "sync pool preparation failed before concurrent checks");
     run_concurrent_sync_pool_prepare(&wamr_test_sync);

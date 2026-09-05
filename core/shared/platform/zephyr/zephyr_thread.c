@@ -6,6 +6,7 @@
 
 #include "platform_api_vmcore.h"
 #include "platform_api_extension.h"
+#include "zephyr_pool_owner_compat.h"
 #include "zephyr_sync_pool.h"
 #include "zephyr_thread_pool.h"
 
@@ -123,10 +124,31 @@ sync_pool_matches(const wamr_zephyr_sync_pool_t *pool, k_tid_t wamr_user_thread)
            && wamr_sync_pool.condvar_count == pool->condvar_count;
 }
 
+static bool
+prepare_pool_owner_access(k_tid_t owner, bool *access_granted)
+{
+    wamr_zephyr_pool_owner_validation_t validation_result;
+
+    *access_granted = false;
+    validation_result = wamr_zephyr_pool_owner_validate(owner);
+
+    if (validation_result == WAMR_ZEPHYR_POOL_OWNER_NEEDS_ACCESS) {
+        k_object_access_grant(owner, k_current_get());
+        validation_result = wamr_zephyr_pool_owner_validate(owner);
+        if (validation_result != WAMR_ZEPHYR_POOL_OWNER_ACCESSIBLE) {
+            k_object_access_revoke(owner, k_current_get());
+            return false;
+        }
+        *access_granted = true;
+    }
+    return validation_result == WAMR_ZEPHYR_POOL_OWNER_ACCESSIBLE;
+}
+
 int
 wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
                               k_tid_t wamr_user_thread)
 {
+    bool owner_access_granted;
     atomic_val_t prepare_state;
     uintptr_t management_start;
     uintptr_t management_end;
@@ -163,23 +185,36 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
         return BHT_ERROR;
     }
 
-    k_object_access_grant(wamr_user_thread, k_current_get());
-    if (!k_object_is_valid(wamr_user_thread, K_OBJ_THREAD)) {
-        return BHT_ERROR;
-    }
-
     prepare_state = atomic_get(&wamr_sync_pool_prepare_state);
     if (prepare_state == WAMR_SYNC_POOL_PREPARED) {
-        return sync_pool_matches(pool, wamr_user_thread) ? BHT_OK : BHT_ERROR;
+        if (!sync_pool_matches(pool, wamr_user_thread)) {
+            return BHT_ERROR;
+        }
+        /* The exact binding already validated this owner on first prepare. */
+        k_object_access_grant(wamr_user_thread, k_current_get());
+        return BHT_OK;
     }
-    if (prepare_state != WAMR_SYNC_POOL_UNPREPARED
-        || !atomic_cas(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_UNPREPARED,
-                       WAMR_SYNC_POOL_PREPARING)) {
+
+    if (prepare_state != WAMR_SYNC_POOL_UNPREPARED) {
+        return BHT_ERROR;
+    }
+    if (!prepare_pool_owner_access(wamr_user_thread,
+                                   &owner_access_granted)) {
+        return BHT_ERROR;
+    }
+    if (!atomic_cas(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_UNPREPARED,
+                    WAMR_SYNC_POOL_PREPARING)) {
+        if (owner_access_granted) {
+            k_object_access_revoke(wamr_user_thread, k_current_get());
+        }
         return BHT_ERROR;
     }
 
     if (k_mutex_init(pool->management_lock) != 0
         || k_mutex_lock(pool->management_lock, K_FOREVER) != 0) {
+        if (owner_access_granted) {
+            k_object_access_revoke(wamr_user_thread, k_current_get());
+        }
         atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
         return BHT_ERROR;
     }
@@ -193,6 +228,9 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
     for (i = 0; i < pool->mutex_count; i++) {
         if (k_mutex_init(&pool->mutexes[i]) != 0) {
             k_mutex_unlock(pool->management_lock);
+            if (owner_access_granted) {
+                k_object_access_revoke(wamr_user_thread, k_current_get());
+            }
             atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
             return BHT_ERROR;
         }
@@ -205,6 +243,9 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
     for (i = 0; i < pool->condvar_count; i++) {
         if (k_condvar_init(&pool->condvars[i]) != 0) {
             k_mutex_unlock(pool->management_lock);
+            if (owner_access_granted) {
+                k_object_access_revoke(wamr_user_thread, k_current_get());
+            }
             atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
             return BHT_ERROR;
         }
@@ -214,6 +255,7 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
         k_object_access_grant(&pool->condvars[i], wamr_user_thread);
     }
 
+    k_object_access_grant(wamr_user_thread, k_current_get());
     wamr_sync_pool = *pool;
     wamr_sync_pool_owner = wamr_user_thread;
     k_mutex_unlock(pool->management_lock);
@@ -225,6 +267,7 @@ int
 wamr_zephyr_thread_pool_prepare(const wamr_zephyr_thread_pool_t *pool,
                                 k_tid_t wamr_user_thread)
 {
+    bool owner_access_granted;
     size_t i;
 
     if (k_is_user_context() || pool == NULL || wamr_user_thread == NULL
@@ -235,20 +278,23 @@ wamr_zephyr_thread_pool_prepare(const wamr_zephyr_thread_pool_t *pool,
         return BHT_ERROR;
     }
 
-    k_object_access_grant(wamr_user_thread, k_current_get());
-    if (!k_object_is_valid(wamr_user_thread, K_OBJ_THREAD)) {
-        return BHT_ERROR;
+    if (wamr_thread_pool.threads != NULL) {
+        if (wamr_thread_pool_owner != wamr_user_thread
+            || wamr_thread_pool.threads != pool->threads
+            || wamr_thread_pool.stacks != pool->stacks
+            || wamr_thread_pool.thread_count != pool->thread_count
+            || wamr_thread_pool.stack_size != pool->stack_size
+            || wamr_thread_pool.stack_stride != pool->stack_stride) {
+            return BHT_ERROR;
+        }
+        /* The exact binding already validated this owner on first prepare. */
+        k_object_access_grant(wamr_user_thread, k_current_get());
+        return BHT_OK;
     }
 
-    if (wamr_thread_pool.threads != NULL) {
-        return wamr_thread_pool_owner == wamr_user_thread
-                       && wamr_thread_pool.threads == pool->threads
-                       && wamr_thread_pool.stacks == pool->stacks
-                       && wamr_thread_pool.thread_count == pool->thread_count
-                       && wamr_thread_pool.stack_size == pool->stack_size
-                       && wamr_thread_pool.stack_stride == pool->stack_stride
-                   ? BHT_OK
-                   : BHT_ERROR;
+    if (!prepare_pool_owner_access(wamr_user_thread,
+                                   &owner_access_granted)) {
+        return BHT_ERROR;
     }
 
     for (i = 0; i < pool->thread_count; i++) {
@@ -257,6 +303,7 @@ wamr_zephyr_thread_pool_prepare(const wamr_zephyr_thread_pool_t *pool,
                               wamr_user_thread);
     }
 
+    k_object_access_grant(wamr_user_thread, k_current_get());
     wamr_thread_pool = *pool;
     wamr_thread_pool_owner = wamr_user_thread;
     return BHT_OK;

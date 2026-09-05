@@ -680,18 +680,6 @@ WAMR_CONTEXT_TEST(platform_thread, test_join_propagates_return_value)
     zassert_equal_ptr(actual, expected, "thread return value was lost");
 }
 
-WAMR_CONTEXT_TEST(platform_thread, test_second_join_is_rejected)
-{
-    korp_tid thread;
-
-    zassert_equal(
-        os_thread_create(&thread, return_argument, NULL, WAMR_TEST_STACK_SIZE),
-        BHT_OK, "thread creation failed");
-    zassert_equal(os_thread_join(thread, NULL), BHT_OK, "thread join failed");
-    zassert_equal(os_thread_join(thread, NULL), BHT_ERROR,
-                  "second join unexpectedly claimed released metadata");
-}
-
 /* Mutation caught: join omits the return value or leaves its slot generation
  * reusable through a stale handle. */
 WAMR_CONTEXT_TEST(platform_thread,

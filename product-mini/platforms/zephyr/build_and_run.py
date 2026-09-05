@@ -127,6 +127,12 @@ def resolve_test_root(requested):
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"test path must stay below {HERE}: {requested}")
     candidate = HERE / relative
+    try:
+        candidate.resolve().relative_to(HERE)
+    except ValueError as error:
+        raise ValueError(
+            f"test path must stay below {HERE}: {requested}"
+        ) from error
     if not (candidate / "sample.yaml").is_file() and not (
         candidate / "testcase.yaml"
     ).is_file():
@@ -299,7 +305,7 @@ def main():
         test_root = resolve_test_root(args.sample)
         if args.scenario is not None:
             scenario_slug(args.scenario)
-    except ValueError as error:
+    except (RuntimeError, ValueError) as error:
         parser.error(str(error))
 
     use_docker = not args.no_docker

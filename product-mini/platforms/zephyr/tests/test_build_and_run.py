@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import importlib.util
+import io
 import shlex
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +43,45 @@ class ResolveTestRootTest(unittest.TestCase):
     def test_rejects_parent_traversal(self):
         with self.assertRaises(ValueError):
             MODULE.resolve_test_root("../simple")
+
+    def test_rejects_symlink_root_that_resolves_outside_platform_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            platform_dir = Path(directory) / "zephyr"
+            platform_dir.mkdir()
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "sample.yaml").write_text("tests: {}\n")
+            (platform_dir / "escaped").symlink_to(
+                outside, target_is_directory=True
+            )
+
+            with (
+                mock.patch.object(MODULE, "HERE", platform_dir),
+                self.assertRaisesRegex(ValueError, "must stay below"),
+            ):
+                MODULE.resolve_test_root("escaped")
+
+    def test_main_reports_symlink_loop_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            platform_dir = Path(directory) / "zephyr"
+            platform_dir.mkdir()
+            (platform_dir / "loop").symlink_to("loop", target_is_directory=True)
+            log_dir = Path(directory) / "logs"
+
+            with (
+                mock.patch.object(MODULE, "HERE", platform_dir),
+                mock.patch.object(MODULE, "LOG_DIR", log_dir),
+                mock.patch.object(sys, "argv", [str(SCRIPT), "loop"]),
+                mock.patch.object(
+                    sys, "stderr", new_callable=io.StringIO
+                ) as stderr,
+                self.assertRaises(SystemExit) as error,
+            ):
+                MODULE.main()
+
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("Symlink loop", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
 
 
 class ScenarioNamingTest(unittest.TestCase):

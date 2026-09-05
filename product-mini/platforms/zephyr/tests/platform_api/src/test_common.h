@@ -21,7 +21,13 @@
 int
 wamr_test_thread_pool_prepare(void);
 int
+wamr_test_thread_pool_prepare_for(k_tid_t owner);
+int
 wamr_test_sync_pool_prepare(void);
+int
+wamr_test_sync_pool_prepare_for(k_tid_t owner);
+k_tid_t
+wamr_test_sync_pool_owner(void);
 void
 wamr_test_sync_pool_grant_current(void);
 void

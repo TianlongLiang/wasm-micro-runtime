@@ -15,6 +15,8 @@
 
 #include "platform_api_extension.h"
 #include "platform_api_vmcore.h"
+#include "zephyr_sync_pool.h"
+#include "zephyr_thread_pool.h"
 
 #if defined(CONFIG_USERSPACE)
 struct korp_mutex_handle;
@@ -212,6 +214,25 @@ wamr_zephyr_sync_test_hook(int phase, uintptr_t handle)
 }
 
 #if defined(CONFIG_WAMR_TEST_USER_MODE)
+#define REJECTED_PREPARE_STACK_SIZE 2048U
+
+WAMR_ZEPHYR_THREAD_POOL_DEFINE(rejected_prepare_threads, 1,
+                                REJECTED_PREPARE_STACK_SIZE);
+WAMR_ZEPHYR_SYNC_POOL_DEFINE(rejected_prepare_sync, 1, 1);
+
+enum rejected_prepare_kind {
+    REJECTED_THREAD_POOL_PREPARE,
+    REJECTED_SYNC_POOL_PREPARE,
+};
+
+struct rejected_prepare_context {
+    enum rejected_prepare_kind kind;
+    k_tid_t owner;
+    struct k_sem *done;
+    int prepare_result;
+    bool owner_access_completed;
+};
+
 struct sync_fault_state {
     atomic_t armed;
     atomic_t observed;
@@ -241,6 +262,9 @@ ZTEST_DMEM static struct sync_fault_state sync_fault_state;
 ZTEST_DMEM static struct missing_condvar_wait_context missing_condvar_wait_ctx;
 ZTEST_DMEM static struct prepared_sync_access_context prepared_sync_access_ctx;
 ZTEST_DMEM static struct prepared_sync_access_context unrelated_sync_access_ctx;
+ZTEST_DMEM static struct rejected_prepare_context rejected_prepare_ctx;
+ZTEST_DMEM static struct rejected_prepare_context identical_prepare_ctx;
+ZTEST_DMEM static k_tid_t private_sync_pool_owner_tid;
 static struct k_thread missing_condvar_thread;
 static struct k_thread prepared_sync_access_thread;
 static struct k_thread unrelated_sync_access_thread;
@@ -248,6 +272,8 @@ static struct k_mutex missing_condvar_mutex;
 static struct k_condvar missing_condvar;
 static struct k_sem missing_condvar_fault_done;
 static struct k_sem unrelated_sync_access_fault_done;
+static struct k_sem rejected_prepare_fault_done;
+static struct k_sem identical_prepare_fault_done;
 K_THREAD_STACK_DEFINE(missing_condvar_thread_stack,
                       WAMR_TEST_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(prepared_sync_access_thread_stack,
@@ -322,6 +348,223 @@ prepared_sync_access_worker(void *arg1, void *arg2, void *arg3)
     context->signal_result = k_condvar_signal(context->condvar);
     context->unlock_result = k_mutex_unlock(context->mutex);
     context->completed = true;
+}
+
+static void
+rejected_prepare_owner(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+}
+
+k_tid_t
+wamr_test_sync_pool_owner(void)
+{
+    if (private_sync_pool_owner_tid == NULL) {
+        private_sync_pool_owner_tid = k_thread_create(
+            &prepared_sync_access_thread, prepared_sync_access_thread_stack,
+            K_THREAD_STACK_SIZEOF(prepared_sync_access_thread_stack),
+            rejected_prepare_owner, NULL, NULL, NULL, 5, K_USER, K_FOREVER);
+        if (private_sync_pool_owner_tid != NULL) {
+            k_object_access_grant(private_sync_pool_owner_tid,
+                                  k_current_get());
+        }
+    }
+    return private_sync_pool_owner_tid;
+}
+
+static void
+probe_prepare_owner(void *arg1, void *arg2, void *arg3)
+{
+    struct rejected_prepare_context *context = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    (void)k_thread_priority_get(context->owner);
+    context->owner_access_completed = true;
+    k_sem_give(context->done);
+}
+
+static void
+reject_pool_prepare_then_drop_to_user(void *arg1, void *arg2, void *arg3)
+{
+    struct rejected_prepare_context *context = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    if (context->kind == REJECTED_THREAD_POOL_PREPARE) {
+        context->prepare_result = wamr_zephyr_thread_pool_prepare(
+            &rejected_prepare_threads, context->owner);
+    }
+    else {
+        context->prepare_result = wamr_zephyr_sync_pool_prepare(
+            &rejected_prepare_sync, context->owner);
+    }
+    k_thread_user_mode_enter(probe_prepare_owner, context, NULL, NULL);
+}
+
+static void
+retry_pool_prepare_then_drop_to_user(void *arg1, void *arg2, void *arg3)
+{
+    struct rejected_prepare_context *context = arg1;
+
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    if (context->kind == REJECTED_THREAD_POOL_PREPARE) {
+        context->prepare_result =
+            wamr_test_thread_pool_prepare_for(context->owner);
+    }
+    else {
+        context->prepare_result =
+            wamr_test_sync_pool_prepare_for(context->owner);
+    }
+    k_thread_user_mode_enter(probe_prepare_owner, context, NULL, NULL);
+}
+
+static void
+assert_rejected_prepare_does_not_grant_owner(
+    enum rejected_prepare_kind kind, const char *pool_kind)
+{
+    struct rejected_prepare_context *context = &rejected_prepare_ctx;
+    k_tid_t owner_tid;
+    k_tid_t caller_tid;
+    int completion_result;
+    int caller_join_result;
+    int owner_join_result;
+    bool observed_fault;
+
+    memset(context, 0, sizeof(*context));
+    k_sem_init(&rejected_prepare_fault_done, 0, 1);
+    context->kind = kind;
+    context->done = &rejected_prepare_fault_done;
+    context->prepare_result = BHT_OK;
+    owner_tid = k_thread_create(
+        &missing_condvar_thread, missing_condvar_thread_stack,
+        K_THREAD_STACK_SIZEOF(missing_condvar_thread_stack),
+        rejected_prepare_owner, NULL, NULL, NULL, 5, K_USER, K_FOREVER);
+    zassert_not_null(owner_tid, "%s rejected owner creation failed",
+                     pool_kind);
+    context->owner = owner_tid;
+    caller_tid = k_thread_create(
+        &unrelated_sync_access_thread, unrelated_sync_access_thread_stack,
+        K_THREAD_STACK_SIZEOF(unrelated_sync_access_thread_stack),
+        reject_pool_prepare_then_drop_to_user, context, NULL, NULL, 5, 0,
+        K_FOREVER);
+    zassert_not_null(caller_tid, "%s rejected caller creation failed",
+                     pool_kind);
+    k_object_access_grant(&rejected_prepare_fault_done, caller_tid);
+    sync_fault_arm(caller_tid, &rejected_prepare_fault_done);
+    k_thread_start(caller_tid);
+    completion_result =
+        k_sem_take(&rejected_prepare_fault_done, K_SECONDS(1));
+    caller_join_result = k_thread_join(caller_tid, K_SECONDS(1));
+    observed_fault = atomic_get(&sync_fault_state.observed) != 0;
+    if (caller_join_result != 0) {
+        k_thread_abort(caller_tid);
+    }
+    k_thread_abort(owner_tid);
+    owner_join_result = k_thread_join(owner_tid, K_SECONDS(1));
+    sync_fault_disarm();
+
+    zassert_equal(context->prepare_result, BHT_ERROR,
+                  "%s replacement prepare returned %d", pool_kind,
+                  context->prepare_result);
+    zassert_equal(completion_result, 0,
+                  "%s rejected-owner probe did not finish", pool_kind);
+    zassert_equal(caller_join_result, 0,
+                  "%s rejected caller did not terminate", pool_kind);
+    zassert_equal(owner_join_result, 0,
+                  "%s rejected owner did not terminate", pool_kind);
+    zassert_false(context->owner_access_completed,
+                  "%s rejection granted access to its supplied owner",
+                  pool_kind);
+    zassert_true(observed_fault,
+                 "%s rejected-owner access was not observed as a fault",
+                 pool_kind);
+}
+
+static void
+assert_identical_prepare_grants_owner(enum rejected_prepare_kind kind,
+                                      const char *pool_kind)
+{
+    struct rejected_prepare_context *context = &identical_prepare_ctx;
+    k_tid_t owner_tid = NULL;
+    k_tid_t caller_tid;
+    int initial_prepare_result = BHT_OK;
+    int completion_result;
+    int caller_join_result;
+    int owner_join_result = 0;
+    int cleanup_init_result = BHT_OK;
+    bool observed_fault;
+
+    memset(context, 0, sizeof(*context));
+    k_sem_init(&identical_prepare_fault_done, 0, 1);
+    context->kind = kind;
+    if (kind == REJECTED_THREAD_POOL_PREPARE) {
+        sync_results.runtime_destroyed = true;
+        wasm_runtime_destroy();
+        owner_tid = k_thread_create(
+            &missing_condvar_thread, missing_condvar_thread_stack,
+            K_THREAD_STACK_SIZEOF(missing_condvar_thread_stack),
+            rejected_prepare_owner, NULL, NULL, NULL, 5, K_USER, K_FOREVER);
+        zassert_not_null(owner_tid, "%s identical owner creation failed",
+                         pool_kind);
+        context->owner = owner_tid;
+        k_object_access_grant(context->owner, k_current_get());
+        initial_prepare_result =
+            wamr_test_thread_pool_prepare_for(context->owner);
+    }
+    else {
+        context->owner = wamr_test_sync_pool_owner();
+    }
+    context->done = &identical_prepare_fault_done;
+    context->prepare_result = BHT_ERROR;
+    caller_tid = k_thread_create(
+        &unrelated_sync_access_thread, unrelated_sync_access_thread_stack,
+        K_THREAD_STACK_SIZEOF(unrelated_sync_access_thread_stack),
+        retry_pool_prepare_then_drop_to_user, context, NULL, NULL, 5, 0,
+        K_FOREVER);
+    zassert_not_null(caller_tid, "%s identical caller creation failed",
+                     pool_kind);
+    k_object_access_grant(&identical_prepare_fault_done, caller_tid);
+    sync_fault_arm(caller_tid, &identical_prepare_fault_done);
+    k_thread_start(caller_tid);
+    completion_result =
+        k_sem_take(&identical_prepare_fault_done, K_SECONDS(1));
+    caller_join_result = k_thread_join(caller_tid, K_SECONDS(1));
+    observed_fault = atomic_get(&sync_fault_state.observed) != 0;
+    if (caller_join_result != 0) {
+        k_thread_abort(caller_tid);
+    }
+    if (owner_tid != NULL) {
+        k_thread_abort(owner_tid);
+        owner_join_result = k_thread_join(owner_tid, K_SECONDS(1));
+        cleanup_init_result = os_thread_sys_init();
+        os_thread_sys_destroy();
+    }
+    sync_fault_disarm();
+
+    zassert_equal(initial_prepare_result, BHT_OK,
+                  "%s initial prepare returned %d", pool_kind,
+                  initial_prepare_result);
+    zassert_equal(context->prepare_result, BHT_OK,
+                  "%s identical prepare returned %d", pool_kind,
+                  context->prepare_result);
+    zassert_equal(completion_result, 0,
+                  "%s identical owner probe did not finish", pool_kind);
+    zassert_equal(caller_join_result, 0,
+                  "%s identical caller did not terminate", pool_kind);
+    zassert_equal(owner_join_result, 0,
+                  "%s identical owner did not terminate", pool_kind);
+    zassert_equal(cleanup_init_result, BHT_OK,
+                  "%s cleanup initialization returned %d", pool_kind,
+                  cleanup_init_result);
+    zassert_true(context->owner_access_completed,
+                 "%s identical prepare did not grant owner access",
+                 pool_kind);
+    zassert_false(observed_fault,
+                  "%s identical owner access faulted", pool_kind);
 }
 #endif
 
@@ -803,8 +1046,8 @@ ZTEST(platform_sync,
     zassert_not_null(prepared_sync_access_ctx.condvar,
                      "prepared native condvar slot missing");
     inherited_tid = k_thread_create(
-        &prepared_sync_access_thread, prepared_sync_access_thread_stack,
-        K_THREAD_STACK_SIZEOF(prepared_sync_access_thread_stack),
+        &missing_condvar_thread, missing_condvar_thread_stack,
+        K_THREAD_STACK_SIZEOF(missing_condvar_thread_stack),
         prepared_sync_access_worker, &prepared_sync_access_ctx, NULL, NULL, 5,
         K_USER | K_INHERIT_PERMS, K_FOREVER);
     zassert_not_null(inherited_tid,
@@ -856,6 +1099,46 @@ ZTEST(platform_sync,
     zassert_true(observed_fault,
                  "unrelated sync-pool access was not observed as a fault");
     sync_fault_disarm();
+#else
+    ztest_test_skip();
+#endif
+}
+
+ZTEST(platform_sync, test_rejected_thread_pool_prepare_does_not_grant_owner)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    assert_rejected_prepare_does_not_grant_owner(
+        REJECTED_THREAD_POOL_PREPARE, "thread pool");
+#else
+    ztest_test_skip();
+#endif
+}
+
+ZTEST(platform_sync, test_rejected_sync_pool_prepare_does_not_grant_owner)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    assert_rejected_prepare_does_not_grant_owner(REJECTED_SYNC_POOL_PREPARE,
+                                                  "sync pool");
+#else
+    ztest_test_skip();
+#endif
+}
+
+ZTEST(platform_sync, test_identical_thread_pool_prepare_grants_owner)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    assert_identical_prepare_grants_owner(REJECTED_THREAD_POOL_PREPARE,
+                                          "thread pool");
+#else
+    ztest_test_skip();
+#endif
+}
+
+ZTEST(platform_sync, test_identical_sync_pool_prepare_grants_owner)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    assert_identical_prepare_grants_owner(REJECTED_SYNC_POOL_PREPARE,
+                                          "sync pool");
 #else
     ztest_test_skip();
 #endif
@@ -1154,58 +1437,6 @@ WAMR_CONTEXT_TEST(platform_sync,
                       "second recursive unlock failed");
         zassert_equal(destroy_result, BHT_OK, "recursive mutex destroy failed");
     }
-#else
-    ztest_test_skip();
-#endif
-}
-
-WAMR_CONTEXT_TEST(platform_sync_pool,
-                  test_mutex_pool_exhaustion_is_independent_and_recovers)
-{
-#if defined(CONFIG_USERSPACE)
-    korp_mutex mutexes[TEST_MUTEX_POOL_COUNT + 1] = { NULL };
-    korp_cond independent_cond = NULL;
-    korp_mutex recovered = NULL;
-    int init_results[TEST_MUTEX_POOL_COUNT + 1];
-    int independent_cond_result;
-    int independent_cond_destroy_result = BHT_ERROR;
-    int recovery_result;
-    int recovery_destroy_result = BHT_ERROR;
-    bool cleanup_succeeded = true;
-
-    for (int i = 0; i < ARRAY_SIZE(mutexes); i++) {
-        init_results[i] = os_mutex_init(&mutexes[i]);
-    }
-    independent_cond_result = os_cond_init(&independent_cond);
-    if (independent_cond_result == BHT_OK) {
-        independent_cond_destroy_result = os_cond_destroy(&independent_cond);
-    }
-    for (int i = 0; i < ARRAY_SIZE(mutexes); i++) {
-        if (init_results[i] == BHT_OK
-            && os_mutex_destroy(&mutexes[i]) != BHT_OK) {
-            cleanup_succeeded = false;
-        }
-    }
-    recovery_result = os_mutex_init(&recovered);
-    if (recovery_result == BHT_OK) {
-        recovery_destroy_result = os_mutex_destroy(&recovered);
-    }
-
-    for (int i = 0; i < TEST_MUTEX_POOL_COUNT; i++) {
-        zassert_equal(init_results[i], BHT_OK,
-                      "mutex pool exhausted before advertised capacity");
-    }
-    zassert_equal(init_results[TEST_MUTEX_POOL_COUNT], BHT_ERROR,
-                  "mutex pool exceeded advertised capacity");
-    zassert_equal(independent_cond_result, BHT_OK,
-                  "mutex exhaustion consumed condition capacity");
-    zassert_equal(independent_cond_destroy_result, BHT_OK,
-                  "independent condition cleanup failed");
-    zassert_true(cleanup_succeeded, "mutex exhaustion cleanup failed");
-    zassert_equal(recovery_result, BHT_OK,
-                  "mutex pool did not recover after exhaustion");
-    zassert_equal(recovery_destroy_result, BHT_OK,
-                  "recovered mutex cleanup failed");
 #else
     ztest_test_skip();
 #endif

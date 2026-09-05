@@ -96,6 +96,9 @@ if (NOT WAMR_USE_PREBUILT_LIB)
 endif ()
 
 ################  WebAssembly module  ################
+# Only the default runtime source includes the generated test_wasm.h. Callers
+# that override the runtime source provide and own their fixture separately.
+if (WAMR_ZEPHYR_RUNTIME_SOURCE STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/wamr_lib.c")
 # ../wasm-app/ is compiled with the wasi-sdk toolchain in a nested build, and
 # the resulting test_wasm.wasm is turned into the byte array wamr_lib.c embeds.
 # The array is a global of this library, so it lands in wamr_partition like the
@@ -129,3 +132,4 @@ add_custom_target (gen_test_wasm_h DEPENDS ${WASM_HEADER})
 
 target_include_directories (wamr_lib PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 add_dependencies (wamr_lib gen_test_wasm_h)
+endif ()

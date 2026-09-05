@@ -9,7 +9,6 @@ tests:
     platform_allow:
       - qemu_arc/qemu_arc_hs
     extra_configs:
-      - CONFIG_USERSPACE=y
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USERMODE_FAULTS=y
       - CONFIG_WAMR_TEST_USERMODE_FAULT_SUPERVISOR_RUNTIME_STATE=y
@@ -17,7 +16,6 @@ tests:
     platform_allow:
       - qemu_arc/qemu_arc_hs
     extra_configs:
-      - CONFIG_USERSPACE=y
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USERMODE_FAULTS=y
       - CONFIG_WAMR_TEST_USERMODE_FAULT_POOL_PARTITION=y
@@ -25,7 +23,6 @@ tests:
     platform_allow:
       - qemu_arc/qemu_arc_hs
     extra_configs:
-      - CONFIG_USERSPACE=y
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USERMODE_FAULTS=y
       - CONFIG_WAMR_TEST_USERMODE_FAULT_MODULE_PARTITION=y
@@ -33,7 +30,6 @@ tests:
     platform_allow:
       - qemu_arc/qemu_arc_hs
     extra_configs:
-      - CONFIG_USERSPACE=y
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USERMODE_FAULTS=y
       - CONFIG_WAMR_TEST_USERMODE_FAULT_WAMR_GLOBALS_PARTITION=y
@@ -41,7 +37,6 @@ tests:
     platform_allow:
       - qemu_arc/qemu_arc_hs
     extra_configs:
-      - CONFIG_USERSPACE=y
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USERMODE_FAULTS=y
       - CONFIG_WAMR_TEST_USERMODE_FAULT_WASM_OOB=y
