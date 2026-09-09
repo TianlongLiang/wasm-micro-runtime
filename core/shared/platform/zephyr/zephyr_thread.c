@@ -10,6 +10,23 @@
 #include "zephyr_sync_pool.h"
 #include "zephyr_thread_pool.h"
 
+#if defined(CONFIG_WAMR_ZEPHYR_TEST_MOCKS)
+/* The dedicated Ztest scenario injects documented allocator/join failures here.
+ * Ordinary builds expand directly to BH_MALLOC/BH_FREE/k_thread_join and carry
+ * no fake state or runtime dispatch. See tests/platform_api/README.md. */
+extern void *wamr_zephyr_thread_test_malloc(unsigned int size);
+extern void wamr_zephyr_thread_test_free(void *ptr);
+extern int wamr_zephyr_thread_test_join(k_tid_t thread, k_timeout_t timeout);
+#define WAMR_THREAD_MALLOC(size) wamr_zephyr_thread_test_malloc(size)
+#define WAMR_THREAD_FREE(ptr) wamr_zephyr_thread_test_free(ptr)
+#define WAMR_THREAD_JOIN(thread, timeout) \
+    wamr_zephyr_thread_test_join(thread, timeout)
+#else
+#define WAMR_THREAD_MALLOC(size) BH_MALLOC(size)
+#define WAMR_THREAD_FREE(ptr) BH_FREE(ptr)
+#define WAMR_THREAD_JOIN(thread, timeout) k_thread_join(thread, timeout)
+#endif
+
 /* clang-format off */
 #define bh_assert(v) do {                                   \
     if (!(v)) {                                             \
@@ -40,7 +57,6 @@ typedef enum {
     WAMR_SYNC_POOL_UNPREPARED,
     WAMR_SYNC_POOL_PREPARING,
     WAMR_SYNC_POOL_PREPARED,
-    WAMR_SYNC_POOL_FAILED,
 } wamr_sync_pool_prepare_state_t;
 
 #if defined(CONFIG_USERSPACE)
@@ -157,6 +173,7 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
     uintptr_t condvars_start;
     uintptr_t condvars_end;
     size_t i;
+    int native_result;
 
     if (k_is_user_context() || pool == NULL || wamr_user_thread == NULL
         || pool->management_lock == NULL || pool->mutexes == NULL
@@ -210,14 +227,13 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
         return BHT_ERROR;
     }
 
-    if (k_mutex_init(pool->management_lock) != 0
-        || k_mutex_lock(pool->management_lock, K_FOREVER) != 0) {
-        if (owner_access_granted) {
-            k_object_access_revoke(wamr_user_thread, k_current_get());
-        }
-        atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
-        return BHT_ERROR;
-    }
+    /* Zephyr 3.7 and 4.4 document no recoverable initialization failure for a
+     * valid object. Reaching this assertion means the validated pool contract or
+     * the Zephyr kernel invariant was violated. */
+    native_result = k_mutex_init(pool->management_lock);
+    bh_assert(native_result == 0);
+    native_result = k_mutex_lock(pool->management_lock, K_FOREVER);
+    bh_assert(native_result == 0);
 
 #if defined(CONFIG_USERSPACE)
     memset(wamr_mutex_slots, 0, sizeof(wamr_mutex_slots));
@@ -226,14 +242,8 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
     k_object_access_grant(pool->management_lock, wamr_user_thread);
 
     for (i = 0; i < pool->mutex_count; i++) {
-        if (k_mutex_init(&pool->mutexes[i]) != 0) {
-            k_mutex_unlock(pool->management_lock);
-            if (owner_access_granted) {
-                k_object_access_revoke(wamr_user_thread, k_current_get());
-            }
-            atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
-            return BHT_ERROR;
-        }
+        native_result = k_mutex_init(&pool->mutexes[i]);
+        bh_assert(native_result == 0);
 #if defined(CONFIG_USERSPACE)
         wamr_mutex_slots[i].native = &pool->mutexes[i];
 #endif
@@ -241,14 +251,8 @@ wamr_zephyr_sync_pool_prepare(const wamr_zephyr_sync_pool_t *pool,
     }
 
     for (i = 0; i < pool->condvar_count; i++) {
-        if (k_condvar_init(&pool->condvars[i]) != 0) {
-            k_mutex_unlock(pool->management_lock);
-            if (owner_access_granted) {
-                k_object_access_revoke(wamr_user_thread, k_current_get());
-            }
-            atomic_set(&wamr_sync_pool_prepare_state, WAMR_SYNC_POOL_FAILED);
-            return BHT_ERROR;
-        }
+        native_result = k_condvar_init(&pool->condvars[i]);
+        bh_assert(native_result == 0);
 #if defined(CONFIG_USERSPACE)
         wamr_cond_slots[i].native = &pool->condvars[i];
 #endif
@@ -487,11 +491,11 @@ detached_thread_data_release(os_thread_data *thread_data)
 
     if (!uses_user_pool) {
 #if BH_ENABLE_ZEPHYR_MPU_STACK == 0
-        BH_FREE(stack);
+        WAMR_THREAD_FREE(stack);
 #endif
-        BH_FREE((os_thread_obj *)tid);
+        WAMR_THREAD_FREE((os_thread_obj *)tid);
     }
-    BH_FREE(thread_data);
+    WAMR_THREAD_FREE(thread_data);
 }
 
 static os_thread_data *
@@ -829,8 +833,8 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     os_thread_obj *thread_obj = NULL;
     os_thread_data *thread_data = NULL;
     k_tid_t tid = NULL;
+    k_tid_t created_tid;
     bool uses_user_pool = k_is_user_context();
-    char *stack_to_free = NULL;
     size_t pool_index = 0U;
     size_t i;
 
@@ -855,7 +859,7 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     detached_thread_data_reap();
 
     if (!uses_user_pool) {
-        if (!(thread_obj = BH_MALLOC(sizeof(os_thread_obj)))) {
+        if (!(thread_obj = WAMR_THREAD_MALLOC(sizeof(os_thread_obj)))) {
             return BHT_ERROR;
         }
         memset(thread_obj, 0, sizeof(*thread_obj));
@@ -863,7 +867,7 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     }
 
     /* Create and initialize thread data */
-    if (!(thread_data = BH_MALLOC(sizeof(os_thread_data)))) {
+    if (!(thread_data = WAMR_THREAD_MALLOC(sizeof(os_thread_data)))) {
         goto fail;
     }
 
@@ -875,7 +879,7 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     if (!uses_user_pool) {
         if (stack_size < APP_THREAD_STACK_SIZE_MIN)
             stack_size = APP_THREAD_STACK_SIZE_MIN;
-        if (!(thread_data->stack = BH_MALLOC(stack_size))) {
+        if (!(thread_data->stack = WAMR_THREAD_MALLOC(stack_size))) {
             goto fail;
         }
         thread_data->stack_size = stack_size;
@@ -925,12 +929,13 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     thread_data_list_add_locked(thread_data);
     zmutex_unlock(&thread_pool_lock);
 
-    if (!k_thread_create(
-            tid, (k_thread_stack_t *)thread_data->stack,
-            thread_data->stack_size, os_thread_wrapper, start, arg, thread_data,
-            prio, uses_user_pool ? K_USER | K_INHERIT_PERMS : 0, K_FOREVER)) {
-        goto fail3;
-    }
+    created_tid = k_thread_create(
+        tid, (k_thread_stack_t *)thread_data->stack, thread_data->stack_size,
+        os_thread_wrapper, start, arg, thread_data, prio,
+        uses_user_pool ? K_USER | K_INHERIT_PERMS : 0, K_FOREVER);
+    /* Both supported Zephyr lines return the supplied thread object after valid
+     * arguments; invalid objects fault/assert instead of reporting NULL. */
+    bh_assert(created_tid == tid);
 
     zmutex_lock(&thread_pool_lock, K_FOREVER);
     thread_data->state = WAMR_THREAD_RUNNING;
@@ -941,23 +946,17 @@ os_thread_create_with_prio(korp_tid *p_tid, thread_start_routine_t start,
     k_thread_start(tid);
     return BHT_OK;
 
-fail3:
-    stack_to_free = thread_data->stack;
-    zmutex_lock(&thread_pool_lock, K_FOREVER);
-    thread_data_list_remove_locked(thread_data);
-    thread_generation_release_locked(thread_data);
-    zmutex_unlock(&thread_pool_lock);
 fail:
     if (thread_data != NULL) {
 #if BH_ENABLE_ZEPHYR_MPU_STACK == 0
         if (!uses_user_pool) {
-            BH_FREE(stack_to_free != NULL ? stack_to_free : thread_data->stack);
+            WAMR_THREAD_FREE(thread_data->stack);
         }
 #endif
-        BH_FREE(thread_data);
+        WAMR_THREAD_FREE(thread_data);
     }
     if (!uses_user_pool) {
-        BH_FREE(thread_obj);
+        WAMR_THREAD_FREE(thread_obj);
     }
     return BHT_ERROR;
 }
@@ -999,7 +998,7 @@ os_thread_join(korp_tid thread, void **value_ptr)
     }
     WAMR_JOIN_TEST_HOOK(WAMR_JOIN_TEST_CLAIMED);
 
-    if (k_thread_join(thread_data->tid, K_FOREVER) != 0) {
+    if (WAMR_THREAD_JOIN(thread_data->tid, K_FOREVER) != 0) {
         zmutex_lock(&thread_pool_lock, K_FOREVER);
         thread_data->join_claimed = false;
         zmutex_unlock(&thread_pool_lock);
@@ -1024,12 +1023,12 @@ os_thread_join(korp_tid thread, void **value_ptr)
 
     if (!uses_user_pool) {
 #if BH_ENABLE_ZEPHYR_MPU_STACK == 0
-        BH_FREE(stack);
+        WAMR_THREAD_FREE(stack);
 #endif
-        BH_FREE((os_thread_obj *)tid);
+        WAMR_THREAD_FREE((os_thread_obj *)tid);
     }
 
-    BH_FREE(thread_data);
+    WAMR_THREAD_FREE(thread_data);
     return BHT_OK;
 }
 

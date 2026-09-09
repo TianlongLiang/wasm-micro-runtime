@@ -308,20 +308,25 @@ exit status; do not infer a result from console text.
 ### Informational coverage
 
 Coverage is a manually requested measurement job, not a pass threshold. The
-pinned CI baseline remains Zephyr 3.7.0. It runs two exact `native_sim`
-platform-API kernel scenarios sequentially because WAMR's generated version
-header races when configurations share a checkout. The second scenario changes
-only `CONFIG_THREAD_STACK_INFO=y`, which exercises the stack-information
-configuration without changing the test contracts:
+pinned CI baseline remains Zephyr 3.7.0. It runs three exact `native_sim`
+platform-API scenarios sequentially because WAMR's generated version header
+races when configurations share a checkout. The second scenario changes only
+`CONFIG_THREAD_STACK_INFO=y`; the third is the isolated mocked-error scenario,
+which compiles only its FFF fixture and leaves normal builds on direct calls.
+See [the focused platform-API guide](tests/platform_api/README.md) for the
+mock boundary and error-path classification.
 
 ```bash
 python3 build_and_run.py --no-docker --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.kernel tests/platform_api
 python3 build_and_run.py --no-docker --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.kernel_stack_info tests/platform_api
+python3 build_and_run.py --no-docker --coverage --sim native_sim \
+  --scenario wamr.zephyr.platform_api.mocked_errors tests/platform_api
 python3 coverage_report.py \
   build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json \
-  build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
+  build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json \
+  build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage.json
 ```
 
 The wrapper uses the Zephyr 3.7 Twister options `--coverage`,
@@ -332,16 +337,106 @@ html,xml`. The individual trace artifacts are:
   and its `coverage.json`;
 - `build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage/`
   and its `coverage.json`.
+- `build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage/`
+  and its `coverage.json`.
 
 `coverage_report.py` publishes the focused aggregate under
 `build/coverage-zephyr-platform-aggregate/`, including HTML, Cobertura XML,
 JSON, text summaries, and `inputs.txt`. The aggregate is union evidence from
-two real builds, not coverage from a single binary. CI uploads both individual
-coverage directories and raw traces with this aggregate as
+three real builds, not coverage from a single binary; the mocked-errors trace
+is not folded into either ordinary configuration. CI uploads all three
+individual coverage directories and raw traces with this aggregate as
 `zephyr-wamr-coverage-native-sim`.
 
-The `af729dc6` and `d286e15c` suffixes are the first eight hex characters of
-the scenario SHA-256. They keep same-slug scenarios distinct in this small
+### 2026-09-08 Zephyr 4.4 mocked-error compatibility probes
+
+The focused native_sim probe ran ordinary `wamr.zephyr.platform_api.kernel`
+and isolated `wamr.zephyr.platform_api.mocked_errors` on these exact revisions:
+
+- `v4.4.0`: `684c9e8f32e4373a21098559f748f06915f950c9`.
+- `v4.4.1`: `1f6485eca25431b5ff27ce9a754218c9e559bbbb`.
+
+| Release | Scenario | JSON passed/skipped | JSON execution time | Combined Twister wall time |
+| --- | --- | ---: | ---: | ---: |
+| 4.4.0 | kernel | 67/19 | 0.08 s | 21.04 s |
+| 4.4.0 | mocked_errors | 3/0 | 0.01 s | same invocation |
+| 4.4.1 | kernel | 67/19 | 0.07 s | 21.26 s |
+| 4.4.1 | mocked_errors | 3/0 | 0.01 s | same invocation |
+
+Each release passed 2/2 executed configurations with no failed, error, or null
+testcase statuses; testcase identities and statuses match across releases.
+Counts match the pinned 3.7 focused evidence below. The 19 kernel skips are
+existing configuration-dependent cases; no skips or expected results changed.
+The ordinary timeout-return and timeout-mutex-reacquisition tests both passed.
+The pre-existing 4.4.x condvar timeout workaround remains unchanged: both
+probed upstream `kernel/condvar.c` implementations still relock only for a
+zero wait result. No new WAMR product or test-harness regression was found,
+and no compatibility code or official Zephyr 3.7.0 pin changed.
+
+The first sandboxed 4.4.0 command failed before building because Python's
+multiprocessing manager could not create its local listener (`PermissionError`,
+then `EOFError`). A minimal manager-only program reproduced that environment
+failure; the identical probe succeeded with approved local socket access.
+The 4.4.1 probe used the same access. No toolchain/execution-harness failure
+occurred after that correction. This is an environment restriction, not a
+Zephyr/WAMR regression.
+
+All four retained build logs contain compiler warnings from `bh_common.c`:
+implicit `strtok_r` declaration and int-to-pointer conversion. These diagnostics
+also occur in the pinned Zephyr 3.7 baseline, so they are not a new 4.4
+regression. The kernel logs also contain unused-function warnings, and all
+four logs contain a CMake warning about unused `TC_NAME`. Twister reports zero
+warning configurations, which does not mean compiler output is warning-free;
+all testcase results remain valid. Completed review found `bh_strtok_r` and its
+affected line unexecuted in all three coverage traces. The pre-existing
+declaration/ABI hazard is not introduced or worsened here and does not block
+these cleanup tests; track its declaration/configuration fix and an executed
+tokenizer regression test separately. Unused-code warnings are in unchanged
+ordinary tests, and `TC_NAME` is supplied by Twister.
+
+The disposable workspaces use Python 3.12 and Zephyr SDK 1.0.1. Reports are
+`/tmp/wamr-zephyr-4.4-probe/{4.4.0,4.4.1}/outputs/wamr-mocked-errors/twister.json`;
+reusable commands are in the
+[focused probe guide](tests/platform_api/README.md#zephyr-44-focused-probes).
+This probe covers only the two native scenarios, not a new full 4.4 matrix or
+pin upgrade.
+
+### 2026-09-07 final Zephyr 3.7 evidence
+
+At revision `2744aaf5`, the complete eleven-entry pinned-v3.7.0 matrix passed:
+20 configurations passed in total (19 executed plus the `simple-http`
+build-only configuration), and four additional configurations were statically
+filtered; its Twister JSON reports contain 326 passed and 60 skipped testcase
+records, with zero failed, error, or null statuses. Per-entry testcase
+pass/skip and wall times were:
+
+| Entry | JSON testcases | Wall time |
+| --- | ---: | ---: |
+| `native_sim simple` | 1/0 | 9.46 s |
+| `qemu_arc simple` | 1/0 | 9.80 s |
+| `native_sim simple-file` | 1/0 | 10.66 s |
+| `native_sim simple-http` | 0/1 | 8.21 s |
+| `qemu_arc user-mode` | 2/0 | 34.37 s |
+| `qemu_arc user-mode-multi-thread` | 1/0 | 17.56 s |
+| `native_sim tests/platform_api` | 137/38 | 18.35 s |
+| `qemu_arc tests/platform_api` | 153/21 | 27.10 s |
+| `native_sim tests/runtime` | 8/0 | 6.91 s |
+| `qemu_arc tests/runtime` | 17/0 | 24.52 s |
+| `qemu_arc tests/usermode_faults` | 5/0 | 76.93 s |
+
+Host discovery passed 33/33 in 0.042 s. The separate raw coverage traces
+passed kernel 67/19 in 7.22 s, kernel-stack-info 67/19 in 7.38 s, and
+mocked-errors 3/0 in 6.89 s. Their aggregate has 531/608 lines and 228/332
+branches; it is measurement only, not a threshold. `zephyr_thread.c` records
+463/538 lines and 219/322 branches. Compared with the previous 519/625-line,
+224/338-branch aggregate, the newly taken failure edges are thread-object
+allocation (`zephyr_thread.c:862`), thread-data allocation (`:870`), and join
+failure (`:1001`); invariant cleanup removes unreachable native-initializer
+and `k_thread_create()` recovery branches, reducing the denominators. All
+three raw paths are retained in the aggregate `inputs.txt`.
+
+The `af729dc6`, `d286e15c`, and `e2d36566` suffixes are the first eight hex
+characters of the scenario SHA-256. They keep same-slug scenarios distinct in this small
 trusted scenario set, which makes them collision-resistant here without
 claiming a collision-free naming scheme.
 

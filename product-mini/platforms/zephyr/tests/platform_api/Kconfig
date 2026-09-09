@@ -7,3 +7,13 @@ source "Kconfig.zephyr"
 config WAMR_TEST_USER_MODE
     bool "Run applicable WAMR tests as user threads"
     default n
+
+config WAMR_ZEPHYR_TEST_MOCKS
+    bool "Enable mocked-error platform API tests"
+    default n
+    depends on ZTEST && !USERSPACE
+    help
+      Enable narrow WAMR-owned seams for the dedicated native_sim
+      mocked-error platform API scenario. Never enable in production.
+      The prompt exists solely so Twister can select the isolated test
+      scenario through extra_configs.

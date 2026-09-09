@@ -281,13 +281,17 @@ jobs:
           python3 product-mini/platforms/zephyr/build_and_run.py \
             --no-docker --coverage --sim native_sim \
             --scenario wamr.zephyr.platform_api.kernel_stack_info tests/platform_api
+          python3 product-mini/platforms/zephyr/build_and_run.py \
+            --no-docker --coverage --sim native_sim \
+            --scenario wamr.zephyr.platform_api.mocked_errors tests/platform_api
 
       - name: Aggregate native platform API coverage
         shell: bash
         run: |
           python3 product-mini/platforms/zephyr/coverage_report.py \
             product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json \
-            product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
+            product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json \
+            product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage.json
         working-directory: modules/wasm-micro-runtime
 
       - name: Upload native platform API coverage
@@ -300,5 +304,7 @@ jobs:
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage/
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage/
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage.json
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/coverage-zephyr-platform-aggregate/
           if-no-files-found: warn

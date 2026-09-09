@@ -5,6 +5,11 @@ common:
   tags: wamr ztest platform_api interpreter pool
   harness: ztest
 tests:
+  wamr.zephyr.platform_api.mocked_errors:
+    platform_allow:
+      - native_sim
+    extra_configs:
+      - CONFIG_WAMR_ZEPHYR_TEST_MOCKS=y
   wamr.zephyr.platform_api.kernel:
     platform_allow:
       - native_sim
