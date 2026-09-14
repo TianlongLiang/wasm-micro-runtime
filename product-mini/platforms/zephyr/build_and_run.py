@@ -26,6 +26,10 @@ LOG_DIR = HERE / "build" / "logs"
 IMAGE = "wamr-zephyr"
 MODULE_DIR = "/root/zephyrproject/modules/wasm-micro-runtime"
 ZEPHYR_PLATFORM_DIR = f"{MODULE_DIR}/product-mini/platforms/zephyr"
+ARC_GCOV_TOOL = (
+    "/root/zephyrproject/zephyr-sdk/arc-zephyr-elf/bin/arc-zephyr-elf-gcov"
+)
+PLATFORM_API_USERSPACE_SCENARIO = "wamr.zephyr.platform_api.userspace"
 TIMEOUT_SECONDS = 30
 SCENARIO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -194,6 +198,13 @@ def twister_command(relative, simulator, use_docker, coverage=False, scenario=No
             f" --coverage --coverage-basedir {shlex.quote(module_dir)}"
             " --coverage-tool gcovr --coverage-formats html,xml"
         )
+        if (
+            simulator == "qemu_arc"
+            and scenario == PLATFORM_API_USERSPACE_SCENARIO
+        ):
+            command += " --extra-args CONFIG_PRIVILEGED_STACK_SIZE=4096"
+        if use_docker and simulator == "qemu_arc":
+            command += f" --gcov-tool {shlex.quote(ARC_GCOV_TOOL)}"
 
     return command
 

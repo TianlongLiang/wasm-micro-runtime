@@ -27,3 +27,5 @@ tests:
       - CONFIG_WAMR=n
       - CONFIG_WAMR_TEST_USER_MODE=y
       - CONFIG_DYNAMIC_OBJECTS=n
+      # gperf can widen its association table between prebuilt and final links.
+      - CONFIG_KOBJECT_RODATA_AREA_EXTRA_BYTES=512

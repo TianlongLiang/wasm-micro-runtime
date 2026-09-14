@@ -175,10 +175,20 @@ wamr_thread_test_before(void *fixture)
 
 ZTEST_SUITE(platform_thread_pool, NULL, NULL, NULL, NULL, NULL);
 
+static void *
+thread_pool_return_argument(void *arg)
+{
+    return arg;
+}
+
 ZTEST(platform_thread_pool, test_thread_pool_prepare_validates_and_preserves_pool)
 {
     wamr_zephyr_thread_pool_t malformed = wamr_test_threads;
     RuntimeInitArgs args = { 0 };
+    korp_tid workers[BH_ZEPHYR_MPU_STACK_COUNT];
+    int join_results[BH_ZEPHYR_MPU_STACK_COUNT];
+    size_t created = 0U;
+    bool cleanup_succeeded = true;
 
     zassert_equal(wamr_zephyr_thread_pool_prepare(NULL, k_current_get()),
                   BHT_ERROR, "null pool was accepted");
@@ -194,6 +204,26 @@ ZTEST(platform_thread_pool, test_thread_pool_prepare_validates_and_preserves_poo
     zassert_equal(wamr_zephyr_thread_pool_prepare(&malformed, k_current_get()),
                   BHT_ERROR, "zero-sized stack was accepted");
 
+    malformed = wamr_test_threads;
+    malformed.threads = NULL;
+    zassert_equal(wamr_zephyr_thread_pool_prepare(&malformed, k_current_get()),
+                  BHT_ERROR, "null thread storage was accepted");
+
+    malformed = wamr_test_threads;
+    malformed.stacks = NULL;
+    zassert_equal(wamr_zephyr_thread_pool_prepare(&malformed, k_current_get()),
+                  BHT_ERROR, "null stack storage was accepted");
+
+    malformed = wamr_test_threads;
+    malformed.thread_count = BH_ZEPHYR_MPU_STACK_COUNT + 1U;
+    zassert_equal(wamr_zephyr_thread_pool_prepare(&malformed, k_current_get()),
+                  BHT_ERROR, "oversized thread pool was accepted");
+
+    malformed = wamr_test_threads;
+    malformed.stack_stride = malformed.stack_size - 1U;
+    zassert_equal(wamr_zephyr_thread_pool_prepare(&malformed, k_current_get()),
+                  BHT_ERROR, "undersized stack stride was accepted");
+
     zassert_equal(wamr_test_thread_pool_prepare(), BHT_OK,
                   "initial pool preparation failed");
     zassert_equal(wamr_test_thread_pool_prepare(), BHT_OK,
@@ -208,7 +238,33 @@ ZTEST(platform_thread_pool, test_thread_pool_prepare_validates_and_preserves_poo
     args.mem_alloc_option.pool.heap_size = sizeof(test_pool);
     zassert_true(wasm_runtime_full_init(&args),
                  "runtime initialization after pool preparation failed");
-    wasm_runtime_destroy();
+
+    /* Keep every generation until the full configured capacity is created. */
+    for (; created < ARRAY_SIZE(workers); ++created) {
+        if (os_thread_create(&workers[created], thread_pool_return_argument,
+                             NULL, 2048U)
+            != BHT_OK) {
+            break;
+        }
+    }
+    /* Defer assertions until all created workers have had their cleanup. */
+    for (size_t i = 0; i < created; ++i) {
+        join_results[i] = os_thread_join(workers[i], NULL);
+        if (join_results[i] != BHT_OK
+            && os_thread_join(workers[i], NULL) != BHT_OK) {
+            cleanup_succeeded = false;
+        }
+    }
+    /* A persistent join failure must not free a still-owned worker's heap. */
+    if (cleanup_succeeded) {
+        wasm_runtime_destroy();
+    }
+    zassert_equal(created, ARRAY_SIZE(workers),
+                  "descriptor rejection damaged full-capacity creation");
+    for (size_t i = 0; i < created; ++i) {
+        zassert_equal(join_results[i], BHT_OK,
+                      "worker %zu join after descriptor rejection failed", i);
+    }
 }
 
 ZTEST(platform_thread_pool,

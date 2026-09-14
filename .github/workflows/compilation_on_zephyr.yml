@@ -242,10 +242,10 @@ jobs:
           echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' \
             > /dev/null
   coverage_measurement:
-    # Coverage is retained for inspection when manually requested; it does not
-    # determine the ordinary Zephyr test verdict.
+    # Coverage is retained for inspection when manually requested. There is no
+    # percentage threshold, but build, test, extraction, and reporting failures
+    # must still fail this measurement job.
     if: github.event_name == 'workflow_dispatch'
-    continue-on-error: true
     runs-on: ubuntu-22.04
     container:
       image: ghcr.io/zephyrproject-rtos/ci-base:v0.26-branch
@@ -294,6 +294,24 @@ jobs:
             product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage.json
         working-directory: modules/wasm-micro-runtime
 
+      - name: Measure QEMU ARC kernel coverage
+        if: ${{ !cancelled() }}
+        shell: bash
+        working-directory: modules/wasm-micro-runtime
+        run: |
+          python3 product-mini/platforms/zephyr/build_and_run.py \
+            --no-docker --coverage --sim qemu_arc \
+            --scenario wamr.zephyr.platform_api.kernel tests/platform_api
+
+      - name: Measure QEMU ARC userspace coverage
+        if: ${{ !cancelled() }}
+        shell: bash
+        working-directory: modules/wasm-micro-runtime
+        run: |
+          python3 product-mini/platforms/zephyr/build_and_run.py \
+            --no-docker --coverage --sim qemu_arc \
+            --scenario wamr.zephyr.platform_api.userspace tests/platform_api
+
       - name: Upload native platform API coverage
         if: always()
         uses: actions/upload-artifact@v7.0.1
@@ -307,4 +325,24 @@ jobs:
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage/
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage.json
             modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/coverage-zephyr-platform-aggregate/
+          if-no-files-found: warn
+
+      - name: Upload QEMU ARC kernel coverage
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: zephyr-wamr-coverage-qemu-arc-kernel
+          path: |
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage/
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json
+          if-no-files-found: warn
+
+      - name: Upload QEMU ARC userspace coverage
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: zephyr-wamr-coverage-qemu-arc-userspace
+          path: |
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-userspace-75456078-coverage/coverage/
+            modules/wasm-micro-runtime/product-mini/platforms/zephyr/build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-userspace-75456078-coverage/coverage.json
           if-no-files-found: warn

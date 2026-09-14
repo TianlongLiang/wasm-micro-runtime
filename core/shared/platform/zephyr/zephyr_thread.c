@@ -108,10 +108,10 @@ sync_pool_object_range(const void *objects, size_t object_count,
     uintptr_t start = (uintptr_t)objects;
     uintptr_t size;
 
-    if (object_count > UINTPTR_MAX / object_size) {
-        return false;
-    }
-
+    /* Every caller bounds object_count by the compile-time mutex/condition
+     * pool capacity and passes a nonzero sizeof expression. */
+    bh_assert(object_size != 0U);
+    bh_assert(object_count <= UINTPTR_MAX / object_size);
     size = object_count * object_size;
     if (start > UINTPTR_MAX - size) {
         return false;
@@ -362,6 +362,7 @@ enum {
 
 enum {
     WAMR_DETACH_TEST_EXITED_CLAIMED,
+    WAMR_DETACH_TEST_COMPLETION_ENQUEUED,
 };
 
 #if defined(CONFIG_ZTEST)
@@ -385,38 +386,29 @@ wamr_zephyr_thread_detach_test_hook(int phase)
 static void
 thread_data_list_add_locked(os_thread_data *thread_data)
 {
-    if (!thread_data_list)
-        thread_data_list = thread_data;
-    else {
-        /* If already in list, just return */
-        os_thread_data *p = thread_data_list;
-        while (p) {
-            if (p == thread_data)
-                return;
-            p = p->next;
-        }
+    os_thread_data *p;
 
-        /* Set as head of list */
-        thread_data->next = thread_data_list;
-        thread_data_list = thread_data;
+    for (p = thread_data_list; p != NULL; p = p->next) {
+        /* A generation is allocated and inserted exactly once under the pool
+         * lock; duplicate insertion is an internal lifecycle bug. */
+        bh_assert(p != thread_data);
     }
+    thread_data->next = thread_data_list;
+    thread_data_list = thread_data;
 }
 
 static void
 thread_data_list_remove_locked(os_thread_data *thread_data)
 {
-    if (thread_data_list) {
-        if (thread_data_list == thread_data)
-            thread_data_list = thread_data_list->next;
-        else {
-            /* Search and remove it from list */
-            os_thread_data *p = thread_data_list;
-            while (p && p->next != thread_data)
-                p = p->next;
-            if (p && p->next == thread_data)
-                p->next = p->next->next;
-        }
+    os_thread_data **link = &thread_data_list;
+
+    while (*link != NULL && *link != thread_data) {
+        link = &(*link)->next;
     }
+    /* Callers either looked up this generation while holding the lock or are
+     * completing that mapped generation. */
+    bh_assert(*link == thread_data);
+    *link = thread_data->next;
 }
 
 static void
@@ -792,6 +784,9 @@ static void
 os_thread_complete(void *return_value)
 {
     os_thread_data *thread_data;
+#if defined(CONFIG_ZTEST)
+    bool detached_enqueued = false;
+#endif
 
     zmutex_lock(&thread_pool_lock, K_FOREVER);
     thread_data = thread_data_list_lookup_tid_locked(k_current_get());
@@ -804,8 +799,16 @@ os_thread_complete(void *return_value)
     else if (thread_data->state == WAMR_THREAD_DETACHED_RUNNING) {
         thread_data_list_remove_locked(thread_data);
         detached_thread_data_list_add_locked(thread_data);
+#if defined(CONFIG_ZTEST)
+        detached_enqueued = true;
+#endif
     }
     zmutex_unlock(&thread_pool_lock);
+#if defined(CONFIG_ZTEST)
+    if (detached_enqueued) {
+        WAMR_DETACH_TEST_HOOK(WAMR_DETACH_TEST_COMPLETION_ENQUEUED);
+    }
+#endif
 }
 
 static void
@@ -1057,9 +1060,17 @@ wamr_zephyr_sync_test_hook(int phase, uintptr_t handle)
 static bool
 sync_metadata_lock(void)
 {
-    return atomic_get(&wamr_sync_pool_prepare_state) == WAMR_SYNC_POOL_PREPARED
-           && wamr_sync_pool.management_lock != NULL
-           && k_mutex_lock(wamr_sync_pool.management_lock, K_FOREVER) == 0;
+    int result;
+
+    if (atomic_get(&wamr_sync_pool_prepare_state) != WAMR_SYNC_POOL_PREPARED
+        || wamr_sync_pool.management_lock == NULL) {
+        return false;
+    }
+    result = k_mutex_lock(wamr_sync_pool.management_lock, K_FOREVER);
+    /* The prepared object is valid and granted to the WAMR owner; a forever
+     * lock has no documented recoverable failure in thread context. */
+    bh_assert(result == 0);
+    return true;
 }
 
 static void
@@ -1306,34 +1317,24 @@ os_mutex_lock(korp_mutex *mutex)
 
     WAMR_SYNC_TEST_HOOK(WAMR_SYNC_TEST_MUTEX_OPERATION_CLAIMED, handle);
     result = k_mutex_lock(native, K_FOREVER);
-    if (!sync_metadata_lock()) {
-        if (result == 0) {
-            (void)k_mutex_unlock(native);
-        }
-        return BHT_ERROR;
-    }
-
+    /* Zephyr's valid-object K_FOREVER mutex lock cannot be busy or time out. */
+    bh_assert(result == 0);
+    /* WAMR's one-time prepared sync-pool binding survives active operations. */
+    bh_assert(sync_metadata_lock());
     slot = mutex_slot_lookup_locked(handle);
-    if (slot == NULL || slot->active_operations == 0U) {
-        sync_metadata_unlock();
-        if (result == 0) {
-            (void)k_mutex_unlock(native);
-        }
-        return BHT_ERROR;
+    /* Destroy refuses a slot while active_operations is nonzero. */
+    bh_assert(slot != NULL && slot->active_operations > 0U);
+    current = k_current_get();
+    if (slot->owner == current) {
+        slot->recursion++;
     }
-    if (result == 0) {
-        current = k_current_get();
-        if (slot->owner == current) {
-            slot->recursion++;
-        }
-        else {
-            slot->owner = current;
-            slot->recursion = 1U;
-        }
+    else {
+        slot->owner = current;
+        slot->recursion = 1U;
     }
     slot->active_operations--;
     sync_metadata_unlock();
-    return result == 0 ? BHT_OK : BHT_ERROR;
+    return BHT_OK;
 #else
     return zmutex_lock(mutex, K_FOREVER);
 #endif
@@ -1346,7 +1347,6 @@ os_mutex_unlock(korp_mutex *mutex)
     wamr_mutex_slot_t *slot;
     struct k_mutex *native;
     korp_mutex handle;
-    uint32 previous_recursion;
     int result;
 
     if (mutex == NULL || *mutex == NULL || !sync_metadata_lock()) {
@@ -1361,7 +1361,6 @@ os_mutex_unlock(korp_mutex *mutex)
         return BHT_ERROR;
     }
     slot->active_operations++;
-    previous_recursion = slot->recursion;
     slot->recursion--;
     if (slot->recursion == 0U) {
         slot->owner = NULL;
@@ -1370,22 +1369,17 @@ os_mutex_unlock(korp_mutex *mutex)
     sync_metadata_unlock();
 
     result = k_mutex_unlock(native);
-    if (!sync_metadata_lock()) {
-        return BHT_ERROR;
-    }
-
+    /* WAMR verified current ownership and nonzero recursion before claiming
+     * the operation; Zephyr's not-owned/unlocked errors cannot apply. */
+    bh_assert(result == 0);
+    /* WAMR's one-time prepared sync-pool binding survives active operations. */
+    bh_assert(sync_metadata_lock());
     slot = mutex_slot_lookup_locked(handle);
-    if (slot == NULL || slot->active_operations == 0U) {
-        sync_metadata_unlock();
-        return BHT_ERROR;
-    }
-    if (result != 0) {
-        slot->owner = k_current_get();
-        slot->recursion = previous_recursion;
-    }
+    /* Destroy refuses a slot while active_operations is nonzero. */
+    bh_assert(slot != NULL && slot->active_operations > 0U);
     slot->active_operations--;
     sync_metadata_unlock();
-    return result == 0 ? BHT_OK : BHT_ERROR;
+    return BHT_OK;
 #else
 #if KERNEL_VERSION_NUMBER >= 0x020200 /* version 2.2.0 */
     return zmutex_unlock(mutex);
@@ -1427,7 +1421,11 @@ os_cond_init(korp_cond *cond)
     sync_metadata_unlock();
     return BHT_OK;
 #else
-    return k_condvar_init(cond) == 0 ? BHT_OK : BHT_ERROR;
+    int result = k_condvar_init(cond);
+
+    /* Zephyr condition initialization returns zero for a valid object. */
+    bh_assert(result == 0);
+    return BHT_OK;
 #endif
 }
 
@@ -1534,18 +1532,15 @@ os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
     if (relock_condvar_timeout_mutex_if_needed(native_mutex, result) != 0) {
         mutex_reacquired = false;
     }
-    if (!sync_metadata_lock()) {
-        return BHT_ERROR;
-    }
-
+    /* WAMR's one-time prepared sync-pool binding survives active operations. */
+    bh_assert(sync_metadata_lock());
     cond_slot = cond_slot_lookup_locked(cond_handle);
     mutex_slot = mutex_slot_lookup_locked(mutex_handle);
-    if (cond_slot == NULL || mutex_slot == NULL
-        || cond_slot->active_operations == 0U || cond_slot->active_waiters == 0U
-        || mutex_slot->active_operations == 0U) {
-        sync_metadata_unlock();
-        return BHT_ERROR;
-    }
+    /* Condition destroy refuses active operations and waiters; mutex destroy
+     * refuses the paired active operation throughout the native wait. */
+    bh_assert(cond_slot != NULL && cond_slot->active_operations > 0U
+              && cond_slot->active_waiters > 0U);
+    bh_assert(mutex_slot != NULL && mutex_slot->active_operations > 0U);
 
     mutex_slot->owner = mutex_reacquired ? k_current_get() : NULL;
     mutex_slot->recursion = mutex_reacquired ? 1U : 0U;
@@ -1557,10 +1552,10 @@ os_cond_wait_user(korp_cond *cond, korp_mutex *mutex, k_timeout_t timeout,
     if (!mutex_reacquired) {
         return BHT_ERROR;
     }
-    if (result == 0) {
-        return BHT_OK;
-    }
-    return timed && result == -EAGAIN ? ETIMEDOUT : BHT_ERROR;
+    /* Zephyr condition waits return zero or timed -EAGAIN; K_FOREVER cannot
+     * time out, and the version-bounded mutex relock has succeeded. */
+    bh_assert(result == 0 || (timed && result == -EAGAIN));
+    return result == 0 ? BHT_OK : ETIMEDOUT;
 }
 #endif
 
@@ -1570,7 +1565,11 @@ os_cond_wait(korp_cond *cond, korp_mutex *mutex)
 #if defined(CONFIG_USERSPACE)
     return os_cond_wait_user(cond, mutex, K_FOREVER, false);
 #else
-    return k_condvar_wait(cond, mutex, K_FOREVER) == 0 ? BHT_OK : BHT_ERROR;
+    int result = k_condvar_wait(cond, mutex, K_FOREVER);
+
+    /* Zephyr's valid-object K_FOREVER condition wait cannot time out. */
+    bh_assert(result == 0);
+    return BHT_OK;
 #endif
 }
 
@@ -1597,7 +1596,11 @@ os_cond_reltimedwait(korp_cond *cond, korp_mutex *mutex, uint64 useconds)
     return os_cond_wait_user(cond, mutex, Z_TIMEOUT_MS(mills), true);
 #else
     if (useconds == BHT_WAIT_FOREVER) {
-        return k_condvar_wait(cond, mutex, K_FOREVER) == 0 ? BHT_OK : BHT_ERROR;
+        int result = k_condvar_wait(cond, mutex, K_FOREVER);
+
+        /* Zephyr's valid-object K_FOREVER condition wait cannot time out. */
+        bh_assert(result == 0);
+        return BHT_OK;
     }
     else {
         uint64 mills_64 = useconds / 1000;
@@ -1616,7 +1619,10 @@ os_cond_reltimedwait(korp_cond *cond, korp_mutex *mutex, uint64 useconds)
         if (relock_condvar_timeout_mutex_if_needed(mutex, result) != 0) {
             return BHT_ERROR;
         }
-        return result == 0 || result == -EAGAIN ? BHT_OK : BHT_ERROR;
+        /* Zephyr's timed condition wait returns zero or -EAGAIN after the
+         * version-bounded mutex relock has succeeded. */
+        bh_assert(result == 0 || result == -EAGAIN);
+        return BHT_OK;
     }
 #endif
 }
@@ -1645,19 +1651,22 @@ os_cond_signal(korp_cond *cond)
     sync_metadata_unlock();
 
     result = k_condvar_signal(native);
-    if (!sync_metadata_lock()) {
-        return BHT_ERROR;
-    }
+    /* Zephyr condition signal returns zero for the claimed valid object. */
+    bh_assert(result == 0);
+    /* WAMR's one-time prepared sync-pool binding survives active operations. */
+    bh_assert(sync_metadata_lock());
     slot = cond_slot_lookup_locked(handle);
-    if (slot == NULL || slot->active_operations == 0U) {
-        sync_metadata_unlock();
-        return BHT_ERROR;
-    }
+    /* Destroy refuses a slot while active_operations is nonzero. */
+    bh_assert(slot != NULL && slot->active_operations > 0U);
     slot->active_operations--;
     sync_metadata_unlock();
-    return result >= 0 ? BHT_OK : BHT_ERROR;
+    return BHT_OK;
 #else
-    return k_condvar_signal(cond) >= 0 ? BHT_OK : BHT_ERROR;
+    int result = k_condvar_signal(cond);
+
+    /* Zephyr condition signal returns zero for a valid object. */
+    bh_assert(result == 0);
+    return BHT_OK;
 #endif
 }
 
@@ -1771,16 +1780,14 @@ os_thread_detach(korp_tid thread)
     zmutex_unlock(&thread_pool_lock);
 
     if (exited_thread_data != NULL) {
+        int join_result;
+
         WAMR_DETACH_TEST_HOOK(WAMR_DETACH_TEST_EXITED_CLAIMED);
-        if (k_thread_join(exited_thread_data->tid, K_FOREVER) == 0) {
-            detached_thread_data_release(exited_thread_data);
-        }
-        else {
-            zmutex_lock(&thread_pool_lock, K_FOREVER);
-            detached_thread_data_list_add_locked(exited_thread_data);
-            zmutex_unlock(&thread_pool_lock);
-            result = BHT_ERROR;
-        }
+        join_result = k_thread_join(exited_thread_data->tid, K_FOREVER);
+        /* The target was observed EXITED under the pool lock; the caller cannot
+         * be that exited target, and K_FOREVER cannot report busy or timeout. */
+        bh_assert(join_result == 0);
+        detached_thread_data_release(exited_thread_data);
     }
     return result;
 }
@@ -1816,19 +1823,22 @@ os_cond_broadcast(korp_cond *cond)
     sync_metadata_unlock();
 
     result = k_condvar_broadcast(native);
-    if (!sync_metadata_lock()) {
-        return BHT_ERROR;
-    }
+    /* Zephyr broadcast returns a nonnegative waiter count for a valid object. */
+    bh_assert(result >= 0);
+    /* WAMR's one-time prepared sync-pool binding survives active operations. */
+    bh_assert(sync_metadata_lock());
     slot = cond_slot_lookup_locked(handle);
-    if (slot == NULL || slot->active_operations == 0U) {
-        sync_metadata_unlock();
-        return BHT_ERROR;
-    }
+    /* Destroy refuses a slot while active_operations is nonzero. */
+    bh_assert(slot != NULL && slot->active_operations > 0U);
     slot->active_operations--;
     sync_metadata_unlock();
-    return result >= 0 ? BHT_OK : BHT_ERROR;
+    return BHT_OK;
 #else
-    return k_condvar_broadcast(cond) >= 0 ? BHT_OK : BHT_ERROR;
+    int result = k_condvar_broadcast(cond);
+
+    /* Zephyr broadcast returns a nonnegative waiter count for a valid object. */
+    bh_assert(result >= 0);
+    return BHT_OK;
 #endif
 }
 

@@ -8,7 +8,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
 
+#define WAMR_TEST_POOL_STORAGE ZTEST_BMEM
 #include "test_common.h"
+#undef WAMR_TEST_POOL_STORAGE
 
 #include "platform_api_extension.h"
 #include "platform_api_vmcore.h"
@@ -44,6 +46,7 @@ enum {
 
 enum {
     WAMR_DETACH_TEST_EXITED_CLAIMED,
+    WAMR_DETACH_TEST_COMPLETION_ENQUEUED,
 };
 
 void
@@ -53,6 +56,8 @@ int
 wamr_zephyr_thread_test_wait(korp_tid handle, k_timeout_t timeout);
 int
 wamr_zephyr_thread_test_lifecycle_lock(korp_tid handle);
+void
+os_thread_sys_destroy(void);
 
 struct thread_result {
     int input;
@@ -144,6 +149,17 @@ struct explicit_exit_state {
     int detach_result;
 };
 
+struct reaper_worker_state {
+    struct k_sem *release;
+    int release_result;
+};
+
+struct out_of_order_reaper_state {
+    atomic_t hook_active;
+    int hook_release_result;
+    struct reaper_worker_state workers[THREAD_POOL_CAPACITY];
+};
+
 struct platform_thread_fixture {
     struct thread_result result;
     struct thread_result results[4];
@@ -160,8 +176,10 @@ struct platform_thread_fixture {
     struct detach_after_exit_race_state detach_after_exit_race;
     struct detached_reuse_race_state detached_reuse_race;
     struct explicit_exit_state explicit_exit;
+    struct out_of_order_reaper_state out_of_order_reaper;
     korp_tid owned_threads[MAX_OWNED_THREADS];
     atomic_t child_exited;
+    bool runtime_destroyed;
 };
 
 ZTEST_DMEM static struct platform_thread_fixture thread_fixture;
@@ -172,6 +190,9 @@ static struct k_sem join_claimed;
 static struct k_sem join_release;
 static struct k_sem detach_claimed;
 static struct k_sem detach_release;
+static struct k_sem reaper_completion_enqueued;
+static struct k_sem reaper_completion_release;
+static struct k_sem reaper_worker_release[THREAD_POOL_CAPACITY];
 static struct k_sem detached_join_done;
 static struct k_sem reuse_join_start;
 static struct k_sem reuse_join_paused;
@@ -251,6 +272,17 @@ return_nested_grandchild_result(void *arg)
     }
     k_sem_give(&nested_grandchild_done);
     return NESTED_GRANDCHILD_RESULT;
+}
+
+static void *
+wait_for_reaper_worker_release(void *arg)
+{
+    struct reaper_worker_state *state = arg;
+
+    k_sem_give(&phase_ready);
+    state->release_result =
+        k_sem_take(state->release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+    return NULL;
 }
 
 static void *
@@ -354,8 +386,18 @@ wamr_zephyr_thread_join_test_hook(int phase)
 void
 wamr_zephyr_thread_detach_test_hook(int phase)
 {
+    struct out_of_order_reaper_state *reaper =
+        &thread_fixture.out_of_order_reaper;
     struct detach_after_exit_race_state *state =
         &thread_fixture.detach_after_exit_race;
+
+    if (atomic_get(&reaper->hook_active)
+        && phase == WAMR_DETACH_TEST_COMPLETION_ENQUEUED) {
+        k_sem_give(&reaper_completion_enqueued);
+        reaper->hook_release_result = k_sem_take(
+            &reaper_completion_release, K_MSEC(THREAD_GUARD_TIMEOUT_MS));
+        return;
+    }
 
     if (!atomic_get(&state->hook_active)
         || phase != WAMR_DETACH_TEST_EXITED_CLAIMED) {
@@ -527,6 +569,11 @@ thread_before(void *fixture)
     init_phase_sem(&join_release);
     init_phase_sem(&detach_claimed);
     init_phase_sem(&detach_release);
+    init_phase_sem(&reaper_completion_enqueued);
+    init_phase_sem(&reaper_completion_release);
+    for (size_t i = 0; i < ARRAY_SIZE(reaper_worker_release); ++i) {
+        init_phase_sem(&reaper_worker_release[i]);
+    }
     init_phase_sem(&detached_join_done);
     init_phase_sem(&reuse_join_start);
     init_phase_sem(&reuse_join_paused);
@@ -552,11 +599,16 @@ thread_after(void *fixture)
         k_sem_give(&phase_release);
         k_sem_give(&join_release);
         k_sem_give(&detach_release);
+        k_sem_give(&reaper_completion_enqueued);
+        k_sem_give(&reaper_completion_release);
         k_sem_give(&reuse_join_start);
         k_sem_give(&reuse_join_release);
         k_sem_give(&reuse_creator_start);
         k_sem_give(&nested_child_release);
         k_sem_give(&nested_grandchild_release);
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(reaper_worker_release); ++i) {
+        k_sem_give(&reaper_worker_release[i]);
     }
     atomic_set(&thread_fixture.concurrent_join.before_claim_arrivals, 2);
     atomic_set(&thread_fixture.concurrent_join.protected_lookup_arrivals, 2);
@@ -596,11 +648,99 @@ thread_after(void *fixture)
                              NULL);
     }
 
-    pool_after(fixture);
+    if (!thread_fixture.runtime_destroyed) {
+        pool_after(fixture);
+    }
+    zassert_is_null(os_self_thread(),
+                    "thread-system mapping survived clean runtime teardown");
 }
 
 ZTEST_SUITE(platform_thread, NULL, NULL, thread_before, thread_after,
             NULL);
+
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_invalid_and_stale_detach_preserve_lifecycle)
+{
+    korp_tid stale;
+    korp_tid replacement;
+    int stale_join_result;
+    int replacement_join_result;
+
+    zassert_equal(os_thread_detach(NULL), BHT_ERROR,
+                  "null detach handle was accepted");
+    zassert_equal(os_thread_create(&stale, return_argument, NULL,
+                                   WAMR_TEST_STACK_SIZE), BHT_OK,
+                  "stale-handle source creation failed");
+    own_thread(stale);
+    stale_join_result = os_thread_join(stale, NULL);
+    if (stale_join_result == BHT_OK) {
+        disown_thread(stale);
+    }
+    zassert_equal(stale_join_result, BHT_OK,
+                  "stale-handle source join failed");
+    zassert_equal(os_thread_detach(stale), BHT_ERROR,
+                  "joined stale handle was detached");
+    zassert_equal(os_thread_create(&replacement, return_argument, NULL,
+                                   WAMR_TEST_STACK_SIZE), BHT_OK,
+                  "detach rejection damaged thread lifecycle");
+    own_thread(replacement);
+    replacement_join_result = os_thread_join(replacement, NULL);
+    if (replacement_join_result == BHT_OK) {
+        disown_thread(replacement);
+    }
+    zassert_equal(replacement_join_result, BHT_OK,
+                  "replacement join failed");
+}
+
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_active_worker_defers_thread_system_teardown)
+{
+    struct phase_worker_state *state = &thread_fixture.lifecycle;
+    RuntimeInitArgs args = { 0 };
+    korp_tid initial_identity = os_self_thread();
+    korp_tid worker;
+
+    memset(state, 0, sizeof(*state));
+    state->release_result = -EAGAIN;
+    zassert_equal(os_thread_create(&worker, publish_ready_and_return, state,
+                                   WAMR_TEST_STACK_SIZE), BHT_OK,
+                  "active worker creation failed");
+    own_thread(worker);
+    zassert_equal(k_sem_take(&phase_ready,
+                             K_MSEC(THREAD_GUARD_TIMEOUT_MS)), 0,
+                  "active worker did not reach the barrier");
+
+    os_thread_sys_destroy();
+    zassert_equal_ptr(os_self_thread(), initial_identity,
+                      "active worker allowed thread-system teardown");
+
+    k_sem_give(&phase_release);
+    zassert_equal(k_sem_take(&phase_done,
+                             K_MSEC(THREAD_GUARD_TIMEOUT_MS)), 0,
+                  "active worker did not finish");
+    zassert_equal(os_thread_join(worker, NULL), BHT_OK,
+                  "active worker join failed");
+    disown_thread(worker);
+
+    thread_fixture.runtime_destroyed = true;
+    wasm_runtime_destroy();
+    zassert_is_null(os_self_thread(),
+                    "clean runtime teardown retained thread mapping");
+
+    memset(test_pool, 0xA5, sizeof(test_pool));
+    args.mem_alloc_type = Alloc_With_Pool;
+    args.mem_alloc_option.pool.heap_buf = test_pool;
+    args.mem_alloc_option.pool.heap_size = sizeof(test_pool);
+    zassert_true(wasm_runtime_full_init(&args),
+                 "runtime reinitialization after deferred teardown failed");
+    thread_fixture.runtime_destroyed = false;
+    zassert_not_null(os_self_thread(),
+                     "reinitialized runtime has no caller mapping");
+    wasm_runtime_destroy();
+    thread_fixture.runtime_destroyed = true;
+    zassert_is_null(os_self_thread(),
+                    "reinitialized runtime did not tear down cleanly");
+}
 
 /* Catches a regression where stack metadata is ignored or exposed incorrectly. */
 ZTEST(platform_thread, test_stack_boundary_matches_configuration)
@@ -612,6 +752,30 @@ ZTEST(platform_thread, test_stack_boundary_matches_configuration)
 #else
     zassert_is_null(os_thread_get_stack_boundary(),
                     "stack boundary exists without stack metadata");
+#endif
+}
+
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_thread_pool_prepare_rejects_user_context_and_recovers)
+{
+#if defined(CONFIG_WAMR_TEST_USER_MODE)
+    korp_tid worker;
+    int join_result;
+
+    zassert_equal(wamr_test_thread_pool_prepare(), BHT_ERROR,
+                  "user context prepared the thread pool");
+    zassert_equal(os_thread_create(&worker, return_argument, NULL,
+                                   WAMR_TEST_STACK_SIZE),
+                  BHT_OK, "prepared pool was damaged by rejected prepare");
+    own_thread(worker);
+    join_result = os_thread_join(worker, NULL);
+    if (join_result == BHT_OK) {
+        disown_thread(worker);
+    }
+    zassert_equal(join_result, BHT_OK,
+                  "worker recovery after rejected prepare failed");
+#else
+    ztest_test_skip();
 #endif
 }
 
@@ -1416,6 +1580,96 @@ WAMR_CONTEXT_TEST(platform_thread,
 
     zassert_equal(replacement_create_result, BHT_OK,
                   "detach did not release an exited thread slot");
+}
+
+/* Mutation caught: a head-only reaper stops at live B and misses dead A. */
+WAMR_CONTEXT_TEST(platform_thread,
+                  test_reaper_skips_running_head_and_reclaims_later_exit)
+{
+    struct out_of_order_reaper_state *state =
+        &thread_fixture.out_of_order_reaper;
+    /* Creation order is A, C, D, B; each owns a distinct release barrier. */
+    korp_tid threads[THREAD_POOL_CAPACITY];
+    korp_tid replacement;
+    int fifth_create_result;
+    int join_result;
+
+    state->hook_release_result = -EAGAIN;
+    for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
+        state->workers[i].release = &reaper_worker_release[i];
+        state->workers[i].release_result = -EAGAIN;
+        zassert_equal(os_thread_create(&threads[i],
+                                       wait_for_reaper_worker_release,
+                                       &state->workers[i], WAMR_TEST_STACK_SIZE),
+                      BHT_OK, "reaper worker %zu creation failed", i);
+        own_thread(threads[i]);
+        zassert_equal(k_sem_take(&phase_ready,
+                                 K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                      0, "reaper worker %zu did not reach its barrier", i);
+    }
+
+    /* All four slots must exist before A exits: any create would reap A. */
+    zassert_equal(os_thread_detach(threads[0]), BHT_OK, "A detach failed");
+    disown_thread(threads[0]);
+    k_sem_give(&reaper_worker_release[0]);
+    zassert_equal(wamr_zephyr_thread_test_wait(
+                      threads[0], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                  0, "A did not exit on the detached list");
+
+    zassert_equal(os_thread_detach(threads[3]), BHT_OK, "B detach failed");
+    disown_thread(threads[3]);
+    atomic_set(&state->hook_active, 1);
+    k_sem_give(&reaper_worker_release[3]);
+    zassert_equal(k_sem_take(&reaper_completion_enqueued,
+                             K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                  0, "B did not become the running detached-list head");
+
+    /* [B running, A dead], with C and D still holding the other slots. */
+    fifth_create_result = os_thread_create(&replacement, return_argument,
+                                           NULL, WAMR_TEST_STACK_SIZE);
+    if (fifth_create_result == BHT_OK) {
+        own_thread(replacement);
+        join_result = os_thread_join(replacement, NULL);
+        if (join_result == BHT_OK) {
+            disown_thread(replacement);
+        }
+        zassert_equal(join_result, BHT_OK, "first replacement join failed");
+    }
+
+    /* Finish detached cleanup even when the deliberate mutation rejects #5. */
+    k_sem_give(&reaper_completion_release);
+    zassert_equal(wamr_zephyr_thread_test_wait(
+                      threads[3], K_MSEC(THREAD_GUARD_TIMEOUT_MS)),
+                  0, "B did not exit after hook release");
+    atomic_clear(&state->hook_active);
+    zassert_equal(state->hook_release_result, 0,
+                  "B completion hook release failed");
+
+    zassert_equal(os_thread_create(&replacement, return_argument, NULL,
+                                   WAMR_TEST_STACK_SIZE),
+                  BHT_OK, "post-B replacement creation failed");
+    own_thread(replacement);
+    join_result = os_thread_join(replacement, NULL);
+    if (join_result == BHT_OK) {
+        disown_thread(replacement);
+    }
+    zassert_equal(join_result, BHT_OK, "post-B replacement join failed");
+
+    for (size_t i = 1; i <= 2; ++i) {
+        k_sem_give(&reaper_worker_release[i]);
+        join_result = os_thread_join(threads[i], NULL);
+        if (join_result == BHT_OK) {
+            disown_thread(threads[i]);
+        }
+        zassert_equal(join_result, BHT_OK, "blocker %zu join failed", i);
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(threads); ++i) {
+        zassert_equal(state->workers[i].release_result, 0,
+                      "reaper worker %zu release failed", i);
+    }
+    zassert_equal(fifth_create_result, BHT_OK,
+                  "fifth create returned %d: reaper did not scan past running B",
+                  fifth_create_result);
 }
 
 /* Mutation caught: join accepts a target after detach has already claimed

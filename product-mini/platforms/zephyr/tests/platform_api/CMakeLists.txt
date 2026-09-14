@@ -13,6 +13,14 @@ else()
                              src/test_unsupported.c src/test_time.c)
 endif()
 
+if(CONFIG_COVERAGE)
+  # Limit embedded coverage to the code under measurement. Whole-image gcov
+  # exhausts the fixed target-side dump heap and, in userspace, needlessly
+  # instruments Zephyr syscall paths and the test harness.
+  zephyr_compile_options(
+    "-fprofile-filter-files=.*/core/shared/platform/zephyr/.*")
+endif()
+
 if(CONFIG_WAMR_TEST_USER_MODE)
   set(WAMR_ZEPHYR_APP_PARTITION ztest_mem_partition)
   set(WAMR_BUILD_TARGET ARC)

@@ -153,6 +153,56 @@ class TwisterCommandTest(unittest.TestCase):
         self.assertIn("--coverage-tool gcovr", command)
         self.assertIn("--coverage-formats html,xml", command)
 
+    def test_docker_qemu_arc_coverage_selects_arc_gcov(self):
+        command = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "qemu_arc",
+            True,
+            coverage=True,
+            scenario="wamr.zephyr.platform_api.kernel",
+        )
+
+        tokens = shlex.split(command)
+        self.assertIn("--gcov-tool", tokens)
+        self.assertEqual(
+            tokens[tokens.index("--gcov-tool") + 1],
+            "/root/zephyrproject/zephyr-sdk/arc-zephyr-elf/bin/arc-zephyr-elf-gcov",
+        )
+
+    def test_qemu_arc_userspace_coverage_expands_privileged_stack(self):
+        scenario = "wamr.zephyr.platform_api.userspace"
+        command = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "qemu_arc",
+            True,
+            coverage=True,
+            scenario=scenario,
+        )
+
+        tokens = shlex.split(command)
+        self.assertIn("--extra-args", tokens)
+        self.assertEqual(
+            tokens[tokens.index("--extra-args") + 1],
+            "CONFIG_PRIVILEGED_STACK_SIZE=4096",
+        )
+
+        kernel = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "qemu_arc",
+            True,
+            coverage=True,
+            scenario="wamr.zephyr.platform_api.kernel",
+        )
+        plain_userspace = MODULE.twister_command(
+            Path("tests/platform_api"),
+            "qemu_arc",
+            True,
+            coverage=False,
+            scenario=scenario,
+        )
+        self.assertNotIn("--extra-args", shlex.split(kernel))
+        self.assertNotIn("--extra-args", shlex.split(plain_userspace))
+
     def test_no_docker_paths_remain_single_shell_arguments(self):
         checkout = Path("/tmp/WAMR checkout's coverage")
         with mock.patch.object(MODULE, "WAMR_ROOT", checkout):

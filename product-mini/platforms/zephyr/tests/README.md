@@ -9,6 +9,92 @@ All current runtime scenarios use the interpreter and
 APIs, randomized/timing-dependent/load stress testing, and physical-board
 coverage are outside this test set.
 
+## 2026-09-13 final meaningful-branch-coverage evidence
+
+All evidence in this section was regenerated on code revision `82ec4ca4`,
+after restoring legacy rwlock compatibility for the ordinary WASI samples.
+Zephyr 3.7.0 remains the official pin. Host discovery passed 35/35 tests in
+0.048 s. Every one of the eleven ordinary entries exited zero, with no failed
+or errored configurations and no failed, error, or null testcase statuses.
+
+| Ordinary entry | Passed/static-filter configurations | JSON passed/skipped cases | JSON `execution_time` per configuration | Twister wall time |
+| --- | ---: | ---: | --- | ---: |
+| `native_sim simple` | 1/0 | 1/0 | 2.60 s | 9.39 s |
+| `qemu_arc simple` | 1/0 | 1/0 | 1.03 s | 11.03 s |
+| `native_sim simple-file` | 1/0 | 1/0 | 2.61 s | 10.38 s |
+| `native_sim simple-http` | 1/0 | 0/1 | 0.00 s | 7.72 s |
+| `qemu_arc user-mode` | 2/0 | 2/0 | normal/prebuilt: 1.03/1.03 s | 34.48 s |
+| `qemu_arc user-mode-multi-thread` | 1/0 | 1/0 | 1.05 s | 18.31 s |
+| `native_sim tests/platform_api` | 3/1 | 143/40 | mocks/kernel/stack-info: 0.01/0.09/0.09 s | 18.37 s |
+| `qemu_arc tests/platform_api` | 2/2 | 160/22 | kernel/userspace: 1.43/2.46 s | 30.50 s |
+| `native_sim tests/runtime` | 1/1 | 8/0 | 0.01 s | 8.59 s |
+| `qemu_arc tests/runtime` | 2/0 | 17/0 | kernel/userspace: 1.05/1.13 s | 30.99 s |
+| `qemu_arc tests/usermode_faults` | 5/0 | 5/0 | 1.03 s each | 85.52 s |
+| Total | 20/4 | 339/63 | — | — |
+
+The 20 passed configurations include 19 executed and the unchanged HTTP
+build-only configuration; its skipped case is not an HTTP runtime pass.
+The case totals count records retained in `twister.json`, not Twister console
+counts that also include statically filtered cases. Each report is
+`../build/twister-<root-with-slashes-replaced-by-hyphens>-<sim>/twister.json`,
+with the corresponding wrapper log in
+`../build/logs/<root-with-slashes-replaced-by-hyphens>-<sim>.log`.
+Run each table entry with `python3 ../build_and_run.py --sim <sim> <root>`
+from this directory; the wrapper resolves roots relative to the Zephyr platform.
+
+Against the 2026-09-07 matrix below, native/ARC platform-root wall time changed
+18.35/27.10 s to 18.37/30.50 s; native/ARC runtime changed 6.91/24.52 s to
+8.59/30.99 s. These are observed build-and-test timings, not performance
+benchmarks; compatibility probes also ran on the host during this matrix.
+Every ordinary entry remains below two minutes, so no dedicated stress lane
+or scenario split is needed.
+
+### Zephyr 4.4.0 and 4.4.1 probes
+
+Both isolated platform-API probes passed 5/5 executed configurations with
+three static filters and 303 passed/62 skipped testcase records. Exact tags:
+`v4.4.0` (`684c9e8f32e4373a21098559f748f06915f950c9`) and
+`v4.4.1` (`1f6485eca25431b5ff27ce9a754218c9e559bbbb`).
+
+| Scenario/target | Passed/skipped | 4.4.0 `execution_time` | 4.4.1 `execution_time` |
+| --- | ---: | ---: | ---: |
+| Native mocked errors | 3/0 | 0.01 s | 0.01 s |
+| Native kernel | 70/20 | 0.08 s | 0.08 s |
+| Native stack info | 70/20 | 0.09 s | 0.08 s |
+| ARC kernel | 71/19 | 1.43 s | 1.41 s |
+| ARC userspace | 89/3 | 1.99 s | 2.03 s |
+| Combined Twister wall time | — | 75.06 s | 69.44 s |
+
+Reports are
+`/tmp/wamr-zephyr-4.4-probe/<version>/outputs/meaningful-branch-coverage/twister.json`.
+The disposable setup uses Python 3.12.3, west 1.5.0, SDK 1.0.1 ARC/x86 GNU
+toolchains and SDK host tools, and gperf 3.1. Only disposable manifests were
+created; the repository's manifest and pin did not change. From the repository
+root, use this command for each `version` (`4.4.0` or `4.4.1`):
+
+```bash
+env PATH=/tmp/wamr-zephyr-4.4-probe/$version/.venv/bin:$PATH \
+  ZEPHYR_BASE=/tmp/wamr-zephyr-4.4-probe/$version/zephyr \
+  ZEPHYR_TOOLCHAIN_VARIANT=zephyr \
+  ZEPHYR_SDK_INSTALL_DIR=/tmp/wamr-zephyr-4.4-probe/zephyr-sdk-1.0.1 \
+  west twister -T product-mini/platforms/zephyr/tests/platform_api \
+  -p native_sim -p qemu_arc/qemu_arc_hs \
+  -x EXTRA_ZEPHYR_MODULES="$PWD" \
+  --outdir /tmp/wamr-zephyr-4.4-probe/$version/outputs/meaningful-branch-coverage \
+  --inline-logs --clobber-output --disable-warnings-as-errors --jobs 1
+```
+
+The timeout-mutex-reacquisition case passes in all four non-mocked scenarios
+on both releases. Direct source reinspection confirms both upstream condvar
+implementations still relock only after a zero wait result; the existing
+`[4.4.0, 4.5.0)` timeout relock remains unchanged and necessary. The initial
+sandboxed 4.4.0 attempt failed before builds at a local multiprocessing socket;
+a manager-only reproducer confirmed the environment restriction and approved
+identical execution passed. No product or harness correction was needed.
+Both probes report zero failed/errored/Twister-warning configurations, but
+existing `strtok_r` declaration/conversion, unused-helper and `TC_NAME` build
+warnings remain. These probes are not a full 4.4 CI matrix or a pin upgrade.
+
 ## Deterministic lifecycle stress and current evidence
 
 The platform and runtime roots include deterministic stress for WAMR thread and
@@ -24,7 +110,7 @@ caller on QEMU ARC. Pool provisioning, object-permission, and deliberately
 missing-grant checks remain supervisor-controlled plain `ZTEST` cases: they
 exercise embedding infrastructure rather than a public user-call contract.
 
-Measured final ordinary-root wall times are 13.64 s (`platform_api` native),
+Historical ordinary-root wall times were 13.64 s (`platform_api` native),
 27.77 s (`platform_api` QEMU ARC), 7.08 s (`runtime` native), and 25.72 s
 (`runtime` QEMU ARC). They are far below the two-to-three-minute placement
 ceiling, so every deterministic case remains in its existing ordinary required
@@ -285,8 +371,7 @@ python3 build_and_run.py --no-docker --sim qemu_arc tests/platform_api
 ```
 
 Run the complete host-side unit-test discovery from the repository root. This
-includes both `test_build_and_run.py` and `test_coverage_report.py` (29 tests
-in the current final evidence):
+includes both `test_build_and_run.py` and `test_coverage_report.py`:
 
 ```sh
 python3 -m unittest discover -s product-mini/platforms/zephyr/tests \
@@ -320,7 +405,17 @@ python3 build_and_run.py --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.kernel_stack_info tests/platform_api
 python3 build_and_run.py --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.mocked_errors tests/platform_api
+python3 build_and_run.py --coverage --sim qemu_arc \
+  --scenario wamr.zephyr.platform_api.kernel tests/platform_api
+python3 build_and_run.py --coverage --sim qemu_arc \
+  --scenario wamr.zephyr.platform_api.userspace tests/platform_api
 ```
+
+GitHub Actions runs these five commands only in the manually dispatched
+`coverage_measurement` job. Build, test, gcov extraction, and report failures
+fail that manual job even though no coverage percentage is enforced. CI
+uploads the native aggregate and the two QEMU reports as three independent
+artifacts; ordinary push and pull-request jobs do not collect coverage.
 
 Use `--no-docker` in an already configured Zephyr workspace or CI container.
 Then aggregate the three raw traces from the repository root:
@@ -347,6 +442,14 @@ build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-erro
 ├── coverage/
 ├── coverage.json
 └── twister.json
+build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-kernel-af729dc6-coverage/
+├── coverage/
+├── coverage.json
+└── twister.json
+build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-userspace-75456078-coverage/
+├── coverage/
+├── coverage.json
+└── twister.json
 build/coverage-zephyr-platform-aggregate/
 ├── index.html
 ├── coverage.xml
@@ -361,11 +464,41 @@ characters of the scenario SHA-256. They keep same-slug scenarios distinct in th
 trusted scenario set, which makes them collision-resistant here without
 claiming a collision-free naming scheme.
 
-The aggregate is union evidence from three real builds, not coverage from one
-binary. The mocked-errors trace stays separate from the kernel and
-stack-information configurations until aggregation. QEMU ARC remains
-behavioral userspace evidence rather than coverage. Hardware cache branches
-and impossible defensive branches are intentionally not targeted.
+The native aggregate is union evidence from three real builds, not coverage
+from one binary. The mocked-errors trace stays separate from the kernel and
+stack-information configurations until aggregation. Keep the QEMU ARC kernel
+and userspace reports separate from that native aggregate and from each other:
+their architecture and privilege-specific compiled branches are different.
+Hardware cache branches and impossible defensive branches are intentionally
+not targeted.
+
+Embedded coverage is compiler-filtered to `core/shared/platform/zephyr/` so
+the target records the production code being measured instead of the whole
+Zephyr, WAMR, and test image. Whole-image probes exhausted Zephyr 3.7's default
+16 KiB `CONFIG_COVERAGE_GCOV_HEAP_SIZE`; the focused dumps complete without
+increasing it. Gcov may additionally attribute inline code to
+`core/shared/platform/include/platform_api_vmcore.h`; that is the only file
+outside the filter directory in the current reports. In the Docker workflow,
+the wrapper also supplies the SDK's ARC `gcov` executable. A `--no-docker`
+caller must provide a configured SDK/gcov environment.
+
+The userspace coverage command alone adds
+`CONFIG_PRIVILEGED_STACK_SIZE=4096`. This is not the WAMR worker stack. It is
+the per-user-thread stack used while Zephyr handles syscalls. Full gcov builds
+compile those paths at `-O0`, add counter updates, and disable inlining; the
+default 1 KiB privileged stack overflowed during the concurrent synchronization
+case and produced a PC-zero MPU instruction-fetch fault. Kernel-mode threads do
+not cross that userspace syscall boundary, so the QEMU ARC kernel coverage run
+works with the default privileged-stack setting.
+
+Verified on Zephyr 3.7 on 2026-09-09:
+
+| QEMU ARC report | Tests passed | Skipped | Lines | Branches |
+| --- | ---: | ---: | ---: | ---: |
+| Kernel | 68 | 18 | 528/614 (86.0%) | 225/334 (67.4%) |
+| Userspace | 85 | 3 | 772/932 (82.8%) | 379/588 (64.5%) |
+
+The host-side discovery suite passed 35/35 tests with these wrapper changes.
 
 Historical pre-feature/pilot evidence: Task 6 established the Zephyr 3.7.0
 pinned baseline on 2026-08-27. The earlier Task 7 pilot reran affected 3.7

@@ -7,6 +7,42 @@ port](../../../core/shared/platform/zephyr), and is packaged as a [Zephyr
 module](../../../zephyr) so that an application only has to enable a few
 Kconfig options to get the runtime linked into its image.
 
+## Latest validation: 2026-09-13
+
+Final code revision `82ec4ca4` passes all 35 host tests and all eleven ordinary
+Zephyr 3.7.0 entries: 339 passed and 63 intentionally skipped testcase records,
+zero failed/errored configurations. The unchanged HTTP entry is build-only,
+not an HTTP runtime pass. The longest ordinary entry takes 85.52 seconds;
+native/ARC platform-API roots take 18.37/30.50 seconds.
+
+Three separate informational reports measure native aggregate coverage at
+549/613 lines (89.56%) and 235/328 branches (71.65%), QEMU ARC kernel at
+546/619 (88.21%) and 232/330 (70.30%), and QEMU ARC userspace at
+784/907 (86.44%) and 388/578 (67.13%). Only the three native traces are
+aggregated. There is no coverage threshold or new exclusion.
+
+The ordinary tests now prove one-time pool validation/recovery, invalid and
+stale detach rejection, active-worker teardown deferral and out-of-order
+detached reaping. Named assertions preserve valid native operations and
+public recovery while making internal lifecycle invariants explicit. QEMU
+userspace coverage alone uses a 4096-byte privileged stack for gcov-expanded
+syscall frames; ordinary tests retain 1024. The userspace platform-test
+scenario reserves 512 extra gperf metadata bytes for documented prebuilt/final
+hash-layout uncertainty. Neither is a production configuration change.
+
+Legacy partial rwlocks remain for existing libc-WASI sample compatibility;
+uniform rejection broke WASI fd-table initialization and was withdrawn before
+this final matrix. Read locking and destruction remain unimplemented, and
+complete rwlock correctness is deferred. No sample was skipped to hide this
+boundary. Both isolated Zephyr 4.4.0 and 4.4.1 platform-API probes pass 303/62
+cases across five configurations, including timeout mutex reacquisition; the
+existing bounded relock workaround remains necessary. The official pin stays
+at 3.7.0.
+
+See the [final matrix and compatibility details](tests/README.md#2026-09-13-final-meaningful-branch-coverage-evidence)
+and [exact coverage inputs and before/after totals](tests/platform_api/README.md#final-2026-09-13-evidence).
+Older measurements below are historical snapshots, not the current totals.
+
 ## Samples
 
 | Sample                       | What it demonstrates                                          |
@@ -308,13 +344,15 @@ exit status; do not infer a result from console text.
 ### Informational coverage
 
 Coverage is a manually requested measurement job, not a pass threshold. The
-pinned CI baseline remains Zephyr 3.7.0. It runs three exact `native_sim`
-platform-API scenarios sequentially because WAMR's generated version header
-races when configurations share a checkout. The second scenario changes only
-`CONFIG_THREAD_STACK_INFO=y`; the third is the isolated mocked-error scenario,
-which compiles only its FFF fixture and leaves normal builds on direct calls.
-See [the focused platform-API guide](tests/platform_api/README.md) for the
-mock boundary and error-path classification.
+pinned CI baseline remains Zephyr 3.7.0. The manual job runs three exact
+`native_sim` platform-API scenarios plus separate QEMU ARC kernel and userspace
+scenarios. Configurations run sequentially because WAMR's generated version
+header races when configurations share a checkout. The second native scenario
+changes only `CONFIG_THREAD_STACK_INFO=y`; the third is the isolated
+mocked-error scenario, which compiles only its FFF fixture and leaves normal
+builds on direct calls. See
+[the focused platform-API guide](tests/platform_api/README.md) for the mock
+boundary and error-path classification.
 
 ```bash
 python3 build_and_run.py --no-docker --coverage --sim native_sim \
@@ -323,6 +361,10 @@ python3 build_and_run.py --no-docker --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.kernel_stack_info tests/platform_api
 python3 build_and_run.py --no-docker --coverage --sim native_sim \
   --scenario wamr.zephyr.platform_api.mocked_errors tests/platform_api
+python3 build_and_run.py --no-docker --coverage --sim qemu_arc \
+  --scenario wamr.zephyr.platform_api.kernel tests/platform_api
+python3 build_and_run.py --no-docker --coverage --sim qemu_arc \
+  --scenario wamr.zephyr.platform_api.userspace tests/platform_api
 python3 coverage_report.py \
   build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json \
   build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json \
@@ -339,6 +381,10 @@ html,xml`. The individual trace artifacts are:
   and its `coverage.json`.
 - `build/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-mocked-errors-e2d36566-coverage/coverage/`
   and its `coverage.json`.
+- `build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage/`
+  and its `coverage.json`.
+- `build/twister-tests-platform_api-qemu_arc-wamr-zephyr-platform-api-userspace-75456078-coverage/coverage/`
+  and its `coverage.json`.
 
 `coverage_report.py` publishes the focused aggregate under
 `build/coverage-zephyr-platform-aggregate/`, including HTML, Cobertura XML,
@@ -347,6 +393,12 @@ three real builds, not coverage from a single binary; the mocked-errors trace
 is not folded into either ordinary configuration. CI uploads all three
 individual coverage directories and raw traces with this aggregate as
 `zephyr-wamr-coverage-native-sim`.
+
+CI uploads the QEMU reports independently as
+`zephyr-wamr-coverage-qemu-arc-kernel` and
+`zephyr-wamr-coverage-qemu-arc-userspace`; they are not inputs to the native
+aggregate. The manual job has no percentage threshold, but a build, test,
+extraction, or reporting error fails the requested measurement.
 
 ### 2026-09-08 Zephyr 4.4 mocked-error compatibility probes
 
@@ -528,7 +580,11 @@ env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH ZEP
 env PATH=/tmp/task7-gperf/usr/bin:/tmp/wamr-zephyr-4.4-probe/.venv/bin:$PATH python3 product-mini/platforms/zephyr/coverage_report.py --root /home/tl/projects/wasm-micro-runtime --output-dir /tmp/wamr-zephyr-4.4-probe/outputs/coverage-zephyr-platform-aggregate-4.4 /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-af729dc6-coverage/coverage.json /tmp/wamr-zephyr-4.4-probe/outputs/coverage/twister-tests-platform_api-native_sim-wamr-zephyr-platform-api-kernel-stack-info-d286e15c-coverage/coverage.json
 ```
 
-QEMU ARC remains behavioral userspace evidence rather than a coverage lane.
+QEMU ARC now provides separate, focused kernel and userspace coverage reports.
+See `tests/README.md` for the commands, coverage-only privileged-stack setting,
+and why those architecture-specific reports are not merged into the native
+aggregate.
+
 On 2026-08-28, Task 7 reran every previously affected Zephyr 4.4.0 root
 against the official signed `v4.4.0` tag
 (`684c9e8f32e4373a21098559f748f06915f950c9`) in
