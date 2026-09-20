@@ -341,6 +341,63 @@ example, `tests/platform-api` on `native_sim` uses
 `build/twister-tests-platform-api-native_sim/`. The wrapper forwards Twister's
 exit status; do not infer a result from console text.
 
+### Informational coverage
+
+Coverage is measurement only, not a pass threshold. The supported baseline
+uses the native platform API suite; native_sim is not isolation evidence:
+
+```bash
+python3 build_and_run.py --no-docker --coverage --sim native_sim tests/platform-api
+```
+
+The wrapper uses the Zephyr 3.7 Twister options `--coverage`,
+`--coverage-basedir`, `--coverage-tool gcovr`, and `--coverage-formats
+html,xml`. It keeps this run separate from the ordinary artifacts under
+`build/twister-tests-platform-api-native_sim-coverage/`; its log likewise uses
+`build/logs/tests-platform-api-native_sim-coverage.log`. Twister's verdict is
+still the command's exit status. The coverage artifact directory is
+`build/twister-tests-platform-api-native_sim-coverage/coverage/`, and its
+machine-readable report is
+`build/twister-tests-platform-api-native_sim-coverage/coverage/coverage.xml`.
+The reports from the pinned gcovr 8.2 are:
+
+- `coverage/index.html`: browsable details;
+- `coverage/coverage.xml`: machine-readable Cobertura XML;
+- `coverage.json`: Twister's raw gcovr trace data.
+
+On 2026-08-12 the native run passed its one runnable configuration (the
+userspace configuration was statically filtered). The raw report contained 40
+compiled WAMR production files. Twister's `tests/*` exclusion omitted the test
+application, and no Zephyr or generated build sources appeared in the report.
+The focused `core/shared/platform/zephyr/` measurement was:
+
+| Metric | Covered | Total | gcovr display |
+| --- | ---: | ---: | ---: |
+| Lines | 228 | 366 | 62% |
+| Branches | 51 | 110 | 46% |
+
+Zephyr 3.7 Twister does not expose a source-filter option for coverage report
+generation. To reproduce the focused view without changing Twister's verdict,
+run these post-report commands from the WAMR checkout root:
+
+```bash
+docker run --rm \
+  -v "$PWD:/root/zephyrproject/modules/wasm-micro-runtime" \
+  -w /root/zephyrproject/modules/wasm-micro-runtime wamr-zephyr \
+  gcovr -r /root/zephyrproject/modules/wasm-micro-runtime \
+  --filter 'core/shared/platform/zephyr/' \
+  --add-tracefile product-mini/platforms/zephyr/build/twister-tests-platform-api-native_sim-coverage/coverage.json \
+  --txt-metric line --txt -
+
+docker run --rm \
+  -v "$PWD:/root/zephyrproject/modules/wasm-micro-runtime" \
+  -w /root/zephyrproject/modules/wasm-micro-runtime wamr-zephyr \
+  gcovr -r /root/zephyrproject/modules/wasm-micro-runtime \
+  --filter 'core/shared/platform/zephyr/' \
+  --add-tracefile product-mini/platforms/zephyr/build/twister-tests-platform-api-native_sim-coverage/coverage.json \
+  --txt-metric branch --txt -
+```
+
 The pilot supports `native_sim` and `qemu_arc/qemu_arc_hs`. `native_sim` runs
 the kernel scenarios only and is a fast host smoke target, not a userspace
 isolation claim. On QEMU ARC, both suites run their kernel scenario and their
@@ -362,10 +419,10 @@ These are explicit, named skips that retain their test bodies; they are not
 passing demonstrations. A QEMU ARC user protection-fault case remains active
 and verifies that a user worker cannot write supervisor-only memory.
 
-Phase Two should first add comprehensive MPU/verifier/illegal-pointer fault
-matrices and exhaustive platform API coverage. Filesystem, sockets, AOT,
-alternate allocators, stress, coverage, and physical-board testing remain
-lower-priority future work.
+Phase Two adds coverage measurement. Comprehensive MPU, verifier, and illegal-
+pointer matrices and exhaustive platform API coverage remain future work.
+Filesystem, sockets, AOT, alternate allocators, stress, and physical-board
+testing remain lower-priority future work.
 
 ## Adding a new sample
 
