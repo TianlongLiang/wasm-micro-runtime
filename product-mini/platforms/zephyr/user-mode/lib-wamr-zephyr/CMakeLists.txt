@@ -75,9 +75,12 @@ target_include_directories (wamr_lib PUBLIC ${WAMR_RUNTIME_INCLUDE_DIRS})
 target_compile_definitions (wamr_lib PUBLIC ${WAMR_RUNTIME_COMPILE_DEFINITIONS})
 
 # Add source files to the library
+if (NOT DEFINED WAMR_ZEPHYR_RUNTIME_SOURCE)
+  set (WAMR_ZEPHYR_RUNTIME_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/wamr_lib.c)
+endif ()
 zephyr_library_sources (
   ${WAMR_RUNTIME_LIB_SOURCE} 
-  wamr_lib.c
+  ${WAMR_ZEPHYR_RUNTIME_SOURCE}
 )
 
 # Suppress -Wtype-limits warnings originating from Zephyr's own headers
@@ -103,18 +106,22 @@ if (NOT WAMR_USE_PREBUILT_LIB)
 endif ()
 
 ################  WebAssembly module  ################
-# ../wasm-app/ is compiled with the wasi-sdk toolchain in a nested build, and
-# the resulting test_wasm.wasm is turned into the byte array wamr_lib.c embeds.
+# Compile the selected C guest with wasi-sdk in a nested build and embed its
+# test_wasm.wasm in the selected runtime source.
 # The array is a global of this library, so it lands in wamr_partition like the
 # rest of the runtime state.
 list (APPEND CMAKE_MODULE_PATH ${WAMR_ROOT_DIR}/build-scripts)
 find_package (WASISDK REQUIRED)
 
 include (ExternalProject)
+if (NOT DEFINED WAMR_ZEPHYR_WASM_APP_SOURCE_DIR)
+  set (WAMR_ZEPHYR_WASM_APP_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../wasm-app)
+endif ()
 ExternalProject_Add (wasm_app
-  SOURCE_DIR        ${CMAKE_CURRENT_SOURCE_DIR}/../wasm-app
-  CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_SOURCE_DIR}/../wasm-app -B build
+  SOURCE_DIR        ${WAMR_ZEPHYR_WASM_APP_SOURCE_DIR}
+  CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${WAMR_ZEPHYR_WASM_APP_SOURCE_DIR} -B build
                       -DCMAKE_TOOLCHAIN_FILE=${WASISDK_TOOLCHAIN}
+                      -DWAMR_ROOT_DIR=${WAMR_ROOT_DIR}
   BUILD_COMMAND     ${CMAKE_COMMAND} --build build
   INSTALL_COMMAND   ${CMAKE_COMMAND} --install build --prefix ${CMAKE_CURRENT_BINARY_DIR}/wasm-app
   BUILD_ALWAYS      TRUE
